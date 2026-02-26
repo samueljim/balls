@@ -1,8 +1,0 @@
-1:"$Sreact.fragment"
-2:I[45121,["/_next/static/chunks/294cf0f9be8a1993.js","/_next/static/chunks/81f0f13d25d49d65.js"],"default"]
-3:I[71653,["/_next/static/chunks/5a71b686dbf13b16.js"],"default"]
-4:I[60512,["/_next/static/chunks/294cf0f9be8a1993.js","/_next/static/chunks/81f0f13d25d49d65.js"],"default"]
-5:I[50415,["/_next/static/chunks/e6c76340bde6a97d.js"],"NotFoundFallback"]
-:HL["/_next/static/chunks/37d6a1e66f4553d0.css","style"]
-:HL["https://fonts.googleapis.com/css2?family=Luckiest+Guy&display=swap","style"]
-0:{"buildId":"aTOiYSBP1Qdg6AcJInTnd","rsc":["$","$1","c",{"children":[[["$","link","0",{"rel":"stylesheet","href":"/_next/static/chunks/37d6a1e66f4553d0.css","precedence":"next"}]],["$","html",null,{"lang":"en","children":[["$","head",null,{"children":["$","link",null,{"href":"https://fonts.googleapis.com/css2?family=Luckiest+Guy&display=swap","rel":"stylesheet"}]}],["$","body",null,{"className":"min-h-screen antialiased font-sans","children":["$","$L2",null,{"parallelRouterKey":"children","error":"$3","errorStyles":[],"errorScripts":[["$","script","script-0",{"src":"/_next/static/chunks/5a71b686dbf13b16.js","async":true}]],"template":["$","$L4",null,{}],"notFound":[["$","$L5",null,{}],[]]}]}]]}]]}],"loading":null,"isPartial":false}

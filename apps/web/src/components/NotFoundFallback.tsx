@@ -3,6 +3,7 @@
 import { usePathname } from "next/navigation";
 import { Suspense, useState, useEffect } from "react";
 import dynamic from "next/dynamic";
+import { Fun40xPage } from "@/components/ErrorPages";
 
 const LobbyContent = dynamic(
   () => import("@/app/lobby/[id]/LobbyContent").then((m) => m.default),
@@ -56,14 +57,7 @@ function NotFoundFallbackInner() {
     );
   }
 
-  return (
-    <main className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-b from-[#0d1f0d] via-[#0a0a0a] to-[#1a0f0a]">
-      <h1 className="font-display text-4xl text-emerald-500 mb-4">Page not found</h1>
-      <a href="/" className="text-emerald-400 hover:text-emerald-300 underline">
-        Back home
-      </a>
-    </main>
-  );
+  return <Fun40xPage />;
 }
 
 export function NotFoundFallback() {

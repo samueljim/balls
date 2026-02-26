@@ -7,10 +7,18 @@ import { Input } from "@/components/ui/input";
 import { FunPageLayout, FunPanel, funInputClass, funButtonPrimaryClass } from "@/components/layout/FunPageLayout";
 import { API_BASE, apiJson } from "@/lib/api";
 
-export default function JoinContent() {
+function useSearchDict(searchString: string) {
+  const params = new URLSearchParams(searchString || (typeof window !== "undefined" ? window.location.search : ""));
+  return { get: (k: string) => params.get(k) };
+}
+
+export default function JoinContent({
+  overrideCode,
+  overrideSearch,
+}: { overrideCode?: string; overrideSearch?: string } = {}) {
   const params = useParams();
   const router = useRouter();
-  const code = (params.code as string)?.toUpperCase() ?? "";
+  const code = (overrideCode ?? (params.code as string))?.toUpperCase() ?? "";
   const [name, setName] = useState("");
   const [joining, setJoining] = useState(false);
   const [error, setError] = useState("");

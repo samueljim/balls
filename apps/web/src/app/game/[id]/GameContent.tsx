@@ -5,19 +5,34 @@ import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
 import { GameCanvas } from "@/components/game/GameCanvas";
 
-function GameInner() {
+function useSearchDict(searchString: string) {
+  const params = new URLSearchParams(searchString || (typeof window !== "undefined" ? window.location.search : ""));
+  return { get: (k: string) => params.get(k) ?? "" };
+}
+
+function GameInner({ overrideId, overrideSearch }: { overrideId?: string; overrideSearch?: string } = {}) {
   const params = useParams();
-  const search = useSearchParams();
-  const gameId = params.id as string;
+  const searchFromRouter = useSearchParams();
+  const search = overrideSearch !== undefined ? useSearchDict(overrideSearch) : searchFromRouter;
+  const gameId = (overrideId ?? (params.id as string)) ?? "";
   const playerId = search.get("playerId") ?? "";
   const [playerOrder, setPlayerOrder] = useState<{ playerId: string; isBot: boolean; name: string }[]>([]);
 
   useEffect(() => {
+    if (!gameId) return;
     try {
       const stored = sessionStorage.getItem(`worms:${gameId}`);
       if (stored) setPlayerOrder(JSON.parse(stored));
     } catch (_) {}
   }, [gameId]);
+
+  if (!gameId) {
+    return (
+      <main className="min-h-screen flex items-center justify-center bg-[#0d1f0d]">
+        <p className="text-stone-400">Missing game id</p>
+      </main>
+    );
+  }
 
   if (playerOrder.length === 0) {
     return (
@@ -52,7 +67,10 @@ function GameInner() {
   );
 }
 
-export default function GameContent() {
+export default function GameContent({
+  overrideId,
+  overrideSearch,
+}: { overrideId?: string; overrideSearch?: string } = {}) {
   return (
     <Suspense
       fallback={
@@ -61,7 +79,7 @@ export default function GameContent() {
         </main>
       }
     >
-      <GameInner />
+      <GameInner overrideId={overrideId} overrideSearch={overrideSearch} />
     </Suspense>
   );
 }

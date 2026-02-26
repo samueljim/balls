@@ -1,7 +1,7 @@
 "use client";
 
 import { usePathname } from "next/navigation";
-import { Suspense } from "react";
+import { Suspense, useState, useEffect } from "react";
 import dynamic from "next/dynamic";
 
 const LobbyContent = dynamic(
@@ -17,8 +17,17 @@ const JoinContent = dynamic(
   { ssr: false }
 );
 
+function usePathnameOrWindow() {
+  const pathnameFromRouter = usePathname();
+  const [pathnameFromWindow, setPathnameFromWindow] = useState("");
+  useEffect(() => {
+    setPathnameFromWindow(window.location.pathname);
+  }, []);
+  return pathnameFromRouter ?? pathnameFromWindow;
+}
+
 function NotFoundFallbackInner() {
-  const pathname = usePathname() ?? (typeof window !== "undefined" ? window.location.pathname : "");
+  const pathname = usePathnameOrWindow();
   const search = typeof window !== "undefined" ? window.location.search : "";
 
   const lobbyMatch = pathname.match(/^\/lobby\/([^/]+)\/?$/);

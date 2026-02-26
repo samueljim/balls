@@ -14,16 +14,35 @@ interface Player {
   isBot?: boolean;
 }
 
-export default function LobbyContent() {
+function useSearchDict(searchString: string) {
+  const params = new URLSearchParams(searchString || (typeof window !== "undefined" ? window.location.search : ""));
+  return {
+    get: (k: string) => params.get(k),
+  };
+}
+
+export default function LobbyContent({
+  overrideId,
+  overrideSearch,
+}: { overrideId?: string; overrideSearch?: string } = {}) {
   const params = useParams();
-  const search = useSearchParams();
-  const lobbyId = params.id as string;
+  const searchFromRouter = useSearchParams();
+  const search = overrideSearch !== undefined ? useSearchDict(overrideSearch) : searchFromRouter;
+  const lobbyId = (overrideId ?? (params.id as string)) ?? "";
   const isHost = search.get("host") === "1";
   const playerId = search.get("playerId") ?? lobbyId;
   const playerName = search.get("playerName") ?? "Host";
   const [players, setPlayers] = useState<Player[]>([]);
   const [copied, setCopied] = useState(false);
   const code = search.get("code") ?? null;
+
+  if (!lobbyId) {
+    return (
+      <main className="min-h-screen flex items-center justify-center bg-[#0d1f0d]">
+        <p className="text-stone-400">Missing lobby id</p>
+      </main>
+    );
+  }
 
   const wsPath = `/lobby/${lobbyId}?playerId=${encodeURIComponent(playerId)}&playerName=${encodeURIComponent(playerName)}`;
   const { readyState, lastMessage, send } = useWebSocket(getWsUrl(wsPath));

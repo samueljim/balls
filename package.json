@@ -1,0 +1,19 @@
+{
+  "name": "worms",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -n worker,web \"pnpm run dev:worker\" \"pnpm run dev:web\"",
+    "dev:worker": "node scripts/run-worker-dev.mjs",
+    "dev:web": "cd apps/web && pnpm dev",
+    "deploy": "pnpm run deploy:worker",
+    "deploy:worker": "cd apps/worker && pnpm run deploy",
+    "deploy:web": "cd apps/web && pnpm run build && cd ../.. && pnpm --filter worms-worker exec wrangler pages deploy ../web/out --project-name=worms-web",
+    "build": "pnpm run -r build",
+    "build:game": "cd packages/game-core && wasm-pack build --target web --out-dir pkg"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "turbo": "^2.3.0"
+  },
+  "packageManager": "pnpm@9.14.2"
+}

@@ -1,0 +1,1 @@
+self.__SSG_MANIFEST=new Set(["\u002Fgame\u002F[id]","\u002Fjoin\u002F[code]","\u002Flobby\u002F[id]"]);self.__SSG_MANIFEST_CB&&self.__SSG_MANIFEST_CB()

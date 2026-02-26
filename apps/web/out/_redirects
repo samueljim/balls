@@ -1,0 +1,4 @@
+# SPA fallback: serve app shell for dynamic routes so client router can handle them (avoid rewriting to a path that matches again = no redirect loop)
+/lobby/*   /index.html   200
+/game/*    /index.html   200
+/join/*    /index.html   200

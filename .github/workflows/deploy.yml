@@ -75,7 +75,7 @@ jobs:
           NEXT_PUBLIC_WS_BASE: wss://api.balls.bne.sh
 
       - name: Deploy to Cloudflare Pages
-        run: pnpm --filter balls-worker exec wrangler pages deploy ../web/out --project-name=balls-web
+        run: pnpm --filter balls-worker exec wrangler pages deploy ../web/out --project-name=worms-web
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

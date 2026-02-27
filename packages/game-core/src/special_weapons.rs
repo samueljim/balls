@@ -1,4 +1,4 @@
-use crate::physics::Worm;
+use crate::physics::Ball;
 use crate::terrain::Terrain;
 use crate::projectile::Explosion;
 use macroquad::prelude::*;
@@ -18,7 +18,7 @@ pub enum AirstrikeType {
 }
 
 impl AirstrikeDroplet {
-    pub fn tick(&mut self, terrain: &mut Terrain, worms: &mut [Worm], dt: f32) -> Option<Explosion> {
+    pub fn tick(&mut self, terrain: &mut Terrain, balls: &mut [Ball], dt: f32) -> Option<Explosion> {
         if !self.alive {
             return None;
         }
@@ -35,13 +35,13 @@ impl AirstrikeDroplet {
         // Check collision with terrain or water
         let is_water = self.y >= crate::terrain::WATER_LEVEL;
         if is_water || terrain.is_solid(self.x as i32, self.y as i32) {
-            return self.explode(terrain, worms);
+            return self.explode(terrain, balls);
         }
 
         None
     }
 
-    fn explode(&mut self, terrain: &mut Terrain, worms: &mut [Worm]) -> Option<Explosion> {
+    fn explode(&mut self, terrain: &mut Terrain, balls: &mut [Ball]) -> Option<Explosion> {
         self.alive = false;
 
         let (radius, damage) = match self.weapon_type {
@@ -51,10 +51,10 @@ impl AirstrikeDroplet {
 
         terrain.apply_damage(self.x as i32, self.y as i32, radius as i32);
 
-        // Apply damage to worms
+        // Apply damage to balls
         let blast_radius = radius * 1.8;
         let r2 = blast_radius * blast_radius;
-        for w in worms.iter_mut() {
+        for w in balls.iter_mut() {
             if !w.alive {
                 continue;
             }
@@ -93,7 +93,7 @@ pub struct UziBullet {
 }
 
 impl UziBullet {
-    pub fn tick(&mut self, terrain: &mut Terrain, worms: &mut [Worm], dt: f32) -> bool {
+    pub fn tick(&mut self, terrain: &mut Terrain, balls: &mut [Ball], dt: f32) -> bool {
         if !self.alive {
             return false;
         }
@@ -111,7 +111,7 @@ impl UziBullet {
             return false;
         }
 
-        // Skip terrain/worm checks when above map
+        // Skip terrain/ball checks when above map
         if self.y < 0.0 {
             return false;
         }
@@ -129,8 +129,8 @@ impl UziBullet {
             return true;
         }
 
-        // Check worm collision
-        for w in worms.iter_mut() {
+        // Check ball collision
+        for w in balls.iter_mut() {
             if !w.alive {
                 continue;
             }
@@ -175,13 +175,13 @@ impl PlacedExplosive {
         false
     }
 
-    pub fn explode(&self, terrain: &mut Terrain, worms: &mut [Worm]) -> Explosion {
+    pub fn explode(&self, terrain: &mut Terrain, balls: &mut [Ball]) -> Explosion {
         terrain.apply_damage(self.x as i32, self.y as i32, self.radius as i32);
 
-        // Apply damage to worms
+        // Apply damage to balls
         let blast_radius = self.radius * 1.8;
         let r2 = blast_radius * blast_radius;
-        for w in worms.iter_mut() {
+        for w in balls.iter_mut() {
             if !w.alive {
                 continue;
             }

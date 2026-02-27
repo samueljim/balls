@@ -1,4 +1,4 @@
-use crate::physics::Worm;
+use crate::physics::Ball;
 use crate::terrain::Terrain;
 use crate::weapons::Weapon;
 
@@ -42,7 +42,7 @@ pub struct ClusterBomblet {
 }
 
 impl ShotgunPellet {
-    pub fn tick(&mut self, terrain: &mut Terrain, worms: &mut [Worm], dt: f32) -> bool {
+    pub fn tick(&mut self, terrain: &mut Terrain, balls: &mut [Ball], dt: f32) -> bool {
         if !self.alive {
             return false;
         }
@@ -60,7 +60,7 @@ impl ShotgunPellet {
             return false;
         }
 
-        // Skip terrain/worm checks when above map
+        // Skip terrain/ball checks when above map
         if self.y < 0.0 {
             return false;
         }
@@ -79,8 +79,8 @@ impl ShotgunPellet {
             return true;
         }
 
-        // Check worm collision
-        for w in worms.iter_mut() {
+        // Check ball collision
+        for w in balls.iter_mut() {
             if !w.alive {
                 continue;
             }
@@ -102,7 +102,7 @@ impl ShotgunPellet {
 }
 
 impl ClusterBomblet {
-    pub fn tick(&mut self, terrain: &mut Terrain, worms: &mut [Worm], dt: f32) -> Option<Explosion> {
+    pub fn tick(&mut self, terrain: &mut Terrain, balls: &mut [Ball], dt: f32) -> Option<Explosion> {
         if !self.alive {
             return None;
         }
@@ -113,7 +113,7 @@ impl ClusterBomblet {
 
         self.fuse -= dt;
         if self.fuse <= 0.0 {
-            return self.explode(terrain, worms);
+            return self.explode(terrain, balls);
         }
 
         // Boundary check
@@ -125,7 +125,7 @@ impl ClusterBomblet {
 
         // Check collision
         if terrain.is_solid(self.x as i32, self.y as i32) {
-            return self.explode(terrain, worms);
+            return self.explode(terrain, balls);
         }
 
         if self.y > crate::terrain::WATER_LEVEL {
@@ -141,14 +141,14 @@ impl ClusterBomblet {
         None
     }
 
-    fn explode(&mut self, terrain: &mut Terrain, worms: &mut [Worm]) -> Option<Explosion> {
+    fn explode(&mut self, terrain: &mut Terrain, balls: &mut [Ball]) -> Option<Explosion> {
         self.alive = false;
         
         terrain.apply_damage(self.x as i32, self.y as i32, self.radius as i32);
 
         let blast_radius = self.radius * 2.0;
         let r2 = blast_radius * blast_radius;
-        for w in worms.iter_mut() {
+        for w in balls.iter_mut() {
             if !w.alive {
                 continue;
             }
@@ -200,7 +200,7 @@ impl Projectile {
         }
     }
 
-    pub fn tick(&mut self, terrain: &mut Terrain, worms: &mut [Worm], wind: f32, dt: f32) -> (Option<Explosion>, Vec<ClusterBomblet>) {
+    pub fn tick(&mut self, terrain: &mut Terrain, balls: &mut [Ball], wind: f32, dt: f32) -> (Option<Explosion>, Vec<ClusterBomblet>) {
         if !self.alive {
             return (None, Vec::new());
         }
@@ -213,13 +213,13 @@ impl Projectile {
         const GRAVITY: f32 = 480.0;
         let air_resistance = if self.weapon == Weapon::Bazooka { 0.99 } else { 0.98 };
 
-        // Homing Missile behavior - track nearest worm
+        // Homing Missile behavior - track nearest ball
         if self.weapon == Weapon::HomingMissile {
             let mut closest_dist = f32::MAX;
             let mut target_x = 0.0;
             let mut target_y = 0.0;
             
-            for w in worms.iter() {
+            for w in balls.iter() {
                 if !w.alive {
                     continue;
                 }
@@ -261,7 +261,7 @@ impl Projectile {
             self.fuse -= dt;
             if self.fuse <= 0.0 {
                 self.alive = false;
-                return self.create_explosion(terrain, worms);
+                return self.create_explosion(terrain, balls);
             }
         }
 
@@ -274,7 +274,7 @@ impl Projectile {
             return (None, Vec::new());
         }
 
-        // Skip terrain/worm checks when above map
+        // Skip terrain/ball checks when above map
         if py < 0 {
             return (None, Vec::new());
         }
@@ -311,13 +311,13 @@ impl Projectile {
             }
 
             self.alive = false;
-            return self.create_explosion(terrain, worms);
+            return self.create_explosion(terrain, balls);
         }
 
         (None, Vec::new())
     }
 
-    fn create_explosion(&self, terrain: &mut Terrain, worms: &mut [Worm]) -> (Option<Explosion>, Vec<ClusterBomblet>) {
+    fn create_explosion(&self, terrain: &mut Terrain, balls: &mut [Ball]) -> (Option<Explosion>, Vec<ClusterBomblet>) {
         let explosion_radius = self.weapon.explosion_radius() as i32;
 
         let px = self.x as i32;
@@ -327,7 +327,7 @@ impl Projectile {
 
         let max_damage = self.weapon.base_damage();
 
-        for w in worms.iter_mut() {
+        for w in balls.iter_mut() {
             if !w.alive {
                 continue;
             }

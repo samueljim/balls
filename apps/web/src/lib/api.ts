@@ -1,8 +1,8 @@
 /**
- * Backend API base URL. Defaults to the deployed worker at api.worms.bne.sh.
+ * Backend API base URL. Defaults to the deployed worker at api.balls.bne.sh.
  * Override with NEXT_PUBLIC_API_BASE for local worker (e.g. http://localhost:8787).
  */
-const DEFAULT_API_BASE = "https://api.worms.bne.sh";
+const DEFAULT_API_BASE = "https://api.balls.bne.sh";
 export const API_BASE =
   typeof window !== "undefined"
     ? (process.env.NEXT_PUBLIC_API_BASE ?? DEFAULT_API_BASE)

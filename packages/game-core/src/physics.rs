@@ -1,6 +1,6 @@
 use crate::terrain::Terrain;
 
-pub const WORM_RADIUS: f32 = 8.0;
+pub const BALL_RADIUS: f32 = 8.0;
 const GRAVITY: f32 = 480.0;
 const WALK_SPEED: f32 = 100.0;
 const JUMP_VEL: f32 = -270.0;
@@ -9,7 +9,7 @@ const GROUND_FRICTION: f32 = 0.80;
 const AIR_FRICTION: f32 = 0.98;
 const FALL_DAMAGE_THRESHOLD: f32 = 120.0;
 const FALL_DAMAGE_FACTOR: f32 = 0.25;
-const MOVEMENT_BUDGET: f32 = 150.0; // Maximum horizontal distance a worm can move per turn
+const MOVEMENT_BUDGET: f32 = 150.0; // Maximum horizontal distance a ball can move per turn
 
 pub const TEAM_COLORS: [(f32, f32, f32); 4] = [
     (0.85, 0.25, 0.25),
@@ -18,7 +18,7 @@ pub const TEAM_COLORS: [(f32, f32, f32); 4] = [
     (0.90, 0.75, 0.20),
 ];
 
-pub struct Worm {
+pub struct Ball {
     pub x: f32,
     pub y: f32,
     pub vx: f32,
@@ -37,9 +37,9 @@ pub struct Worm {
     pub movement_used: f32,
 }
 
-impl Worm {
+impl Ball {
     pub fn new(x: f32, y: f32, team: u32, name: String) -> Self {
-        Worm {
+        Ball {
             x,
             y,
             vx: 0.0,
@@ -98,7 +98,7 @@ impl Worm {
         }
 
         self.on_ground = false;
-        let r = WORM_RADIUS;
+        let r = BALL_RADIUS;
         for &offset in &[-r * 0.4, 0.0, r * 0.4] {
             let cx = (self.x + offset) as i32;
             let foot_y = (self.y + r) as i32;
@@ -208,50 +208,50 @@ impl Worm {
     }
 }
 
-pub fn walk(worm: &mut Worm, terrain: &Terrain, dir: f32) {
-    if !worm.on_ground || !worm.alive {
+pub fn walk(ball: &mut Ball, terrain: &Terrain, dir: f32) {
+    if !ball.on_ground || !ball.alive {
         return;
     }
     
     // Check if movement budget is exhausted
-    if !worm.can_move() {
+    if !ball.can_move() {
         return;
     }
     
-    worm.facing = dir;
+    ball.facing = dir;
     let step = dir * WALK_SPEED * (1.0 / 60.0);
     let movement_distance = step.abs();
     
     // Check if this step would exceed budget
-    if worm.movement_used + movement_distance > worm.movement_budget {
+    if ball.movement_used + movement_distance > ball.movement_budget {
         // Only move the remaining budget amount
-        let remaining = worm.movement_budget - worm.movement_used;
+        let remaining = ball.movement_budget - ball.movement_used;
         let limited_step = dir.signum() * remaining;
         if remaining < 0.5 {
             return; // Too small to move
         }
-        worm.movement_used = worm.movement_budget;
-        let new_x = worm.x + limited_step;
-        worm.x = new_x;
+        ball.movement_used = ball.movement_budget;
+        let new_x = ball.x + limited_step;
+        ball.x = new_x;
         return;
     }
     
-    let old_x = worm.x;
-    let new_x = worm.x + step;
-    let r = WORM_RADIUS;
+    let old_x = ball.x;
+    let new_x = ball.x + step;
+    let r = BALL_RADIUS;
     let nx = new_x as i32;
-    let foot_y = (worm.y + r) as i32;
+    let foot_y = (ball.y + r) as i32;
 
-    if terrain.is_solid((new_x + dir * r) as i32, worm.y as i32) {
+    if terrain.is_solid((new_x + dir * r) as i32, ball.y as i32) {
         for climb in 1..=MAX_CLIMB {
-            let test_y = worm.y as i32 - climb;
+            let test_y = ball.y as i32 - climb;
             if !terrain.is_solid((new_x + dir * r) as i32, test_y)
                 && !terrain.is_solid(nx, test_y - r as i32)
             {
-                worm.x = new_x;
-                worm.y = test_y as f32;
+                ball.x = new_x;
+                ball.y = test_y as f32;
                 // Track the actual distance moved
-                worm.movement_used += (worm.x - old_x).abs();
+                ball.movement_used += (ball.x - old_x).abs();
                 return;
             }
         }
@@ -260,35 +260,35 @@ pub fn walk(worm: &mut Worm, terrain: &Terrain, dir: f32) {
 
     for drop in 0..=10 {
         if terrain.is_solid(nx, foot_y + drop) {
-            worm.x = new_x;
-            worm.y = (foot_y + drop - 1) as f32 - r;
+            ball.x = new_x;
+            ball.y = (foot_y + drop - 1) as f32 - r;
             // Track the actual distance moved
-            worm.movement_used += (worm.x - old_x).abs();
+            ball.movement_used += (ball.x - old_x).abs();
             return;
         }
     }
 
-    worm.x = new_x;
+    ball.x = new_x;
     // Track the actual distance moved
-    worm.movement_used += (worm.x - old_x).abs();
+    ball.movement_used += (ball.x - old_x).abs();
 }
 
-pub fn jump(worm: &mut Worm) {
-    if !worm.on_ground || !worm.alive {
+pub fn jump(ball: &mut Ball) {
+    if !ball.on_ground || !ball.alive {
         return;
     }
-    worm.vy = JUMP_VEL;
-    worm.vx += worm.facing * 60.0;
-    worm.on_ground = false;
-    worm.fall_start_y = worm.y;
+    ball.vy = JUMP_VEL;
+    ball.vx += ball.facing * 60.0;
+    ball.on_ground = false;
+    ball.fall_start_y = ball.y;
 }
 
-pub fn backflip(worm: &mut Worm) {
-    if !worm.on_ground || !worm.alive {
+pub fn backflip(ball: &mut Ball) {
+    if !ball.on_ground || !ball.alive {
         return;
     }
-    worm.vy = JUMP_VEL - 60.0;
-    worm.vx += -worm.facing * 120.0;
-    worm.on_ground = false;
-    worm.fall_start_y = worm.y;
+    ball.vy = JUMP_VEL - 60.0;
+    ball.vx += -ball.facing * 120.0;
+    ball.on_ground = false;
+    ball.fall_start_y = ball.y;
 }

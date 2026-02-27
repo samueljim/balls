@@ -2,7 +2,7 @@
 name = "game-core"
 version = "0.1.0"
 edition = "2021"
-description = "Worms-like game engine using macroquad"
+description = "Balls-like game engine using macroquad"
 
 [[bin]]
 name = "game-core"

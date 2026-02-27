@@ -10,7 +10,7 @@ mod weapons;
 
 use camera::GameCamera;
 use macroquad::prelude::*;
-use physics::{Worm, WORM_RADIUS};
+use physics::{Ball, BALL_RADIUS};
 use projectile::{Projectile, ClusterBomblet, ShotgunPellet};
 use special_weapons::{AirstrikeDroplet, UziBullet, PlacedExplosive, AirstrikeType};
 use state::Phase;
@@ -43,8 +43,8 @@ struct Game {
     terrain_texture: Texture2D,
     terrain_dirty: bool,
 
-    worms: Vec<Worm>,
-    current_worm: usize,
+    balls: Vec<Ball>,
+    current_ball: usize,
 
     phase: Phase,
     turn_timer: f32,
@@ -95,8 +95,8 @@ struct Game {
     last_aim_send: f32,
     /// Track last logged turn state to reduce console spam
     last_logged_turn_state: (usize, Option<usize>),
-    /// Track which worm index was last used per team for round-robin rotation
-    last_worm_per_team: Vec<Option<usize>>,
+    /// Track which ball index was last used per team for round-robin rotation
+    last_ball_per_team: Vec<Option<usize>>,
 }
 
 impl Game {
@@ -117,18 +117,18 @@ impl Game {
             ["Viper", "Ghost", "Flash"],
             ["Rex", "Duke", "Scout"],
         ];
-        let worms_per_team: usize = 3;
-        let total = num_teams * worms_per_team;
-        let mut worms = Vec::new();
+        let balls_per_team: usize = 3;
+        let total = num_teams * balls_per_team;
+        let mut balls = Vec::new();
 
-        // Spawn worms within the playable land area only
+        // Spawn balls within the playable land area only
         let mut positions: Vec<f32> = Vec::new();
         for i in 0..total {
             let x = terrain::LAND_START_X + (i + 1) as f32 * terrain::PLAYABLE_LAND_WIDTH / (total + 1) as f32;
             positions.push(x);
         }
         let mut interleaved: Vec<(usize, usize)> = Vec::new();
-        for wi in 0..worms_per_team {
+        for wi in 0..balls_per_team {
             for ti in 0..num_teams {
                 interleaved.push((ti, wi));
             }
@@ -143,15 +143,15 @@ impl Game {
             
             // Try original position first
             if let Some(surface_y) = t.find_surface_y(search_x) {
-                // Check if there's lava at or near where the worm would spawn
-                let worm_y = surface_y - (WORM_RADIUS as i32) - 2;
+                // Check if there's lava at or near where the ball would spawn
+                let ball_y = surface_y - (BALL_RADIUS as i32) - 2;
                 let mut is_safe = true;
                 
                 // Check area around spawn position for lava
                 for dy in -2..3 {
                     for dx in -2..3 {
                         let check_x = search_x + dx;
-                        let check_y = worm_y + dy;
+                        let check_y = ball_y + dy;
                         if t.get(check_x, check_y) == terrain::LAVA {
                             is_safe = false;
                             break;
@@ -161,7 +161,7 @@ impl Game {
                 }
                 
                 if is_safe {
-                    spawn_y = Some(surface_y as f32 - WORM_RADIUS - 2.0);
+                    spawn_y = Some(surface_y as f32 - BALL_RADIUS - 2.0);
                 }
             }
             
@@ -171,14 +171,14 @@ impl Game {
                     for dir in [-1, 1] {
                         let test_x = (x as i32 + offset * dir).max(terrain::LAND_START_X as i32).min(terrain::LAND_END_X as i32);
                         if let Some(surface_y) = t.find_surface_y(test_x) {
-                            let worm_y = surface_y - (WORM_RADIUS as i32) - 2;
+                            let ball_y = surface_y - (BALL_RADIUS as i32) - 2;
                             let mut is_safe = true;
                             
                             // Check area around spawn position for lava
                             for dy in -2..3 {
                                 for dx in -2..3 {
                                     let check_x = test_x + dx;
-                                    let check_y = worm_y + dy;
+                                    let check_y = ball_y + dy;
                                     if t.get(check_x, check_y) == terrain::LAVA {
                                         is_safe = false;
                                         break;
@@ -188,7 +188,7 @@ impl Game {
                             }
                             
                             if is_safe {
-                                spawn_y = Some(surface_y as f32 - WORM_RADIUS - 2.0);
+                                spawn_y = Some(surface_y as f32 - BALL_RADIUS - 2.0);
                                 search_x = test_x;
                                 break;
                             }
@@ -203,7 +203,7 @@ impl Game {
             let y = spawn_y.unwrap_or(400.0);
             let spawn_x = search_x as f32;
             let name = team_names[ti % team_names.len()][wi % 3].to_string();
-            worms.push(Worm::new(spawn_x, y, ti as u32, name));
+            balls.push(Ball::new(spawn_x, y, ti as u32, name));
         }
 
         // Center camera on playable land area
@@ -218,8 +218,8 @@ impl Game {
             terrain_image: img,
             terrain_texture: tex,
             terrain_dirty: false,
-            worms,
-            current_worm: 0,
+            balls,
+            current_ball: 0,
             phase: Phase::Aiming,
             turn_timer: TURN_TIME,
             settle_timer: 0.0,
@@ -255,13 +255,13 @@ impl Game {
             last_aim_send: 0.0,
             last_logged_turn_state: (0, None),
             retreat_timer: 0.0,
-            last_worm_per_team: {
-                // Pre-record that worm 0 (team 0's first worm) is the initial
-                // current_worm, so the next sync_to_player_turn(0) knows to
-                // advance to the second worm instead of re-picking the first.
+            last_ball_per_team: {
+                // Pre-record that ball 0 (team 0's first ball) is the initial
+                // current_ball, so the next sync_to_player_turn(0) knows to
+                // advance to the second ball instead of re-picking the first.
                 let mut v = vec![None; num_teams];
                 if num_teams > 0 {
-                    v[0] = Some(0); // current_worm starts at 0 which belongs to team 0
+                    v[0] = Some(0); // current_ball starts at 0 which belongs to team 0
                 }
                 v
             },
@@ -295,10 +295,10 @@ impl Game {
         self.current_turn_index == my_player_index
     }
     
-    /// Find the first alive worm for a given team/player
-    fn find_worm_for_player(&self, player_index: usize) -> Option<usize> {
+    /// Find the first alive ball for a given team/player
+    fn find_ball_for_player(&self, player_index: usize) -> Option<usize> {
         let team = player_index as u32;
-        self.worms
+        self.balls
             .iter()
             .enumerate()
             .find(|(_, w)| w.alive && w.team == team)
@@ -369,31 +369,31 @@ impl Game {
             return;
         }
 
-        // During Retreat or ProjectileFlying phase: allow movement for local player's worm
+        // During Retreat or ProjectileFlying phase: allow movement for local player's ball
         if self.phase == Phase::Retreat || self.phase == Phase::ProjectileFlying {
-            // During Retreat the active player moves the worm that just fired,
-            // which is already stored in current_worm.
+            // During Retreat the active player moves the ball that just fired,
+            // which is already stored in current_ball.
             // During ProjectileFlying the non-active player can also move; use
-            // find_worm_for_player so they control one of their own worms.
-            let worm_idx_opt = if self.phase == Phase::Retreat {
-                // Always the worm that fired (current_worm)
-                Some(self.current_worm)
+            // find_ball_for_player so they control one of their own balls.
+            let ball_idx_opt = if self.phase == Phase::Retreat {
+                // Always the ball that fired (current_ball)
+                Some(self.current_ball)
             } else if self.net.connected {
-                self.net.my_player_index.and_then(|pi| self.find_worm_for_player(pi))
+                self.net.my_player_index.and_then(|pi| self.find_ball_for_player(pi))
             } else {
-                Some(self.current_worm)
+                Some(self.current_ball)
             };
 
-            if let Some(wi) = worm_idx_opt {
-                if wi < self.worms.len() && self.worms[wi].alive {
-                    let worm = &mut self.worms[wi];
-                    let can_move = worm.can_move();
+            if let Some(wi) = ball_idx_opt {
+                if wi < self.balls.len() && self.balls[wi].alive {
+                    let ball = &mut self.balls[wi];
+                    let can_move = ball.can_move();
 
                     let current_time = get_time() as f32;
                     let should_send_movement = self.net.connected && (current_time - self.last_movement_send > 0.1);
 
                     if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) {
-                        physics::walk(worm, &self.terrain, -1.0);
+                        physics::walk(ball, &self.terrain, -1.0);
                         if should_send_movement {
                             let msg = r#"{"type":"input","input":"{\"Walk\":{\"dir\":-1.0}}"}"#;
                             self.net.send_message(msg);
@@ -401,7 +401,7 @@ impl Game {
                         }
                     }
                     if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) {
-                        physics::walk(worm, &self.terrain, 1.0);
+                        physics::walk(ball, &self.terrain, 1.0);
                         if should_send_movement {
                             let msg = r#"{"type":"input","input":"{\"Walk\":{\"dir\":1.0}}"}"#;
                             self.net.send_message(msg);
@@ -411,16 +411,16 @@ impl Game {
 
                     if can_move {
                         if is_key_pressed(KeyCode::W) || is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::Space) {
-                            physics::jump(worm);
-                            worm.movement_used += 20.0;
+                            physics::jump(ball);
+                            ball.movement_used += 20.0;
                             if self.net.connected {
                                 let msg = r#"{"type":"input","input":"{\"Jump\":{}}"}"#;
                                 self.net.send_message(msg);
                             }
                         }
                         if is_key_pressed(KeyCode::S) || is_key_pressed(KeyCode::Down) {
-                            physics::backflip(worm);
-                            worm.movement_used += 30.0;
+                            physics::backflip(ball);
+                            ball.movement_used += 30.0;
                             if self.net.connected {
                                 let msg = r#"{"type":"input","input":"{\"Backflip\":{}}"}"#;
                                 self.net.send_message(msg);
@@ -533,9 +533,9 @@ impl Game {
 
         // Only update aim angle on your turn
         if self.is_my_turn() {
-            if let Some(worm) = self.worms.get(self.current_worm) {
-                if worm.alive {
-                    let (wx, wy) = (worm.x, worm.y);
+            if let Some(ball) = self.balls.get(self.current_ball) {
+                if ball.alive {
+                    let (wx, wy) = (ball.x, ball.y);
                     let (world_mx, world_my) = self.cam.screen_to_world(mx, my);
                     let dx = world_mx - wx;
                     let dy = world_my - wy;
@@ -558,15 +558,15 @@ impl Game {
         }
 
         // Only allow movement if it's the player's turn and phase allows it
-        if self.is_my_turn() && self.phase.allows_movement() && self.current_worm < self.worms.len() && self.worms[self.current_worm].alive && !self.weapon_menu_open {
-            let worm = &mut self.worms[self.current_worm];
-            let can_move = worm.can_move();
+        if self.is_my_turn() && self.phase.allows_movement() && self.current_ball < self.balls.len() && self.balls[self.current_ball].alive && !self.weapon_menu_open {
+            let ball = &mut self.balls[self.current_ball];
+            let can_move = ball.can_move();
             
             let current_time = get_time() as f32;
             let should_send_movement = self.net.connected && (current_time - self.last_movement_send > 0.1);
             
             if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) {
-                physics::walk(worm, &self.terrain, -1.0);
+                physics::walk(ball, &self.terrain, -1.0);
                 if should_send_movement {
                     let msg = r#"{"type":"input","input":"{\"Walk\":{\"dir\":-1.0}}"}"#;
                     self.net.send_message(msg);
@@ -574,7 +574,7 @@ impl Game {
                 }
             }
             if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) {
-                physics::walk(worm, &self.terrain, 1.0);
+                physics::walk(ball, &self.terrain, 1.0);
                 if should_send_movement {
                     let msg = r#"{"type":"input","input":"{\"Walk\":{\"dir\":1.0}}"}"#;
                     self.net.send_message(msg);
@@ -585,16 +585,16 @@ impl Game {
             // Only allow jumping if there's movement budget
             if can_move {
                 if is_key_pressed(KeyCode::W) || is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::Space) {
-                    physics::jump(worm);
-                    worm.movement_used += 20.0; // Jumping costs movement
+                    physics::jump(ball);
+                    ball.movement_used += 20.0; // Jumping costs movement
                     if self.net.connected {
                         let msg = r#"{"type":"input","input":"{\"Jump\":{}}"}"#;
                         self.net.send_message(msg);
                     }
                 }
                 if is_key_pressed(KeyCode::S) || is_key_pressed(KeyCode::Down) {
-                    physics::backflip(worm);
-                    worm.movement_used += 30.0; // Backflip costs more
+                    physics::backflip(ball);
+                    ball.movement_used += 30.0; // Backflip costs more
                     if self.net.connected {
                         let msg = r#"{"type":"input","input":"{\"Backflip\":{}}"}"#;
                         self.net.send_message(msg);
@@ -609,17 +609,17 @@ impl Game {
                 let (mx, my) = mouse_position();
                 let world_pos = self.cam.to_macroquad().screen_to_world(vec2(mx, my));
                 
-                let idx = self.current_worm;
-                if idx < self.worms.len() && self.worms[idx].alive {
+                let idx = self.current_ball;
+                if idx < self.balls.len() && self.balls[idx].alive {
                     // Check if the destination is valid (not inside solid terrain)
                     let target_x = world_pos.x.clamp(0.0, self.terrain.width as f32);
                     let target_y = world_pos.y.clamp(0.0, self.terrain.height as f32);
                     
-                    // Simple teleport - place worm at clicked location
-                    self.worms[idx].x = target_x;
-                    self.worms[idx].y = target_y;
-                    self.worms[idx].vx = 0.0;
-                    self.worms[idx].vy = 0.0;
+                    // Simple teleport - place ball at clicked location
+                    self.balls[idx].x = target_x;
+                    self.balls[idx].y = target_y;
+                    self.balls[idx].vx = 0.0;
+                    self.balls[idx].vy = 0.0;
                     
                     self.teleport_mode = false;
                     self.has_fired = true;
@@ -629,33 +629,33 @@ impl Game {
             }
             // Handle Baseball Bat mode
             else if self.baseball_bat_mode {
-                let idx = self.current_worm;
-                if idx < self.worms.len() && self.worms[idx].alive {
+                let idx = self.current_ball;
+                if idx < self.balls.len() && self.balls[idx].alive {
                     // Store necessary values to avoid borrowing issues
-                    let worm_x = self.worms[idx].x;
-                    let worm_y = self.worms[idx].y;
+                    let ball_x = self.balls[idx].x;
+                    let ball_y = self.balls[idx].y;
                     let bat_range = 60.0;
                     let angle = self.aim_angle;
                     let knockback_power = 15.0;
                     
-                    // Find worms in range and knock them back
-                    for i in 0..self.worms.len() {
+                    // Find balls in range and knock them back
+                    for i in 0..self.balls.len() {
                         if i == idx { continue; }
-                        if !self.worms[i].alive { continue; }
+                        if !self.balls[i].alive { continue; }
                         
-                        let dx = self.worms[i].x - worm_x;
-                        let dy = self.worms[i].y - worm_y;
+                        let dx = self.balls[i].x - ball_x;
+                        let dy = self.balls[i].y - ball_y;
                         let dist = (dx*dx + dy*dy).sqrt();
                         
                         if dist < bat_range {
                             // Apply knockback based on aim direction
-                            self.worms[i].vx += angle.cos() * knockback_power;
-                            self.worms[i].vy += angle.sin() * knockback_power;
+                            self.balls[i].vx += angle.cos() * knockback_power;
+                            self.balls[i].vy += angle.sin() * knockback_power;
                             
                             // Deal minimal damage
-                            self.worms[i].health = self.worms[i].health.saturating_sub(10);
-                            if self.worms[i].health == 0 {
-                                self.worms[i].alive = false;
+                            self.balls[i].health = self.balls[i].health.saturating_sub(10);
+                            if self.balls[i].health == 0 {
+                                self.balls[i].alive = false;
                             }
                         }
                     }
@@ -691,8 +691,8 @@ impl Game {
         if self.has_fired {
             return;
         }
-        let idx = self.current_worm;
-        if idx >= self.worms.len() || !self.worms[idx].alive {
+        let idx = self.current_ball;
+        if idx >= self.balls.len() || !self.balls[idx].alive {
             return;
         }
 
@@ -734,13 +734,13 @@ impl Game {
     }
 
     fn do_fire(&mut self, idx: usize, angle: f32, power: f32, weapon: Weapon) {
-        if idx >= self.worms.len() || !self.worms[idx].alive {
+        if idx >= self.balls.len() || !self.balls[idx].alive {
             return;
         }
-        let worm = &self.worms[idx];
-        let offset = WORM_RADIUS + 4.0;
-        let sx = worm.x + angle.cos() * offset;
-        let sy = worm.y + angle.sin() * offset;
+        let ball = &self.balls[idx];
+        let offset = BALL_RADIUS + 4.0;
+        let sx = ball.x + angle.cos() * offset;
+        let sy = ball.y + angle.sin() * offset;
         
         match weapon {
             // Shotgun - spread of pellets
@@ -794,11 +794,11 @@ impl Game {
             // Airstrike - 5 droplets from above
             Weapon::Airstrike => {
                 self.airstrike_droplets.clear();
-                let worm_x = worm.x;
+                let ball_x = ball.x;
                 let spacing = 80.0;
                 
                 for i in 0..5 {
-                    let x = worm_x + (i as f32 - 2.0) * spacing;
+                    let x = ball_x + (i as f32 - 2.0) * spacing;
                     self.airstrike_droplets.push(AirstrikeDroplet {
                         x,
                         y: -50.0,
@@ -813,11 +813,11 @@ impl Game {
             // Napalm Strike - 7 droplets in a line
             Weapon::NapalmStrike => {
                 self.airstrike_droplets.clear();
-                let worm_x = worm.x;
+                let ball_x = ball.x;
                 let spacing = 60.0;
                 
                 for i in 0..7 {
-                    let x = worm_x + (i as f32 - 3.0) * spacing;
+                    let x = ball_x + (i as f32 - 3.0) * spacing;
                     self.airstrike_droplets.push(AirstrikeDroplet {
                         x,
                         y: -50.0,
@@ -829,11 +829,11 @@ impl Game {
                 self.phase = Phase::ProjectileFlying;
             },
             
-            // Dynamite - place at worm position
+            // Dynamite - place at ball position
             Weapon::Dynamite => {
                 self.placed_explosives.push(PlacedExplosive {
-                    x: worm.x,
-                    y: worm.y + WORM_RADIUS - 2.0,
+                    x: ball.x,
+                    y: ball.y + BALL_RADIUS - 2.0,
                     fuse: 5.0,
                     alive: true,
                     radius: 45.0,
@@ -896,8 +896,8 @@ impl Game {
             unsafe { console_log(msg.as_ptr()); }
         }
         if self.net.connected && self.is_my_turn() {
-            // Send worm state snapshot so opponent syncs positions/health
-            self.send_worm_state();
+            // Send ball state snapshot so opponent syncs positions/health
+            self.send_ball_state();
             self.net.send_message(r#"{"type":"end_turn"}"#);
         }
         self.phase = Phase::TurnEnd;
@@ -906,18 +906,18 @@ impl Game {
         self.charge_power = 0.0;
     }
 
-    /// Send a snapshot of all worm positions/health to sync with other players
-    fn send_worm_state(&self) {
-        let mut worm_data = String::from("[");
-        for (i, w) in self.worms.iter().enumerate() {
-            if i > 0 { worm_data.push(','); }
-            worm_data.push_str(&format!(
+    /// Send a snapshot of all ball positions/health to sync with other players
+    fn send_ball_state(&self) {
+        let mut ball_data = String::from("[");
+        for (i, w) in self.balls.iter().enumerate() {
+            if i > 0 { ball_data.push(','); }
+            ball_data.push_str(&format!(
                 "{{\"x\":{},\"y\":{},\"vx\":{},\"vy\":{},\"hp\":{},\"alive\":{}}}",
                 w.x, w.y, w.vx, w.vy, w.health, w.alive
             ));
         }
-        worm_data.push(']');
-        let msg = format!("{{\"type\":\"worm_state\",\"worms\":{}}}", worm_data);
+        ball_data.push(']');
+        let msg = format!("{{\"type\":\"ball_state\",\"balls\":{}}}", ball_data);
         self.net.send_message(&msg);
     }
 
@@ -1004,13 +1004,13 @@ impl Game {
         }
     }
 
-    /// Apply worm state snapshot from the active player to sync positions/health
-    fn apply_worm_state(&mut self, msg: &str) {
-        // Parse the worms array from the message
-        // Format: {"type":"worm_state","worms":[{"x":..,"y":..,"vx":..,"vy":..,"hp":..,"alive":..}, ...]}
-        let worms_key = "\"worms\":[";
-        let start = match msg.find(worms_key) {
-            Some(i) => i + worms_key.len(),
+    /// Apply ball state snapshot from the active player to sync positions/health
+    fn apply_ball_state(&mut self, msg: &str) {
+        // Parse the balls array from the message
+        // Format: {"type":"ball_state","balls":[{"x":..,"y":..,"vx":..,"vy":..,"hp":..,"alive":..}, ...]}
+        let balls_key = "\"balls\":[";
+        let start = match msg.find(balls_key) {
+            Some(i) => i + balls_key.len(),
             None => return,
         };
         // Find the closing bracket
@@ -1020,10 +1020,10 @@ impl Game {
         };
         let array_content = &msg[start..end];
         
-        // Split by "},{" to get individual worm objects
-        let mut worm_idx = 0;
+        // Split by "},{" to get individual ball objects
+        let mut ball_idx = 0;
         let mut pos = 0;
-        while pos < array_content.len() && worm_idx < self.worms.len() {
+        while pos < array_content.len() && ball_idx < self.balls.len() {
             // Find the next object boundaries
             let obj_start = match array_content[pos..].find('{') {
                 Some(i) => pos + i,
@@ -1037,34 +1037,34 @@ impl Game {
             
             // Parse fields
             if let Some(x) = parse_json_number(obj, "x") {
-                self.worms[worm_idx].x = x as f32;
+                self.balls[ball_idx].x = x as f32;
             }
             if let Some(y) = parse_json_number(obj, "y") {
-                self.worms[worm_idx].y = y as f32;
+                self.balls[ball_idx].y = y as f32;
             }
             if let Some(vx) = parse_json_number(obj, "vx") {
-                self.worms[worm_idx].vx = vx as f32;
+                self.balls[ball_idx].vx = vx as f32;
             }
             if let Some(vy) = parse_json_number(obj, "vy") {
-                self.worms[worm_idx].vy = vy as f32;
+                self.balls[ball_idx].vy = vy as f32;
             }
             if let Some(hp) = parse_json_number(obj, "hp") {
-                self.worms[worm_idx].health = hp as i32;
+                self.balls[ball_idx].health = hp as i32;
             }
             // Parse alive (boolean)
             if obj.contains("\"alive\":true") {
-                self.worms[worm_idx].alive = true;
+                self.balls[ball_idx].alive = true;
             } else if obj.contains("\"alive\":false") {
-                self.worms[worm_idx].alive = false;
+                self.balls[ball_idx].alive = false;
             }
             
-            worm_idx += 1;
+            ball_idx += 1;
             pos = obj_end;
         }
         
         #[cfg(target_arch = "wasm32")]
         {
-            let debug_msg = format!("[SYNC] Applied worm_state for {} worms\0", worm_idx);
+            let debug_msg = format!("[SYNC] Applied ball_state for {} balls\0", ball_idx);
             unsafe { console_log(debug_msg.as_ptr()); }
         }
     }
@@ -1075,14 +1075,14 @@ impl Game {
             return;
         }
 
-        let n = self.worms.len();
+        let n = self.balls.len();
         if n == 0 {
             return;
         }
-        let start = self.current_worm;
+        let start = self.current_ball;
         let mut next = (start + 1) % n;
         loop {
-            if self.worms[next].alive {
+            if self.balls[next].alive {
                 break;
             }
             next = (next + 1) % n;
@@ -1090,37 +1090,37 @@ impl Game {
                 break;
             }
         }
-        self.current_worm = next;
+        self.current_ball = next;
         self.reset_turn_state();
     }
 
-    /// Sync to a player's turn from the worker. Finds the next alive worm belonging to
-    /// the given team (player_index) using round-robin so all worms get a turn.
+    /// Sync to a player's turn from the worker. Finds the next alive ball belonging to
+    /// the given team (player_index) using round-robin so all balls get a turn.
     fn sync_to_player_turn(&mut self, player_index: usize) {
         if self.check_game_over() {
             return;
         }
         let team = player_index as u32;
-        let n = self.worms.len();
+        let n = self.balls.len();
         if n == 0 {
             return;
         }
 
-        // Ensure last_worm_per_team has enough entries
-        while self.last_worm_per_team.len() <= player_index {
-            self.last_worm_per_team.push(None);
+        // Ensure last_ball_per_team has enough entries
+        while self.last_ball_per_team.len() <= player_index {
+            self.last_ball_per_team.push(None);
         }
 
-        // Collect indices of all alive worms on this team
-        let team_worms: Vec<usize> = (0..n)
-            .filter(|&i| self.worms[i].alive && self.worms[i].team == team)
+        // Collect indices of all alive balls on this team
+        let team_balls: Vec<usize> = (0..n)
+            .filter(|&i| self.balls[i].alive && self.balls[i].team == team)
             .collect();
 
-        if team_worms.is_empty() {
-            // Fallback: just find any alive worm
+        if team_balls.is_empty() {
+            // Fallback: just find any alive ball
             for i in 0..n {
-                if self.worms[i].alive {
-                    self.current_worm = i;
+                if self.balls[i].alive {
+                    self.current_ball = i;
                     self.reset_turn_state();
                     return;
                 }
@@ -1128,13 +1128,13 @@ impl Game {
             return;
         }
 
-        // Pick the next worm in rotation after the last one used
-        let last = self.last_worm_per_team[player_index];
+        // Pick the next ball in rotation after the last one used
+        let last = self.last_ball_per_team[player_index];
         let chosen = match last {
             Some(prev) => {
-                // Find the team worm that comes after prev in the global worm list
-                let mut pick = team_worms[0]; // default to first
-                for &wi in &team_worms {
+                // Find the team ball that comes after prev in the global ball list
+                let mut pick = team_balls[0]; // default to first
+                for &wi in &team_balls {
                     if wi > prev {
                         pick = wi;
                         break;
@@ -1142,20 +1142,20 @@ impl Game {
                 }
                 // If none found after prev, wrap around to first
                 if pick <= prev {
-                    pick = team_worms[0];
+                    pick = team_balls[0];
                 }
                 pick
             }
-            None => team_worms[0],
+            None => team_balls[0],
         };
 
-        self.last_worm_per_team[player_index] = Some(chosen);
-        self.current_worm = chosen;
+        self.last_ball_per_team[player_index] = Some(chosen);
+        self.current_ball = chosen;
         #[cfg(target_arch = "wasm32")]
         {
-            let worm_name = if chosen < self.worms.len() { self.worms[chosen].name.as_str() } else { "?" };
-            let debug_msg = format!("[TURN] sync_to_player_turn({}): chose worm {} '{}', team_worms={:?}, last={:?}\0",
-                player_index, chosen, worm_name, team_worms, last);
+            let ball_name = if chosen < self.balls.len() { self.balls[chosen].name.as_str() } else { "?" };
+            let debug_msg = format!("[TURN] sync_to_player_turn({}): chose ball {} '{}', team_balls={:?}, last={:?}\0",
+                player_index, chosen, ball_name, team_balls, last);
             unsafe { console_log(debug_msg.as_ptr()); }
         }
         self.reset_turn_state();
@@ -1169,10 +1169,10 @@ impl Game {
         self.charging = false;
         self.charge_power = 0.0;
         
-        // Reset movement budget for the current worm
-        if self.current_worm < self.worms.len() {
-            self.worms[self.current_worm].reset_movement_budget();
-            self.aim_angle = if self.worms[self.current_worm].facing > 0.0 {
+        // Reset movement budget for the current ball
+        if self.current_ball < self.balls.len() {
+            self.balls[self.current_ball].reset_movement_budget();
+            self.aim_angle = if self.balls[self.current_ball].facing > 0.0 {
                 -0.3
             } else {
                 std::f32::consts::PI + 0.3
@@ -1185,7 +1185,7 @@ impl Game {
 
     fn check_game_over(&mut self) -> bool {
         let mut alive_teams: Vec<u32> = Vec::new();
-        for w in &self.worms {
+        for w in &self.balls {
             if w.alive && !alive_teams.contains(&w.team) {
                 alive_teams.push(w.team);
             }
@@ -1303,7 +1303,7 @@ impl Game {
                 continue;
             }
             if msg.contains("\"type\":\"input\"") || msg.contains("\"type\": \"input\"") {
-                // If we have a pending turn sync, apply it first so we fire on the right worm
+                // If we have a pending turn sync, apply it first so we fire on the right ball
                 if let Some(player_idx) = self.pending_turn_sync.take() {
                     self.sync_to_player_turn(player_idx);
                 }
@@ -1314,41 +1314,41 @@ impl Game {
                         continue;
                     }
                     
-                    // Use current_worm for the active turn player (already set by
+                    // Use current_ball for the active turn player (already set by
                     // sync_to_player_turn with correct rotation). Only fall back to
-                    // find_worm_for_player for non-turn messages.
-                    let worm_idx_opt = if player_index == self.current_turn_index {
-                        Some(self.current_worm)
+                    // find_ball_for_player for non-turn messages.
+                    let ball_idx_opt = if player_index == self.current_turn_index {
+                        Some(self.current_ball)
                     } else {
-                        self.find_worm_for_player(player_index)
+                        self.find_ball_for_player(player_index)
                     };
-                    if let Some(worm_idx) = worm_idx_opt {
+                    if let Some(ball_idx) = ball_idx_opt {
                         // Parse and apply different input types
                         if let Some((angle_rad, power, weapon)) = parse_fire_input(&input_str) {
-                            self.do_fire(worm_idx, angle_rad, power, weapon);
+                            self.do_fire(ball_idx, angle_rad, power, weapon);
                             self.has_fired = true;
                         } else if let Some(dir) = parse_walk_input(&input_str) {
-                            if worm_idx < self.worms.len() {
-                                physics::walk(&mut self.worms[worm_idx], &self.terrain, dir);
+                            if ball_idx < self.balls.len() {
+                                physics::walk(&mut self.balls[ball_idx], &self.terrain, dir);
                             }
                         } else if input_str.contains("\"Jump\"") || input_str.contains("Jump") {
-                            if worm_idx < self.worms.len() {
-                                physics::jump(&mut self.worms[worm_idx]);
-                                self.worms[worm_idx].movement_used += 20.0;
+                            if ball_idx < self.balls.len() {
+                                physics::jump(&mut self.balls[ball_idx]);
+                                self.balls[ball_idx].movement_used += 20.0;
                             }
                         } else if input_str.contains("\"Backflip\"") || input_str.contains("Backflip") {
-                            if worm_idx < self.worms.len() {
-                                physics::backflip(&mut self.worms[worm_idx]);
-                                self.worms[worm_idx].movement_used += 30.0;
+                            if ball_idx < self.balls.len() {
+                                physics::backflip(&mut self.balls[ball_idx]);
+                                self.balls[ball_idx].movement_used += 30.0;
                             }
                         }
                     }
                 }  
                 continue;
             }
-            if msg.contains("\"type\":\"worm_state\"") || msg.contains("\"type\": \"worm_state\"") {
-                // Apply worm positions/health from the active player
-                self.apply_worm_state(&msg);
+            if msg.contains("\"type\":\"ball_state\"") || msg.contains("\"type\": \"ball_state\"") {
+                // Apply ball positions/health from the active player
+                self.apply_ball_state(&msg);
                 continue;
             }
             if msg.contains("\"type\":\"terrain_sync\"") || msg.contains("\"type\": \"terrain_sync\"") {
@@ -1364,9 +1364,9 @@ impl Game {
                         continue;
                     }
                     
-                    // Find the worm for this player and update their local aim
-                    if let Some(worm_idx) = self.find_worm_for_player(player_index) {
-                        if worm_idx == self.current_worm {
+                    // Find the ball for this player and update their local aim
+                    if let Some(ball_idx) = self.find_ball_for_player(player_index) {
+                        if ball_idx == self.current_ball {
                             self.aim_angle = aim_angle;
                         }
                     }
@@ -1395,22 +1395,22 @@ impl Game {
                 if self.turn_timer <= 0.0 && self.is_my_turn() {
                     self.end_turn();
                 }
-                for w in &mut self.worms {
+                for w in &mut self.balls {
                     w.tick(&self.terrain, dt);
                 }
-                // If the current worm died (walked into water/lava), end turn immediately
-                if self.current_worm < self.worms.len() && !self.worms[self.current_worm].alive {
+                // If the current ball died (walked into water/lava), end turn immediately
+                if self.current_ball < self.balls.len() && !self.balls[self.current_ball].alive {
                     self.end_turn();
                 }
-                if self.current_worm < self.worms.len() {
-                    let w = &self.worms[self.current_worm];
+                if self.current_ball < self.balls.len() {
+                    let w = &self.balls[self.current_ball];
                     if w.alive {
                         self.cam.follow(w.x, w.y - 30.0, 4.0, dt);
                     }
                 }
             }
             Phase::ProjectileFlying => {
-                for w in &mut self.worms {
+                for w in &mut self.balls {
                     w.tick(&self.terrain, dt);
                 }
                 let mut explosion_opt = None;
@@ -1418,7 +1418,7 @@ impl Game {
                 
                 // Handle regular projectile
                 if let Some(ref mut proj) = self.proj {
-                    let (explosion, bomblets) = proj.tick(&mut self.terrain, &mut self.worms, self.wind, dt);
+                    let (explosion, bomblets) = proj.tick(&mut self.terrain, &mut self.balls, self.wind, dt);
                     self.cam.follow(proj.x, proj.y, 8.0, dt);
                     explosion_opt = explosion;
                     proj_died = !proj.alive;
@@ -1434,7 +1434,7 @@ impl Game {
                     let mut any_active = false;
                     for pellet in &mut self.shotgun_pellets {
                         if pellet.alive {
-                            let hit = pellet.tick(&mut self.terrain, &mut self.worms, dt);
+                            let hit = pellet.tick(&mut self.terrain, &mut self.balls, dt);
                             if hit {
                                 self.terrain_dirty = true;
                             }
@@ -1454,7 +1454,7 @@ impl Game {
                     let mut any_active = false;
                     for bullet in &mut self.uzi_bullets {
                         if bullet.alive {
-                            let hit = bullet.tick(&mut self.terrain, &mut self.worms, dt);
+                            let hit = bullet.tick(&mut self.terrain, &mut self.balls, dt);
                             if hit {
                                 self.terrain_dirty = true;
                             }
@@ -1475,7 +1475,7 @@ impl Game {
                     let mut explosions = Vec::new();
                     for droplet in &mut self.airstrike_droplets {
                         if droplet.alive {
-                            if let Some(exp) = droplet.tick(&mut self.terrain, &mut self.worms, dt) {
+                            if let Some(exp) = droplet.tick(&mut self.terrain, &mut self.balls, dt) {
                                 explosions.push(exp);
                                 self.terrain_dirty = true;
                             }
@@ -1498,7 +1498,7 @@ impl Game {
                     let mut explosions = Vec::new();
                     for explosive in &mut self.placed_explosives {
                         if explosive.tick(dt) {
-                            let exp = explosive.explode(&mut self.terrain, &mut self.worms);
+                            let exp = explosive.explode(&mut self.terrain, &mut self.balls);
                             explosions.push(exp);
                             self.terrain_dirty = true;
                         }
@@ -1516,7 +1516,7 @@ impl Game {
                     let mut any_active = false;
                     for bomblet in &mut self.cluster_bomblets {
                         if bomblet.alive {
-                            if let Some(exp) = bomblet.tick(&mut self.terrain, &mut self.worms, dt) {
+                            if let Some(exp) = bomblet.tick(&mut self.terrain, &mut self.balls, dt) {
                                 explosions.push(exp);
                                 self.terrain_dirty = true;
                             }
@@ -1553,9 +1553,9 @@ impl Game {
                     // has the latest cumulative state for reconnect sync.
                     if self.net.connected {
                         self.send_terrain_damages();
-                        // Only the active player sends authoritative worm positions.
+                        // Only the active player sends authoritative ball positions.
                         if self.is_my_turn() {
-                            self.send_worm_state();
+                            self.send_ball_state();
                         }
                     }
                 }
@@ -1569,10 +1569,10 @@ impl Game {
             }
             Phase::Settling => {
                 self.settle_timer += dt;
-                for w in &mut self.worms {
+                for w in &mut self.balls {
                     w.tick(&self.terrain, dt);
                 }
-                let all_settled = self.worms.iter().all(|w| w.is_settled());
+                let all_settled = self.balls.iter().all(|w| w.is_settled());
                 if all_settled || self.settle_timer > SETTLE_TIMEOUT {
                     #[cfg(target_arch = "wasm32")]
                     {
@@ -1583,16 +1583,16 @@ impl Game {
                     if let Some(player_idx) = self.pending_turn_sync.take() {
                         self.sync_to_player_turn(player_idx);
                     } else if self.has_fired && self.is_my_turn() {
-                        // Send fresh worm state after settling
+                        // Send fresh ball state after settling
                         if self.net.connected {
-                            self.send_worm_state();
+                            self.send_ball_state();
                         }
                         // Active player: enter retreat phase - 5 seconds to move
                         self.phase = Phase::Retreat;
                         self.retreat_timer = 5.0;
                         // Reset movement budget for retreat
-                        if self.current_worm < self.worms.len() {
-                            self.worms[self.current_worm].reset_movement_budget();
+                        if self.current_ball < self.balls.len() {
+                            self.balls[self.current_ball].reset_movement_budget();
                         }
                     } else if !self.net.connected {
                         self.end_turn();
@@ -1604,24 +1604,24 @@ impl Game {
                         self.turn_end_timer = TURN_END_DELAY;
                     }
                 }
-                if self.current_worm < self.worms.len() {
-                    let w = &self.worms[self.current_worm];
+                if self.current_ball < self.balls.len() {
+                    let w = &self.balls[self.current_ball];
                     self.cam.follow(w.x, w.y - 30.0, 3.0, dt);
                 }
             }
             Phase::Retreat => {
                 self.retreat_timer -= dt;
-                // Tick worm physics (gravity, etc) during retreat
-                for w in &mut self.worms {
+                // Tick ball physics (gravity, etc) during retreat
+                for w in &mut self.balls {
                     w.tick(&self.terrain, dt);
                 }
-                // If current worm died during retreat (fell in water/lava), end turn now
-                if self.current_worm < self.worms.len() && !self.worms[self.current_worm].alive {
+                // If current ball died during retreat (fell in water/lava), end turn now
+                if self.current_ball < self.balls.len() && !self.balls[self.current_ball].alive {
                     self.retreat_timer = 0.0; // Force turn end
                 }
-                // Follow current worm with camera
-                if self.current_worm < self.worms.len() {
-                    let w = &self.worms[self.current_worm];
+                // Follow current ball with camera
+                if self.current_ball < self.balls.len() {
+                    let w = &self.balls[self.current_ball];
                     if w.alive {
                         self.cam.follow(w.x, w.y - 30.0, 4.0, dt);
                     }
@@ -1637,7 +1637,7 @@ impl Game {
             }
             Phase::TurnEnd => {
                 self.turn_end_timer -= dt;
-                for w in &mut self.worms {
+                for w in &mut self.balls {
                     w.tick(&self.terrain, dt);
                 }
                 if self.turn_end_timer <= 0.0 {
@@ -1723,7 +1723,7 @@ impl Game {
         if !self.net.connected {
             return String::new();
         }
-        let team = self.worms.get(self.current_worm).map(|w| w.team as usize).unwrap_or(0);
+        let team = self.balls.get(self.current_ball).map(|w| w.team as usize).unwrap_or(0);
         
         // Safely get player name, handling out-of-bounds and empty cases
         let name = if team < self.net.player_names.len() {
@@ -1769,7 +1769,7 @@ impl Game {
 
         self.draw_water();
 
-        hud::draw_worm_world(&self.worms, self.current_worm);
+        hud::draw_ball_world(&self.balls, self.current_ball);
 
         if let Some(ref proj) = self.proj {
             for (i, &(tx, ty)) in proj.trail.iter().enumerate() {
@@ -1865,8 +1865,8 @@ impl Game {
         let is_my_turn = self.is_my_turn();
         let turn_owner = self.turn_owner_label();
         hud::draw_hud(
-            &self.worms,
-            self.current_worm,
+            &self.balls,
+            self.current_ball,
             self.phase,
             self.selected_weapon,
             self.charge_power,
@@ -1923,17 +1923,17 @@ impl Game {
     }
 
     fn draw_aim(&self) {
-        let idx = self.current_worm;
-        if idx >= self.worms.len() || !self.worms[idx].alive {
+        let idx = self.current_ball;
+        if idx >= self.balls.len() || !self.balls[idx].alive {
             return;
         }
-        let worm = &self.worms[idx];
+        let ball = &self.balls[idx];
         let angle = self.aim_angle;
         let line_len = 50.0 + self.charge_power * 0.5;
-        let ex = worm.x + angle.cos() * line_len;
-        let ey = worm.y + angle.sin() * line_len;
+        let ex = ball.x + angle.cos() * line_len;
+        let ey = ball.y + angle.sin() * line_len;
 
-        draw_line(worm.x, worm.y, ex, ey, 2.0, Color::new(1.0, 1.0, 0.4, 0.8));
+        draw_line(ball.x, ball.y, ex, ey, 2.0, Color::new(1.0, 1.0, 0.4, 0.8));
 
         draw_circle(ex, ey, 4.0, Color::new(1.0, 0.2, 0.2, 0.8));
         draw_circle_lines(ex, ey, 6.0, 1.5, WHITE);
@@ -1944,8 +1944,8 @@ impl Game {
             50.0
         };
         let traj = projectile::simulate_trajectory(
-            worm.x + angle.cos() * (WORM_RADIUS + 4.0),
-            worm.y + angle.sin() * (WORM_RADIUS + 4.0),
+            ball.x + angle.cos() * (BALL_RADIUS + 4.0),
+            ball.y + angle.sin() * (BALL_RADIUS + 4.0),
             angle,
             power_for_preview,
             self.selected_weapon,
@@ -2081,7 +2081,7 @@ fn parse_json_string<'a>(s: &'a str, key: &str) -> Option<&'a str> {
 
 fn window_conf() -> Conf {
     Conf {
-        window_title: "Worms".to_string(),
+        window_title: "Balls".to_string(),
         window_width: 1280,
         window_height: 720,
         high_dpi: true,

@@ -61,7 +61,7 @@ export default function HomePage() {
             ].join(", "),
           }}
         >
-          WORMS&nbsp;🪱
+          BALLS&nbsp;🔴
         </h1>
         <p className="font-display text-lg text-emerald-400/90 tracking-widest mb-10 -mt-1">
           BLOW STUFF UP WITH FRIENDS

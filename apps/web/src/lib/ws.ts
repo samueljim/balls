@@ -97,7 +97,7 @@ export function useWebSocket(url: string | null, options?: { reconnect?: boolean
   return { readyState, lastMessage, messageVersion, messageQueueRef, send };
 }
 
-const DEFAULT_WS_BASE = "https://api.worms.bne.sh";
+const DEFAULT_WS_BASE = "https://api.balls.bne.sh";
 export function getWsUrl(path: string): string {
   const base = process.env.NEXT_PUBLIC_WS_BASE ?? process.env.NEXT_PUBLIC_API_BASE ?? DEFAULT_WS_BASE;
   const host = base.replace(/^http/, "ws");

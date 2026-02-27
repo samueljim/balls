@@ -189,7 +189,7 @@ export default function LobbyContent({
     if (gameStarted && !hasRedirectedRef.current) {
       hasRedirectedRef.current = true;
       try {
-        sessionStorage.setItem(`worms:${gameStarted.gameId}`, JSON.stringify({ 
+        sessionStorage.setItem(`balls:${gameStarted.gameId}`, JSON.stringify({ 
           playerOrder: gameStarted.playerOrder ?? [],
           rngSeed: gameStarted.rngSeed,
         }));
@@ -267,7 +267,7 @@ export default function LobbyContent({
 
   return (
     <FunPageLayout
-      title="LOBBY&nbsp;🪱"
+      title="LOBBY&nbsp;🔴"
       tagline={code ? `CODE: ${code}` : undefined}
     >
       <FunPanel>

@@ -1,6 +1,6 @@
 use macroquad::prelude::*;
 
-use crate::physics::{Worm, TEAM_COLORS, WORM_RADIUS};
+use crate::physics::{Ball, TEAM_COLORS, BALL_RADIUS};
 use crate::state::Phase;
 use crate::weapons::{Weapon, WeaponCategory};
 
@@ -72,8 +72,8 @@ impl WeaponMenuLayout {
 }
 
 pub fn draw_hud(
-    worms: &[Worm],
-    current_worm: usize,
+    balls: &[Ball],
+    current_ball: usize,
     phase: Phase,
     selected_weapon: Weapon,
     charge_power: f32,
@@ -114,20 +114,20 @@ pub fn draw_hud(
         return;
     }
 
-    if current_worm < worms.len() {
-        let worm = &worms[current_worm];
-        let (r, g, b) = TEAM_COLORS[worm.team as usize % TEAM_COLORS.len()];
+    if current_ball < balls.len() {
+        let ball = &balls[current_ball];
+        let (r, g, b) = TEAM_COLORS[ball.team as usize % TEAM_COLORS.len()];
         let team_color = Color::new(r, g, b, 1.0);
-        let label = format!("{}", worm.name);
+        let label = format!("{}", ball.name);
         draw_text(&label, 12.0, 30.0, 26.0, team_color);
 
-        let hp = format!("HP:{}", worm.health);
+        let hp = format!("HP:{}", ball.health);
         let hp_x = 12.0 + measure_text(&label, None, 26, 1.0).width + 14.0;
         draw_text(&hp, hp_x, 30.0, 20.0, WHITE);
         
         // Draw movement bar
-        let move_remaining = worm.movement_remaining();
-        let move_percent = (move_remaining / worm.movement_budget * 100.0).min(100.0);
+        let move_remaining = ball.movement_remaining();
+        let move_percent = (move_remaining / ball.movement_budget * 100.0).min(100.0);
         let move_x = hp_x + measure_text(&hp, None, 20, 1.0).width + 20.0;
         
         // Movement bar background
@@ -137,7 +137,7 @@ pub fn draw_hud(
         draw_rectangle(move_x - 1.0, bar_y - 1.0, bar_w + 2.0, bar_h + 2.0, Color::new(0.0, 0.0, 0.0, 0.6));
         
         // Movement bar foreground
-        let move_frac = move_remaining / worm.movement_budget;
+        let move_frac = move_remaining / ball.movement_budget;
         let bar_color = if move_frac > 0.5 {
             Color::new(0.2, 0.7, 1.0, 0.9)
         } else if move_frac > 0.15 {
@@ -524,35 +524,35 @@ fn draw_weapon_menu(selected_weapon: Weapon, scroll_offset: f32) {
     );
 }
 
-pub fn draw_worm_world(worms: &[Worm], current_worm: usize) {
-    for (i, worm) in worms.iter().enumerate() {
-        if !worm.alive {
+pub fn draw_ball_world(balls: &[Ball], current_ball: usize) {
+    for (i, ball) in balls.iter().enumerate() {
+        if !ball.alive {
             continue;
         }
-        let (r, g, b) = TEAM_COLORS[worm.team as usize % TEAM_COLORS.len()];
+        let (r, g, b) = TEAM_COLORS[ball.team as usize % TEAM_COLORS.len()];
         let color = Color::new(r, g, b, 1.0);
         let outline = Color::new(r * 0.4, g * 0.4, b * 0.4, 1.0);
-        let rad = WORM_RADIUS;
+        let rad = BALL_RADIUS;
 
-        draw_circle(worm.x, worm.y, rad + 1.5, outline);
-        draw_circle(worm.x, worm.y, rad, color);
+        draw_circle(ball.x, ball.y, rad + 1.5, outline);
+        draw_circle(ball.x, ball.y, rad, color);
 
-        if i == current_worm {
-            draw_circle_lines(worm.x, worm.y, rad + 3.0, 1.5, WHITE);
+        if i == current_ball {
+            draw_circle_lines(ball.x, ball.y, rad + 3.0, 1.5, WHITE);
         }
 
-        let eye_x_base = worm.x + worm.facing * 2.5;
-        let eye_y = worm.y - 1.5;
+        let eye_x_base = ball.x + ball.facing * 2.5;
+        let eye_y = ball.y - 1.5;
         draw_circle(eye_x_base - 1.5, eye_y, 2.2, WHITE);
         draw_circle(eye_x_base + 1.5, eye_y, 2.2, WHITE);
         draw_circle(
-            eye_x_base - 1.5 + worm.facing * 0.6,
+            eye_x_base - 1.5 + ball.facing * 0.6,
             eye_y,
             1.1,
             Color::new(0.1, 0.1, 0.1, 1.0),
         );
         draw_circle(
-            eye_x_base + 1.5 + worm.facing * 0.6,
+            eye_x_base + 1.5 + ball.facing * 0.6,
             eye_y,
             1.1,
             Color::new(0.1, 0.1, 0.1, 1.0),
@@ -560,8 +560,8 @@ pub fn draw_worm_world(worms: &[Worm], current_worm: usize) {
 
         let bar_w = 26.0;
         let bar_h = 4.0;
-        let bar_x = worm.x - bar_w / 2.0;
-        let bar_y = worm.y - rad - 14.0;
+        let bar_x = ball.x - bar_w / 2.0;
+        let bar_y = ball.y - rad - 14.0;
         draw_rectangle(
             bar_x - 1.0,
             bar_y - 1.0,
@@ -569,7 +569,7 @@ pub fn draw_worm_world(worms: &[Worm], current_worm: usize) {
             bar_h + 2.0,
             Color::new(0.0, 0.0, 0.0, 0.6),
         );
-        let hp_frac = worm.health as f32 / worm.max_health as f32;
+        let hp_frac = ball.health as f32 / ball.max_health as f32;
         let hp_color = if hp_frac > 0.5 {
             Color::new(0.15, 0.8, 0.15, 1.0)
         } else if hp_frac > 0.25 {
@@ -580,23 +580,23 @@ pub fn draw_worm_world(worms: &[Worm], current_worm: usize) {
         draw_rectangle(bar_x, bar_y, bar_w * hp_frac, bar_h, hp_color);
 
         let name_size = 11.0;
-        let nm = measure_text(&worm.name, None, name_size as u16, 1.0);
+        let nm = measure_text(&ball.name, None, name_size as u16, 1.0);
         draw_text(
-            &worm.name,
-            worm.x - nm.width / 2.0,
+            &ball.name,
+            ball.x - nm.width / 2.0,
             bar_y - 3.0,
             name_size,
             Color::new(1.0, 1.0, 1.0, 0.85),
         );
 
-        if worm.damage_timer > 0.0 && worm.last_damage > 0 {
-            let popup_y = worm.y - rad - 22.0 - (2.0 - worm.damage_timer) * 20.0;
-            let alpha = worm.damage_timer.min(1.0);
-            let txt = format!("-{}", worm.last_damage);
+        if ball.damage_timer > 0.0 && ball.last_damage > 0 {
+            let popup_y = ball.y - rad - 22.0 - (2.0 - ball.damage_timer) * 20.0;
+            let alpha = ball.damage_timer.min(1.0);
+            let txt = format!("-{}", ball.last_damage);
             let tw = measure_text(&txt, None, 18, 1.0).width;
             draw_text(
                 &txt,
-                worm.x - tw / 2.0,
+                ball.x - tw / 2.0,
                 popup_y,
                 18.0,
                 Color::new(1.0, 0.2, 0.1, alpha),

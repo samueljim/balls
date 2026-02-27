@@ -6,8 +6,8 @@ import Link from "next/link";
 
 const API_BASE =
   typeof window !== "undefined"
-    ? process.env.NEXT_PUBLIC_WS_BASE ?? process.env.NEXT_PUBLIC_API_BASE ?? "https://api.worms.bne.sh"
-    : process.env.NEXT_PUBLIC_API_BASE ?? "https://api.worms.bne.sh";
+    ? process.env.NEXT_PUBLIC_WS_BASE ?? process.env.NEXT_PUBLIC_API_BASE ?? "https://api.balls.bne.sh"
+    : process.env.NEXT_PUBLIC_API_BASE ?? "https://api.balls.bne.sh";
 
 export default function GameView({ overrideId }: { overrideId?: string } = {}) {
   const params = useParams();
@@ -21,7 +21,7 @@ export default function GameView({ overrideId }: { overrideId?: string } = {}) {
     mounted.current = true;
     setLoadError(null);
 
-    (window as unknown as { __WORMS_WS_BASE?: string }).__WORMS_WS_BASE = API_BASE;
+    (window as unknown as { __BALLS_WS_BASE?: string }).__BALLS_WS_BASE = API_BASE;
 
     const base = (typeof process !== "undefined" && process.env?.NEXT_PUBLIC_BASE_PATH) || "";
     const isLocalhost =

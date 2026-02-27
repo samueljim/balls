@@ -192,7 +192,7 @@ pub fn generate(seed: u32) -> Terrain {
     let mut s = lcg(seed.wrapping_add(7777));
 
     // ---- Layer 1: Define 4-8 distinct hill "segments" across the map ----
-    // This creates the classic Worms look of distinct hills separated by valleys
+    // This creates the classic Balls look of distinct hills separated by valleys
     s = lcg(s);
     let num_hills = 4 + (s >> 16) as u32 % 5; // 4-8 hills
     struct HillDef { center: f32, width: f32, height: f32, flat_top: f32 }

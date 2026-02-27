@@ -14,8 +14,8 @@
   var lobbyRngSeed = null; // Seed from lobby (set at game start by host)
 
   function getApiBase() {
-    if (typeof window !== "undefined" && window.__WORMS_WS_BASE) return window.__WORMS_WS_BASE;
-    return "https://api.worms.bne.sh";
+    if (typeof window !== "undefined" && window.__BALLS_WS_BASE) return window.__BALLS_WS_BASE;
+    return "https://api.balls.bne.sh";
   }
 
   function getHttpBase() {
@@ -36,7 +36,7 @@
     var params = new URLSearchParams(window.location.search || "");
     playerId = params.get("playerId") || "";
     try {
-      var key = "worms:" + gameId;
+      var key = "balls:" + gameId;
       var stored = window.sessionStorage && sessionStorage.getItem(key);
       if (stored) {
         var parsed = JSON.parse(stored);

@@ -42,6 +42,10 @@ export default {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
+    // GET / -> health/status
+    if (url.pathname === "/" && request.method === "GET") {
+      return corsJson({ status: "ok" });
+    }
     // POST /lobby/create -> create new Lobby DO, return { code, lobbyId }
     if (url.pathname === "/lobby/create" && request.method === "POST") {
       try {

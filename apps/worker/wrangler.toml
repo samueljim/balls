@@ -1,10 +1,10 @@
-name = "worms-worker"
+name = "balls-worker"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
-# API + WebSockets at https://api.worms.bne.sh (requires bne.sh zone in your CF account)
+# API + WebSockets at https://api.balls.bne.sh (requires bne.sh zone in your CF account)
 [[routes]]
-pattern = "api.worms.bne.sh"
+pattern = "api.balls.bne.sh"
 custom_domain = true
 
 [durable_objects]

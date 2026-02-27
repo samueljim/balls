@@ -9,7 +9,7 @@ const FUNNY_NAMES = [
 ];
 
 function pickFunnyName(used: Set<string>): string {
-  const name = FUNNY_NAMES.find((n) => !used.has(n)) ?? `Worm ${used.size + 1}`;
+  const name = FUNNY_NAMES.find((n) => !used.has(n)) ?? `Ball ${used.size + 1}`;
   return name;
 }
 

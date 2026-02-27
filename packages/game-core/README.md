@@ -1,6 +1,6 @@
 # game-core
 
-Deterministic Worms-like game engine in Rust, compiled to WebAssembly.
+Deterministic Balls-like game engine in Rust, compiled to WebAssembly.
 
 ## Build (requires Rust + wasm-pack)
 
@@ -15,7 +15,7 @@ From repo root, after `apps/web` exists, you can copy `pkg/` to `apps/web/public
 ## API (WASM)
 
 - `new()` – create game instance
-- `init_round(seed, terrainId, wormPositions)` – start round (wormPositions: [x1,y1, x2,y2, ...] in pixels)
+- `init_round(seed, terrainId, ballPositions)` – start round (ballPositions: [x1,y1, x2,y2, ...] in pixels)
 - `apply_input(inputJson)` – apply one input (Fire/Move/EndTurn)
 - `get_state_json()` – current state as JSON
 - `get_terrain_buffer()` – flat u8 array, 0=air 1=solid

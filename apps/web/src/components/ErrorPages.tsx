@@ -65,7 +65,7 @@ export function Fun40xPage({
 /** Fun 50x (server/runtime error) page with try-again + home */
 export function Fun50xPage({
   title = "Something went wrong",
-  tagline = "The server had a tummy ache 🪱",
+  tagline = "The server had a tummy ache 🤢",
   message = "We're on it. Try again or head back home.",
   onRetry,
   homeHref = "/",

@@ -1,6 +1,6 @@
-# Worms (web)
+# Balls (web)
 
-Web-based Worms-style game: invite friends with a link, join with your name, turn-based artillery with destructible terrain. Built with Next.js, Tailwind, Cloudflare Workers + Durable Objects, and a Rust WASM game engine.
+Web-based Balls-style game: invite friends with a link, join with your name, turn-based artillery with destructible terrain. Built with Next.js, Tailwind, Cloudflare Workers + Durable Objects, and a Rust WASM game engine.
 
 ## Structure
 
@@ -29,7 +29,7 @@ pnpm install
 pnpm dev:web
 ```
 
-Then open **http://localhost:3000**. The app uses **https://api.worms.bne.sh** for API and WebSockets by default, so you don’t need a `.env.local` file. Create a game, share the link, join in another tab, etc.
+Then open **http://localhost:3000**. The app uses **https://api.balls.bne.sh** for API and WebSockets by default, so you don’t need a `.env.local` file. Create a game, share the link, join in another tab, etc.
 
 **Game screen (WASM):** The in-browser game canvas needs the WASM build. If you don’t have Rust installed, the lobby and join flows work; the game view will show a load error until WASM is built. From repo root, run `pnpm run build:game` once (install [Rust](https://rustup.rs) and `cargo install wasm-pack` first). When you run `pnpm dev:web`, a watcher copies `packages/game-core/pkg` into `apps/web/public/wasm/` and keeps it in sync — after changing Rust, run `pnpm run build:game` again and refresh the browser to hot-reload WASM.
 
@@ -78,14 +78,14 @@ pnpm deploy:worker
 # or: cd apps/worker && pnpm deploy
 ```
 
-Wrangler will print your worker URL, e.g. `https://worms-worker.<your-subdomain>.workers.dev`. **Use this URL for the web app.**
+Wrangler will print your worker URL, e.g. `https://balls-worker.<your-subdomain>.workers.dev`. **Use this URL for the web app.**
 
 ### 2. Point the web app at the worker
 
 Create `apps/web/.env.local` (or set env in your host):
 
 ```bash
-NEXT_PUBLIC_API_BASE=https://worms-worker.<your-subdomain>.workers.dev
+NEXT_PUBLIC_API_BASE=https://balls-worker.<your-subdomain>.workers.dev
 ```
 
 WebSockets use the same host (wss://...). The app derives the WebSocket URL from `NEXT_PUBLIC_API_BASE`, so you don’t need to set `NEXT_PUBLIC_WS_BASE` unless you use a different host for WS.
@@ -103,22 +103,22 @@ Open http://localhost:3000 and create a game. The app will call your deployed wo
 - **Cloudflare Pages**: Connect the repo to Pages, set the build to `apps/web` (or your static/Next output), and add `NEXT_PUBLIC_API_BASE` (and `NEXT_PUBLIC_WS_BASE` if needed) in the Pages env.
 - **Vercel / other**: Set `NEXT_PUBLIC_API_BASE` and `NEXT_PUBLIC_WS_BASE` to your worker URL.
 
-## worms.bne.sh setup
+## balls.bne.sh setup
 
-The **worker** (API + WebSockets) is at **api.worms.bne.sh**. The **site** (Next.js app) is at **worms.bne.sh** and must be deployed separately to Cloudflare Pages.
+The **worker** (API + WebSockets) is at **api.balls.bne.sh**. The **site** (Next.js app) is at **balls.bne.sh** and must be deployed separately to Cloudflare Pages.
 
-**Why isn’t worms.bne.sh loading?** Only the worker is deployed by `pnpm deploy:worker`. The frontend is not deployed by that command. Deploy the web app to Cloudflare Pages and add the custom domain **worms.bne.sh** (steps below).
+**Why isn’t balls.bne.sh loading?** Only the worker is deployed by `pnpm deploy:worker`. The frontend is not deployed by that command. Deploy the web app to Cloudflare Pages and add the custom domain **balls.bne.sh** (steps below).
 
-### 1. Deploy the worker (API at api.worms.bne.sh) — already done
+### 1. Deploy the worker (API at api.balls.bne.sh) — already done
 
 ```bash
 cd apps/worker && npx wrangler login
 pnpm deploy:worker   # from repo root
 ```
 
-Cloudflare creates the custom domain **api.worms.bne.sh** and the DNS record (bne.sh must be your zone). The worker is also at `https://worms-worker.<subdomain>.workers.dev`.
+Cloudflare creates the custom domain **api.balls.bne.sh** and the DNS record (bne.sh must be your zone). The worker is also at `https://balls-worker.<subdomain>.workers.dev`.
 
-### 2. Deploy the frontend (site at worms.bne.sh)
+### 2. Deploy the frontend (site at balls.bne.sh)
 
 1. In [Cloudflare Dashboard](https://dash.cloudflare.com) go to **Workers & Pages** → **Create** → **Pages** → **Connect to Git**.
 2. Select this repo and branch.
@@ -128,38 +128,38 @@ Cloudflare creates the custom domain **api.worms.bne.sh** and the DNS record (bn
    - **Root directory**: leave blank (repo root)
    - **Build command**: `pnpm install && pnpm run build:web`
    - **Build output directory**: `apps/web/out`
-   - **Environment variables** (Production): **NEXT_PUBLIC_API_BASE** = `https://api.worms.bne.sh`
+   - **Environment variables** (Production): **NEXT_PUBLIC_API_BASE** = `https://api.balls.bne.sh`
 
    **Option B — Without WASM (lobby/join only):** Build from `apps/web` only (no Rust in cloud).
    - **Root directory**: `apps/web`
    - **Build command**: `pnpm install && pnpm run build`
    - **Build output directory**: `out`
 
-4. Save and deploy. After the first deploy, go to the project → **Custom domains** → **Set up a custom domain** → add **worms.bne.sh**.
+4. Save and deploy. After the first deploy, go to the project → **Custom domains** → **Set up a custom domain** → add **balls.bne.sh**.
 
-**Alternative (CLI):** From repo root run `pnpm deploy:web`. This **requires Rust + wasm-pack** on your machine: it builds the game WASM, copies it into the web app, builds the static export, and deploys to Cloudflare Pages (project name `worms-web`). The app defaults to **api.worms.bne.sh** for API and WebSockets.
+**Alternative (CLI):** From repo root run `pnpm deploy:web`. This **requires Rust + wasm-pack** on your machine: it builds the game WASM, copies it into the web app, builds the static export, and deploys to Cloudflare Pages (project name `balls-web`). The app defaults to **api.balls.bne.sh** for API and WebSockets.
 
-**Use worms.bne.sh instead of *.pages.dev:** In [Cloudflare Dashboard](https://dash.cloudflare.com) go to **Workers & Pages** → your Pages project (**worms-web**) → **Custom domains** → **Set up a custom domain** → enter **worms.bne.sh** and save. Cloudflare will add the DNS record (bne.sh must be your zone). After that, the site is available at **https://worms.bne.sh** as well as the *.pages.dev URL.
+**Use balls.bne.sh instead of *.pages.dev:** In [Cloudflare Dashboard](https://dash.cloudflare.com) go to **Workers & Pages** → your Pages project (**balls-web**) → **Custom domains** → **Set up a custom domain** → enter **balls.bne.sh** and save. Cloudflare will add the DNS record (bne.sh must be your zone). After that, the site is available at **https://balls.bne.sh** as well as the *.pages.dev URL.
 
 **Build output directory:** If your Next.js app is set to static export (`output: 'export'` in `next.config.js`), the output directory is `out`. If you use the default Next.js build (no static export), Cloudflare may expect `.next` and run a Node server; in that case pick the preset that matches (e.g. “Next.js” and the output directory your build produces). For a client-only app, static export is simplest: set `output: 'export'` in `apps/web/next.config.js`, then Build output directory = `out`.
 
 ### 3. Game engine (WASM) on the site
 
-If you used **Option A** (build:web from repo root) or **`pnpm deploy:web`**, the WASM build is already part of the deploy and the in-browser game runs. If you used Option B (apps/web only), either switch to Option A for the next deploy or build locally: `pnpm run build:game`, copy `packages/game-core/pkg/*` to `apps/web/public/wasm/`, commit and push. Then open **https://worms.bne.sh**: create a game, share the link (e.g. https://worms.bne.sh/join/CODE), and play.
+If you used **Option A** (build:web from repo root) or **`pnpm deploy:web`**, the WASM build is already part of the deploy and the in-browser game runs. If you used Option B (apps/web only), either switch to Option A for the next deploy or build locally: `pnpm run build:game`, copy `packages/game-core/pkg/*` to `apps/web/public/wasm/`, commit and push. Then open **https://balls.bne.sh**: create a game, share the link (e.g. https://balls.bne.sh/join/CODE), and play.
 
 ## Troubleshooting
 
 **"Durable Objects not loaded" (503 when creating a game)**
 
-The app defaults to **https://api.worms.bne.sh** (local and on Pages). So the worker must be deployed: run `pnpm deploy:worker` from repo root. Ensure **bne.sh** is your Cloudflare zone so the custom domain **api.worms.bne.sh** is created. To use a local worker instead, set **NEXT_PUBLIC_API_BASE** = `http://localhost:8787` in `apps/web/.env.local`.
+The app defaults to **https://api.balls.bne.sh** (local and on Pages). So the worker must be deployed: run `pnpm deploy:worker` from repo root. Ensure **bne.sh** is your Cloudflare zone so the custom domain **api.balls.bne.sh** is created. To use a local worker instead, set **NEXT_PUBLIC_API_BASE** = `http://localhost:8787` in `apps/web/.env.local`.
 
 **`GET /wasm/game_core.js` 404 (WASM load failed)**
 
 The game canvas needs the WASM build in the deployed site. **Git-based Pages:** use **Option A** in “Deploy the frontend” (repo root, build command `pnpm run build:web`) so the cloud build installs Rust and builds WASM. **CLI deploy:** run **`pnpm deploy:web`** from your machine (requires Rust + wasm-pack; builds WASM and deploys). Optional: set **NEXT_PUBLIC_WASM_BASE** if you host WASM elsewhere.
 
-**WebSocket connection to api.worms.bne.sh failed**
+**WebSocket connection to api.balls.bne.sh failed**
 
-The game and lobby use WebSockets on the same host as the API. Ensure the **worker** is deployed and **api.worms.bne.sh** (or your worker URL) resolves to it: run `pnpm deploy:worker` and check Cloudflare Dashboard → Workers & Pages → your worker → Custom domains. If you use a different API URL, set **NEXT_PUBLIC_API_BASE** (and **NEXT_PUBLIC_WS_BASE** if the WebSocket host differs) in the web app’s build env (e.g. in Pages → Settings → Environment variables).
+The game and lobby use WebSockets on the same host as the API. Ensure the **worker** is deployed and **api.balls.bne.sh** (or your worker URL) resolves to it: run `pnpm deploy:worker` and check Cloudflare Dashboard → Workers & Pages → your worker → Custom domains. If you use a different API URL, set **NEXT_PUBLIC_API_BASE** (and **NEXT_PUBLIC_WS_BASE** if the WebSocket host differs) in the web app’s build env (e.g. in Pages → Settings → Environment variables).
 
 ## Notes
 

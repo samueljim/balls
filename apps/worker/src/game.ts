@@ -17,8 +17,8 @@ export class Game implements DurableObject {
   private playerIdToIndex: Map<string, number> = new Map();
   /** Accumulated terrain damage events [[cx,cy,r], ...] for replay on reconnect */
   private terrainDamageLog: number[][] = [];
-  /** Latest worm state snapshot for replay on reconnect */
-  private lastWormState: { type: string; [k: string]: unknown } | null = null;
+  /** Latest ball state snapshot for replay on reconnect */
+  private lastBallState: { type: string; [k: string]: unknown } | null = null;
 
   constructor(state: DurableObjectState, _env: unknown) {
     this.state = state;
@@ -100,7 +100,7 @@ export class Game implements DurableObject {
         }));
       } catch (_) {}
 
-      // On reconnect, send stored terrain damage and worm state so client
+      // On reconnect, send stored terrain damage and ball state so client
       // can restore the game to its current state instead of resetting
       if (this.terrainDamageLog.length > 0) {
         try {
@@ -110,9 +110,9 @@ export class Game implements DurableObject {
           }));
         } catch (_) {}
       }
-      if (this.lastWormState) {
+      if (this.lastBallState) {
         try {
-          server.send(JSON.stringify(this.lastWormState));
+          server.send(JSON.stringify(this.lastBallState));
         } catch (_) {}
       }
     }
@@ -216,10 +216,10 @@ export class Game implements DurableObject {
       } else if (msg.type === "aim" && typeof msg.aim === "number") {
         // Broadcast aim angle updates without changing game state
         this.broadcast({ type: "aim", aim: msg.aim, turnIndex: this.gameState.currentTurnIndex });
-      } else if (msg.type === "worm_state") {
-        // Store latest worm state so we can send it on reconnect
-        this.lastWormState = msg as { type: string; [k: string]: unknown };
-        // Relay worm state snapshot to all clients for position/health sync
+      } else if (msg.type === "ball_state") {
+        // Store latest ball state so we can send it on reconnect
+        this.lastBallState = msg as { type: string; [k: string]: unknown };
+        // Relay ball state snapshot to all clients for position/health sync
         this.broadcast(msg as { type: string; [k: string]: unknown });
       } else if (msg.type === "end_turn") {
         this.advanceTurn();

@@ -32,14 +32,14 @@ Our `main.rs` follows this pattern.
 
 ## 4. WebSocket / multiplayer
 
-- **Lobby** stores `playerOrder` in `sessionStorage` under `worms:${gameId}` and redirects to `/game/${gameId}?playerId=...`.
+- **Lobby** stores `playerOrder` in `sessionStorage` under `balls:${gameId}` and redirects to `/game/${gameId}?playerId=...`.
 - **ws_plugin.js** reads `gameId` from the path, `playerId` from the query, and `playerOrder` from sessionStorage; connects to `wss://.../game/${gameId}?playerId=...`; on open, POSTs to `/game/${gameId}/init` and calls `wasm_exports.on_game_init(ptr, len)` with init JSON.
 - **Worker** must accept `POST /game/:gameId/init` (path ends with `/init`) and forward to the Game DO so init runs.
 - **Rust** uses `extern "C" fn js_send_ws(ptr, len)` to send; plugin provides it and sends over the WebSocket. Rust exports `alloc_buffer`, `on_ws_message`, `on_game_init` for the plugin.
 
 ## 5. API base
 
-- Set `window.__WORMS_WS_BASE` before loading scripts so the plugin uses the correct API origin (e.g. local worker or production).
+- Set `window.__BALLS_WS_BASE` before loading scripts so the plugin uses the correct API origin (e.g. local worker or production).
 
 ## 6. Checklist
 

@@ -46,7 +46,7 @@ export default function JoinContent({
       if (data.error) throw new Error(data.error);
       if (data.gameId && data.playerOrder?.length) {
         try {
-          sessionStorage.setItem(`worms:${data.gameId}`, JSON.stringify(data.playerOrder));
+          sessionStorage.setItem(`balls:${data.gameId}`, JSON.stringify(data.playerOrder));
         } catch (_) {}
         router.push(
           `/game/${data.gameId}?playerId=${data.playerId}&playerName=${encodeURIComponent(data.playerName ?? "")}`

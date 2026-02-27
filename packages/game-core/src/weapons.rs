@@ -36,7 +36,7 @@ pub enum Weapon {
     
     // Fun Weapons
     BananaBonanza,
-    ConcreteShell,
+    Drill,
     SuperSheep,
     BuildWall,
 }
@@ -83,7 +83,7 @@ impl Weapon {
             Weapon::SniperRifle => "Sniper Rifle",
             Weapon::Uzi => "Uzi",
             Weapon::BananaBonanza => "Banana Bonanza",
-            Weapon::ConcreteShell => "Concrete Shell",
+            Weapon::Drill => "Drill",
             Weapon::SuperSheep => "Super Sheep",
             Weapon::BuildWall => "Build Wall",
         }
@@ -93,14 +93,14 @@ impl Weapon {
         match self {
             Weapon::Bazooka | Weapon::Grenade | Weapon::Shotgun | Weapon::ClusterBomb 
             | Weapon::BananaBomb | Weapon::HolyHandGrenade | Weapon::HomingMissile 
-            | Weapon::Mortar | Weapon::Sheep | Weapon::BananaBonanza | Weapon::ConcreteShell
+            | Weapon::Mortar | Weapon::Sheep | Weapon::BananaBonanza
             | Weapon::SuperSheep => WeaponType::Projectile,
             
             Weapon::Dynamite | Weapon::Mine => WeaponType::Placed,
             
             Weapon::Airstrike | Weapon::NapalmStrike => WeaponType::Airstrike,
             
-            Weapon::Teleport | Weapon::Jetpack | Weapon::Parachute | Weapon::Rope | Weapon::BuildWall => WeaponType::Utility,
+            Weapon::Teleport | Weapon::Jetpack | Weapon::Parachute | Weapon::Rope | Weapon::BuildWall | Weapon::Drill => WeaponType::Utility,
             
             Weapon::BaseballBat => WeaponType::Melee,
             
@@ -124,7 +124,7 @@ impl Weapon {
             Weapon::Airstrike => 25.0,
             Weapon::NapalmStrike => 20.0,
             Weapon::BananaBonanza => 45.0,
-            Weapon::ConcreteShell => 0.0,
+            Weapon::Drill => 0.0,
             Weapon::SuperSheep => 55.0,
             Weapon::BuildWall => 0.0,
             _ => 0.0,
@@ -133,7 +133,7 @@ impl Weapon {
 
     pub fn base_damage(&self) -> i32 {
         match self {
-            Weapon::Bazooka => 45,
+            Weapon::Bazooka => 50,
             Weapon::Grenade => 35,
             Weapon::Shotgun => 60,
             Weapon::ClusterBomb => 30,
@@ -150,7 +150,7 @@ impl Weapon {
             Weapon::SniperRifle => 1000,
             Weapon::Uzi => 5,
             Weapon::BananaBonanza => 35,
-            Weapon::ConcreteShell => 0,
+            Weapon::Drill => 0,
             Weapon::SuperSheep => 70,
             Weapon::BuildWall => 0,
             _ => 0,
@@ -168,8 +168,9 @@ impl Weapon {
             Weapon::HomingMissile => 15.0,
             Weapon::Mortar => 11.0,
             Weapon::Sheep => 5.0,
+            Weapon::SniperRifle => 1000.0,
             Weapon::BananaBonanza => 10.0,
-            Weapon::ConcreteShell => 20.0,
+            Weapon::Drill => 20.0,
             Weapon::SuperSheep => 13.0,
             Weapon::BuildWall => 1.0,
             _ => 10.0,
@@ -198,7 +199,6 @@ impl Weapon {
             Weapon::ClusterBomb => 2,
             Weapon::BananaBomb => 5,
             Weapon::HolyHandGrenade => 1,
-            Weapon::Sheep => 0,
             _ => 0,
         }
     }
@@ -252,7 +252,7 @@ impl Weapon {
             "Sniper Rifle" => Some(Weapon::SniperRifle),
             "Uzi" => Some(Weapon::Uzi),
             "Banana Bonanza" => Some(Weapon::BananaBonanza),
-            "Concrete Shell" => Some(Weapon::ConcreteShell),
+            "Concrete Shell" => Some(Weapon::Drill),
             "Super Sheep" => Some(Weapon::SuperSheep),
             "Build Wall" => Some(Weapon::BuildWall),
             _ => None,
@@ -279,7 +279,7 @@ impl Weapon {
             Weapon::Uzi,
             Weapon::Teleport,
             Weapon::BananaBonanza,
-            Weapon::ConcreteShell,
+            Weapon::Drill,
             Weapon::SuperSheep,
             Weapon::BuildWall,
         ]
@@ -292,7 +292,7 @@ impl Weapon {
             | Weapon::Mortar | Weapon::Airstrike | Weapon::NapalmStrike => WeaponCategory::Explosives,
             
             Weapon::Shotgun | Weapon::HomingMissile | Weapon::SniperRifle | Weapon::Uzi
-            | Weapon::ConcreteShell => WeaponCategory::Ballistics,
+            | Weapon::Drill => WeaponCategory::Ballistics,
             
             Weapon::Teleport | Weapon::Jetpack | Weapon::Parachute | Weapon::Rope | Weapon::BuildWall => WeaponCategory::Utilities,
             
@@ -323,7 +323,7 @@ impl Weapon {
             Weapon::SniperRifle => "--",
             Weapon::Uzi => "=",
             Weapon::BananaBonanza => ")))",
-            Weapon::ConcreteShell => "[]",
+            Weapon::Drill => "[]",
             Weapon::SuperSheep => "@!",
             Weapon::BuildWall => "###",
         }
@@ -352,7 +352,7 @@ impl Weapon {
             Weapon::SniperRifle => "Instant laser shot",
             Weapon::Uzi => "Rapid-fire 10 shots",
             Weapon::BananaBonanza => "10 cluster bomblets!",
-            Weapon::ConcreteShell => "Drills a walkable tunnel through terrain. No damage.",
+            Weapon::Drill => "Drills a walkable tunnel through terrain. No damage.",
             Weapon::SuperSheep => "Flying explosive sheep!",
             Weapon::BuildWall => "Place a short wooden wall at target location",
         }

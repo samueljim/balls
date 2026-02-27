@@ -18,18 +18,23 @@ pub enum AirstrikeType {
 }
 
 impl AirstrikeDroplet {
-    pub fn tick(&mut self, terrain: &mut Terrain, balls: &mut [Ball], dt: f32) -> Option<Explosion> {
+    pub fn tick(&mut self, terrain: &mut Terrain, balls: &mut [Ball], dt: f32) -> (Option<Explosion>, Option<FirePool>) {
         if !self.alive {
-            return None;
+            return (None, None);
         }
 
         self.vy += 600.0 * dt; // Faster fall than projectiles
         self.y += self.vy * dt;
 
-        // Check bounds
-        if self.y < 0.0 || self.y > terrain.height as f32 + 100.0 {
+        // Still above the map — keep falling, skip collision checks
+        if self.y < 0.0 {
+            return (None, None);
+        }
+
+        // Gone too far below terrain
+        if self.y > terrain.height as f32 + 100.0 {
             self.alive = false;
-            return None;
+            return (None, None);
         }
 
         // Check collision with terrain or water
@@ -38,10 +43,10 @@ impl AirstrikeDroplet {
             return self.explode(terrain, balls);
         }
 
-        None
+        (None, None)
     }
 
-    fn explode(&mut self, terrain: &mut Terrain, balls: &mut [Ball]) -> Option<Explosion> {
+    fn explode(&mut self, terrain: &mut Terrain, balls: &mut [Ball]) -> (Option<Explosion>, Option<FirePool>) {
         self.alive = false;
 
         let (radius, damage) = match self.weapon_type {
@@ -75,12 +80,68 @@ impl AirstrikeDroplet {
             }
         }
 
-        Some(Explosion {
+        let explosion = Some(Explosion {
             x: self.x,
             y: self.y,
             radius,
             is_water: false,
-        })
+        });
+
+        // Napalm leaves a burning fire pool at the impact point
+        let fire = match self.weapon_type {
+            AirstrikeType::Napalm => Some(FirePool {
+                x: self.x,
+                y: self.y,
+                radius: 30.0,
+                lifetime: 5.0,
+                damage_timer: 0.0,
+                alive: true,
+            }),
+            AirstrikeType::Explosive => None,
+        };
+
+        (explosion, fire)
+    }
+}
+
+// ── Fire pool left by napalm ─────────────────────────────────────────────────
+
+pub struct FirePool {
+    pub x: f32,
+    pub y: f32,
+    pub radius: f32,
+    /// Seconds of burn time remaining
+    pub lifetime: f32,
+    /// Countdown to the next damage tick (fires every 0.5 s)
+    pub damage_timer: f32,
+    pub alive: bool,
+}
+
+impl FirePool {
+    pub fn tick(&mut self, balls: &mut [Ball], dt: f32) {
+        if !self.alive {
+            return;
+        }
+        self.lifetime -= dt;
+        if self.lifetime <= 0.0 {
+            self.alive = false;
+            return;
+        }
+        self.damage_timer -= dt;
+        if self.damage_timer <= 0.0 {
+            self.damage_timer = 0.5; // deal damage every 0.5 s
+            let r2 = self.radius * self.radius;
+            for w in balls.iter_mut() {
+                if !w.alive {
+                    continue;
+                }
+                let dx = w.x - self.x;
+                let dy = w.y - self.y;
+                if dx * dx + dy * dy < r2 {
+                    w.take_damage(8); // 8 hp per tick = up to 80 hp over 5 s
+                }
+            }
+        }
     }
 }
 

@@ -4,45 +4,44 @@
  *
  * Controls added:
  *   - Virtual joystick (bottom-left)  → Left / Right arrow key_down/up
- *   - Jump button (above joystick)    → Space key_down
+ *                                       Push UP on joystick → Space (jump, one-shot)
  *   - Weapon button (bottom-right)    → Tab key_down  (toggles weapon menu)
  *   - End Turn button                 → E key_down
- *   - Zoom + / − buttons              → mouse_wheel
- *   - Single-finger drag on canvas    → mouse_move  (updates aim angle)
- *   - Two-finger drag on canvas       → right-click drag  (camera pan)
- *   - Pinch on canvas                 → mouse_wheel  (zoom)
  *   - FIRE button (bottom-right)      → mouse_down / mouse_up at last aim pos
+ *   - Single-finger drag on canvas    → mouse_move (aim) when menu closed
+ *                                       mouse_wheel (scroll) when weapon menu open
+ *   - Tap on canvas when menu open    → mouse_down/up (select weapon or close menu)
+ *   - Two-finger drag on canvas       → right-click drag (camera pan)
+ *   - Pinch on canvas                 → mouse_wheel (zoom)
+ *   - Zoom + / − buttons              → mouse_wheel
  */
 (function () {
   "use strict";
 
-  /* ── sapp key codes (same as into_sapp_keycode in gl.js) ── */
+  /* ── sapp key codes ── */
   var KEY_SPACE = 32;
-  var KEY_E = 69;
   var KEY_TAB = 258;
   var KEY_LEFT = 263;
   var KEY_RIGHT = 262;
   var KEY_UP = 265;
-  var KEY_DOWN = 264;
 
   /* Last canvas position the user aimed at (used by the FIRE button) */
   var lastAimX = 0;
   var lastAimY = 0;
+
+  /* Track whether weapon menu is open so canvas drags scroll instead of aim */
+  var menuOpen = false;
 
   function isTouchDevice() {
     return "ontouchstart" in window || navigator.maxTouchPoints > 0;
   }
 
   /* ── miniquad plugin hooks ── */
-  function register_plugin() {
-    /* Nothing to add to the WASM import object */
-  }
+  function register_plugin() { /* Nothing to add to the WASM import object */ }
 
   function on_init() {
     if (!isTouchDevice()) return;
-    /* wasm_exports is available at this point (set before init_plugins is called) */
     if (typeof wasm_exports === "undefined" || !wasm_exports.key_down) {
-      /* Fallback poll in case timing is off */
       var poll = setInterval(function () {
         if (typeof wasm_exports !== "undefined" && wasm_exports.key_down) {
           clearInterval(poll);
@@ -59,11 +58,13 @@
     var canvas = document.querySelector("#glcanvas");
     if (!canvas) return;
 
-    /* Seed aim position to canvas centre */
     lastAimX = Math.floor(canvas.clientWidth / 2);
     lastAimY = Math.floor(canvas.clientHeight / 2);
 
     buildOverlay(canvas);
+    /* Register two-zone intercept FIRST so its stopImmediatePropagation
+     * prevents the aim handler below from firing for far-zone single touches */
+    setupCanvasTwoZone(canvas);
     setupCanvasTouches(canvas);
   }
 
@@ -82,27 +83,17 @@
     ov.appendChild(js.container);
     setupJoystick(js);
 
-    /* ── Jump button (sits above the joystick) ── */
-    var jumpBtn = mkBtn("▲\nJUMP", {
-      bottom: "230px", left: "45px", w: "60px", h: "50px",
-    });
-    ov.appendChild(jumpBtn);
-    holdKey(jumpBtn, KEY_SPACE);
-
     /* ── Weapon menu button (bottom-right) ── */
     var weaponBtn = mkBtn("🔫\nWEAPON", {
       bottom: "150px", right: "100px", w: "80px", h: "60px",
     });
     ov.appendChild(weaponBtn);
     tapKey(weaponBtn, KEY_TAB);
-
-    /* ── End Turn button ── */
-    var endBtn = mkBtn("✓\nEND TURN", {
-      bottom: "80px", right: "100px", w: "80px", h: "60px",
-      bg: "rgba(30,80,40,0.88)", border: "rgba(60,160,70,0.9)",
-    });
-    ov.appendChild(endBtn);
-    tapKey(endBtn, KEY_E);
+    /* Also keep our JS-side menuOpen flag in sync */
+    weaponBtn.addEventListener("touchstart", function (e) {
+      e.stopPropagation();
+      menuOpen = !menuOpen;
+    }, false);
 
     /* ── FIRE button (big, bottom-right) ── */
     var fireBtn = mkBtn("🔥\nFIRE", {
@@ -114,12 +105,8 @@
     setupFireButton(fireBtn);
 
     /* ── Zoom +/− buttons (top-right, below the HUD) ── */
-    var zoomInBtn = mkBtn("+", {
-      top: "54px", right: "10px", w: "44px", h: "44px",
-    });
-    var zoomOutBtn = mkBtn("−", {
-      top: "104px", right: "10px", w: "44px", h: "44px",
-    });
+    var zoomInBtn = mkBtn("+", { top: "54px", right: "10px", w: "44px", h: "44px" });
+    var zoomOutBtn = mkBtn("−", { top: "104px", right: "10px", w: "44px", h: "44px" });
     ov.appendChild(zoomInBtn);
     ov.appendChild(zoomOutBtn);
 
@@ -162,9 +149,9 @@
     var active = false;
     var touchId = null;
     var center = { x: 0, y: 0 };
-    /* MAX_R: max drag radius in CSS px — roughly 65% of the 130px joystick base radius */
     var MAX_R = 42;
-    var held = { left: false, right: false };
+    /* held tracks which virtual keys are currently pressed */
+    var held = { left: false, right: false, up: false };
 
     function setKey(side, code, on) {
       if (on === held[side]) return;
@@ -182,6 +169,7 @@
       js.thumb.style.transform = "translate(-50%,-50%)";
       setKey("left", KEY_LEFT, false);
       setKey("right", KEY_RIGHT, false);
+      held.up = false;
     }
 
     js.container.addEventListener("touchstart", function (e) {
@@ -194,13 +182,12 @@
       center.y = r.top + r.height / 2;
     }, false);
 
-    /* touchmove/end/cancel are on `document` intentionally so the joystick
-     * stays responsive when the finger moves outside the joystick bounds. */
     document.addEventListener("touchmove", function (e) {
       if (!active) return;
       for (var i = 0; i < e.changedTouches.length; i++) {
         var t = e.changedTouches[i];
         if (t.identifier !== touchId) continue;
+
         var dx = t.clientX - center.x;
         var dy = t.clientY - center.y;
         var dist = Math.sqrt(dx * dx + dy * dy);
@@ -211,9 +198,25 @@
         js.thumb.style.transform =
           "translate(calc(-50% + " + tx + "px),calc(-50% + " + ty + "px))";
 
+        /* Normalised direction components (-1 … 1) */
         var nx = dist > 8 ? dx / dist : 0;
-        setKey("left", KEY_LEFT, nx < -0.25);
+        var ny = dist > 8 ? dy / dist : 0;
+
+        /* Left / right movement */
+        setKey("left",  KEY_LEFT,  nx < -0.25);
         setKey("right", KEY_RIGHT, nx > 0.25);
+
+        /* Up direction → jump (one-shot per gesture; resets when stick returns to neutral) */
+        if (ny < -0.5 && !held.up) {
+          held.up = true;
+          wasm_exports.key_down(KEY_SPACE, 0, false);
+          /* Brief press — macroquad only needs key_down → key_up transition to register is_key_pressed */
+          setTimeout(function () { wasm_exports.key_up(KEY_SPACE, 0); }, 80);
+        }
+        /* Reset up-held when stick returns to roughly neutral/down so next push can re-jump */
+        if (ny >= -0.25) {
+          held.up = false;
+        }
         break;
       }
     }, { passive: true });
@@ -281,14 +284,42 @@
   /* Minimum pixel movement to register a pinch as intentional */
   var PINCH_THRESHOLD = 3;
   /* Multiplier converting pinch-distance-delta to scroll-wheel units */
-  var PINCH_ZOOM_SENSITIVITY = 1.8;
+  var PINCH_ZOOM_SENSITIVITY = 2.5;
+  /* Radius (canvas css pixels) around last aim point within which a single-
+   * finger drag aims instead of panning. Outside this radius it pans.
+   * lastAimX/lastAimY tracks where the worm last was, acting as a proxy for
+   * the active worm's screen position. */
+  var AIM_ZONE_RADIUS = 160;
 
-  /* ── Canvas touch handlers for aiming + camera pan/zoom ── */
+  /* ── Canvas touch handlers ──────────────────────────────────────────────────
+   *
+   * IMPORTANT: All listeners use { capture: true, passive: false } and call
+   * e.stopImmediatePropagation() to prevent gl.js's native canvas touch handlers
+   * from mapping touches to mouse_down/mouse_up (which would fire the weapon).
+   *
+   * Single-finger behaviour depends on whether the weapon menu is open:
+   *   • Menu CLOSED  → mouse_move (aim) only — no mouse_down/up
+   *   • Menu OPEN    → drag scrolls the list via mouse_wheel
+   *                    tap (< TAP_MOVE_THRESHOLD px movement) sends mouse_down+up
+   *                    to select a weapon or close the menu
+   *
+   * Two-finger: camera pan (right-button drag) + pinch zoom
+   */
   function setupCanvasTouches(canvas) {
     var aimId = null;
-    var panning = false;
+    var panning = false;          // true when right-button drag is active (two-finger OR single-finger far zone)
+    var singleFingerPanning = false; // true when panning was started by a single finger (far zone)
     var lastPanCvs = null;
     var lastPinchDist = null;
+    /* 'aim' | 'pan' | null — set on each single-finger touchstart */
+    var gestureMode = null;
+
+    /* Menu-scroll state */
+    var menuScrollLastCvsY = null;
+    var menuTouchStartCvsY = null;
+    var menuTouchStartCvsX = null;
+    var isDragging = false;
+    var TAP_MOVE_THRESHOLD = 15;
 
     function cvsPos(clientX, clientY) {
       var r = canvas.getBoundingClientRect();
@@ -299,57 +330,117 @@
       };
     }
 
+    /* Convert a CSS-pixel distance to canvas-pixel distance */
+    function cssToCvsPx(cssPx) {
+      return cssPx * (window.devicePixelRatio || 1);
+    }
+
     function stopPan(pos) {
       if (panning) {
         wasm_exports.mouse_up(pos.x, pos.y, 2);
         panning = false;
+        singleFingerPanning = false;
         lastPanCvs = null;
         lastPinchDist = null;
       }
     }
 
     canvas.addEventListener("touchstart", function (e) {
+      e.stopImmediatePropagation();
+      e.preventDefault();
+
       var ts = e.touches;
+
       if (ts.length === 1) {
-        /* Single finger: aim */
-        stopPan(cvsPos(ts[0].clientX, ts[0].clientY));
+        /* If two-finger pan was active, stop it cleanly */
+        if (panning && !singleFingerPanning) {
+          stopPan(cvsPos(ts[0].clientX, ts[0].clientY));
+        }
+
         aimId = ts[0].identifier;
         var p = cvsPos(ts[0].clientX, ts[0].clientY);
         lastAimX = p.x; lastAimY = p.y;
+
+        if (menuOpen) {
+          gestureMode = null;
+          menuScrollLastCvsY  = p.y;
+          menuTouchStartCvsY  = p.y;
+          menuTouchStartCvsX  = p.x;
+          isDragging = false;
+          return;
+        }
+
+        /* Near-zone single-finger aim (far-zone pan is handled by setupCanvasTwoZone
+         * which fires first and calls stopImmediatePropagation so we never reach here
+         * for far-zone touches). */
+        gestureMode = 'aim';
         wasm_exports.mouse_move(p.x, p.y);
       } else if (ts.length >= 2) {
-        /* Two fingers: camera pan + pinch zoom */
+        if (singleFingerPanning) {
+          stopPan(lastPanCvs || cvsPos(ts[0].clientX, ts[0].clientY));
+        }
         aimId = null;
+        gestureMode = null;
+        menuScrollLastCvsY = null;
         var mid = midpoint(ts[0], ts[1]);
         var cMid = cvsPos(mid.x, mid.y);
         lastPinchDist = pinchDist(ts[0], ts[1]);
         if (!panning) {
           panning = true;
+          singleFingerPanning = false;
           wasm_exports.mouse_down(cMid.x, cMid.y, 2);
           lastPanCvs = cMid;
         }
       }
-    }, { capture: true, passive: true });
+    }, { capture: true, passive: false });
 
     canvas.addEventListener("touchmove", function (e) {
+      e.stopImmediatePropagation();
+      e.preventDefault();
+
       var ts = e.touches;
+
       if (ts.length === 1 && aimId !== null) {
         var ct = e.changedTouches;
         for (var i = 0; i < ct.length; i++) {
-          if (ct[i].identifier === aimId) {
-            var p = cvsPos(ct[i].clientX, ct[i].clientY);
+          if (ct[i].identifier !== aimId) continue;
+          var p = cvsPos(ct[i].clientX, ct[i].clientY);
+
+          if (menuOpen) {
+            var totalMove = Math.abs(p.x - menuTouchStartCvsX) + Math.abs(p.y - menuTouchStartCvsY);
+            if (totalMove > TAP_MOVE_THRESHOLD) isDragging = true;
+            if (menuScrollLastCvsY !== null) {
+              var scrollDelta = menuScrollLastCvsY - p.y;
+              if (Math.abs(scrollDelta) > 0.5) {
+                wasm_exports.mouse_wheel(0, -scrollDelta * 0.05);
+              }
+            }
+            menuScrollLastCvsY = p.y;
             lastAimX = p.x; lastAimY = p.y;
-            wasm_exports.mouse_move(p.x, p.y);
             break;
           }
+
+          /* Two-zone: check distance from where aim was when this touch started */
+          if (gestureMode === 'aim') {
+            /* If finger has wandered far enough from start to be considered a pan,
+             * promote to pan mode. Use the touchstart position stored in lastAimX/Y
+             * at gesture start — however since we use a simple heuristic here we
+             * check accumulated travel distance from first touchstart position. */
+            lastAimX = p.x; lastAimY = p.y;
+            wasm_exports.mouse_move(p.x, p.y);
+          } else if (gestureMode === 'pan') {
+            wasm_exports.mouse_move(p.x, p.y);
+            lastPanCvs = p;
+            lastAimX = p.x; lastAimY = p.y;
+          }
+          break;
         }
-      } else if (ts.length >= 2 && panning) {
+      } else if (ts.length >= 2 && panning && !singleFingerPanning) {
         var mid = midpoint(ts[0], ts[1]);
         var cMid = cvsPos(mid.x, mid.y);
         wasm_exports.mouse_move(cMid.x, cMid.y);
         lastPanCvs = cMid;
 
-        /* Pinch zoom */
         var d = pinchDist(ts[0], ts[1]);
         if (lastPinchDist !== null && Math.abs(d - lastPinchDist) > PINCH_THRESHOLD) {
           var delta = (d - lastPinchDist) * PINCH_ZOOM_SENSITIVITY;
@@ -357,21 +448,122 @@
           lastPinchDist = d;
         }
       }
-    }, { capture: true, passive: true });
+    }, { capture: true, passive: false });
 
     canvas.addEventListener("touchend", function (e) {
+      e.stopImmediatePropagation();
+      e.preventDefault();
+
       var remaining = e.touches.length;
       if (remaining < 2) {
         var pos = lastPanCvs || { x: lastAimX, y: lastAimY };
-        stopPan(pos);
+        if (!singleFingerPanning) stopPan(pos); // only stop two-finger pan here
       }
-      if (remaining === 0) aimId = null;
-    }, { capture: true, passive: true });
+      if (remaining === 0) {
+        /* End single-finger pan if it was active */
+        if (singleFingerPanning) {
+          stopPan(lastPanCvs || { x: lastAimX, y: lastAimY });
+        }
+        if (menuOpen && !isDragging) {
+          var tapX = lastAimX, tapY = lastAimY;
+          wasm_exports.mouse_down(tapX, tapY, 0);
+          requestAnimationFrame(function () { wasm_exports.mouse_up(tapX, tapY, 0); });
+          menuOpen = false;
+        }
+        aimId = null;
+        gestureMode = null;
+        menuScrollLastCvsY = null;
+      }
+    }, { capture: true, passive: false });
 
-    canvas.addEventListener("touchcancel", function () {
+    canvas.addEventListener("touchcancel", function (e) {
+      e.stopImmediatePropagation();
       stopPan({ x: lastAimX, y: lastAimY });
       aimId = null;
-    }, { capture: true, passive: true });
+      gestureMode = null;
+      menuScrollLastCvsY = null;
+    }, { capture: true, passive: false });
+
+    /* ── Second pass: implement true two-zone detection ────────────────────────
+     * The handlers above default everything to 'aim'. To make single-finger
+     * dragging from a far position pan the camera, we override the touchstart
+     * logic using a pre-capture listener that fires BEFORE the main one and
+     * decides the mode. We do this inline below by replacing the touchstart
+     * handler with a version that captures the PREVIOUS aim position before
+     * overwriting lastAimX/Y.
+     */
+  }
+
+  /* ── Real two-zone single-finger handler ─────────────────────────────────────
+   * We replace setupCanvasTouches with a version that properly captures the
+   * pre-gesture aim position to decide zone. The function above ran but we
+   * need to redo the logic — so we override by wrapping the canvas touchstart
+   * immediately after.
+   */
+  function setupCanvasTwoZone(canvas) {
+    /* Aim position as of the START of each gesture (not updated during gesture) */
+    var gestureStartAimX = 0;
+    var gestureStartAimY = 0;
+    var singlePanning = false;
+    var singlePanLastPos = null;
+
+    /* Pre-capture intercept to record aim position BEFORE it changes */
+    canvas.addEventListener("touchstart", function (e) {
+      var ts = e.touches;
+      if (ts.length !== 1) return; /* two-finger handled by the main handler above */
+
+      var r = canvas.getBoundingClientRect();
+      var dpr = window.devicePixelRatio || 1;
+      var px = Math.floor((ts[0].clientX - r.left) * dpr);
+      var py = Math.floor((ts[0].clientY - r.top) * dpr);
+
+      /* Distance from the current aim point (proxy for worm position) */
+      var ddx = px - lastAimX;
+      var ddy = py - lastAimY;
+      var dist = Math.sqrt(ddx * ddx + ddy * ddy);
+      var aimZonePx = AIM_ZONE_RADIUS * dpr;
+
+      if (dist >= aimZonePx && !menuOpen) {
+        /* Far zone: start a right-button pan drag */
+        e.stopImmediatePropagation(); /* prevent the main handler firing */
+        e.preventDefault();
+        singlePanning = true;
+        singlePanLastPos = { x: px, y: py };
+        wasm_exports.mouse_down(px, py, 2);
+      }
+      /* Near zone: fall through to main handler (aim) */
+    }, { capture: true, passive: false });
+
+    canvas.addEventListener("touchmove", function (e) {
+      if (!singlePanning || e.touches.length !== 1) return;
+      e.stopImmediatePropagation();
+      e.preventDefault();
+      var r = canvas.getBoundingClientRect();
+      var dpr = window.devicePixelRatio || 1;
+      var px = Math.floor((e.touches[0].clientX - r.left) * dpr);
+      var py = Math.floor((e.touches[0].clientY - r.top) * dpr);
+      wasm_exports.mouse_move(px, py);
+      singlePanLastPos = { x: px, y: py };
+    }, { capture: true, passive: false });
+
+    canvas.addEventListener("touchend", function (e) {
+      if (!singlePanning) return;
+      e.stopImmediatePropagation();
+      e.preventDefault();
+      var pos = singlePanLastPos || { x: lastAimX, y: lastAimY };
+      wasm_exports.mouse_up(pos.x, pos.y, 2);
+      singlePanning = false;
+      singlePanLastPos = null;
+    }, { capture: true, passive: false });
+
+    canvas.addEventListener("touchcancel", function (e) {
+      if (!singlePanning) return;
+      e.stopImmediatePropagation();
+      var pos = singlePanLastPos || { x: lastAimX, y: lastAimY };
+      wasm_exports.mouse_up(pos.x, pos.y, 2);
+      singlePanning = false;
+      singlePanLastPos = null;
+    }, { capture: true, passive: false });
   }
 
   function midpoint(t1, t2) {

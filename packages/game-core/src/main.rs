@@ -12,7 +12,7 @@ use camera::GameCamera;
 use macroquad::prelude::*;
 use physics::{Ball, BALL_RADIUS};
 use projectile::{Projectile, ClusterBomblet, ShotgunPellet};
-use special_weapons::{AirstrikeDroplet, UziBullet, PlacedExplosive, AirstrikeType};
+use special_weapons::{AirstrikeDroplet, FirePool, UziBullet, PlacedExplosive, AirstrikeType};
 use state::Phase;
 use terrain::Terrain;
 use weapons::Weapon;
@@ -62,6 +62,7 @@ struct Game {
     cluster_bomblets: Vec<ClusterBomblet>,
     shotgun_pellets: Vec<ShotgunPellet>,
     airstrike_droplets: Vec<AirstrikeDroplet>,
+    fire_pools: Vec<FirePool>,
     uzi_bullets: Vec<UziBullet>,
     placed_explosives: Vec<PlacedExplosive>,
     teleport_mode: bool,
@@ -77,6 +78,16 @@ struct Game {
     cam: GameCamera,
     panning: bool,
     last_mouse: (f32, f32),
+    /// Origin of a left-button press; cleared once drag threshold exceeded or released.
+    left_drag_start: Option<(f32, f32)>,
+    /// True once left-drag has moved > 8px and is panning the camera.
+    left_drag_panning: bool,
+    /// Seconds remaining where the camera won't auto-follow (user manually panned).
+    /// Set to 6 s on every pan gesture; resets to 0 when the player fires.
+    cam_free_timer: f32,
+    /// After cam_free_timer expires, glide back to the action over this many seconds.
+    /// Speed ramps up from ~5 % to 100 % as this timer counts down to 0.
+    cam_return_timer: f32,
 
     wind: f32,
     rng_state: u32,
@@ -104,6 +115,8 @@ struct Game {
     last_aim_send: f32,
     /// Throttle for position-streaming messages (seconds since last send)
     last_pos_send: f32,
+    /// Last value transmitted as pos_update (bi, x, y, vx, vy); None = never sent.
+    last_pos_sent: Option<(usize, f32, f32, f32, f32)>,
     /// Per-ball lerp targets received from pos_update messages: (x, y, vx, vy)
     /// Used to smoothly interpolate remote balls toward their authoritative positions.
     ball_lerp_targets: Vec<Option<(f32, f32, f32, f32)>>,
@@ -247,6 +260,7 @@ impl Game {
             cluster_bomblets: Vec::new(),
             shotgun_pellets: Vec::new(),
             airstrike_droplets: Vec::new(),
+            fire_pools: Vec::new(),
             uzi_bullets: Vec::new(),
             placed_explosives: Vec::new(),
             teleport_mode: false,
@@ -258,6 +272,10 @@ impl Game {
             cam: GameCamera::new(cam_x, cam_y),
             panning: false,
             last_mouse: (0.0, 0.0),
+            left_drag_start: None,
+            left_drag_panning: false,
+            cam_free_timer: 0.0,
+            cam_return_timer: 0.0,
             wind,
             rng_state: rng,
             particles: Vec::new(),
@@ -272,6 +290,7 @@ impl Game {
             just_reconnected: false,
             last_aim_send: 0.0,
             last_pos_send: 0.0,
+            last_pos_sent: None,
             ball_lerp_targets: {
                 let total = num_teams * 3; // balls_per_team = 3
                 vec![None; total]
@@ -289,6 +308,21 @@ impl Game {
                 v
             },
         }
+    }
+
+    /// Auto-follow helper that respects cam_free_timer and applies smooth glide-back easing.
+    /// Call this in place of cam.follow() at every follow site.
+    fn auto_follow(&mut self, tx: f32, ty: f32, speed: f32, dt: f32) {
+        if self.cam_free_timer > 0.0 {
+            return; // user is looking around, don't fight them
+        }
+        let ease = if self.cam_return_timer > 0.0 {
+            // Ramp from ~5 % at the start of the glide to 100 % as timer reaches 0
+            (1.0 - self.cam_return_timer / 2.0).max(0.05)
+        } else {
+            1.0
+        };
+        self.cam.follow(tx, ty, speed * ease, dt);
     }
 
     /// Returns true if it's currently our turn (or if offline/native)
@@ -359,11 +393,53 @@ impl Game {
         if is_mouse_button_released(MouseButton::Right) || is_mouse_button_released(MouseButton::Middle) {
             self.panning = false;
         }
-        if self.panning {
+
+        // Left-click drag-to-pan: record press origin and promote to pan once cursor moves > 8px.
+        if is_mouse_button_pressed(MouseButton::Left) {
+            self.left_drag_start = Some((mx, my));
+            self.left_drag_panning = false;
+            self.last_mouse = (mx, my);
+        }
+        if is_mouse_button_released(MouseButton::Left) {
+            self.left_drag_panning = false;
+            self.left_drag_start = None;
+        }
+        if !self.left_drag_panning {
+            if let Some((sx, sy)) = self.left_drag_start {
+                let dist = ((mx - sx) * (mx - sx) + (my - sy) * (my - sy)).sqrt();
+                if dist > 8.0 {
+                    self.left_drag_panning = true;
+                    self.left_drag_start = None;
+                    // Cancel any charge that started on this same click
+                    self.charging = false;
+                    self.charge_power = 0.0;
+                }
+            }
+        }
+
+        if self.panning || self.left_drag_panning {
             let dx = mx - self.last_mouse.0;
             let dy = my - self.last_mouse.1;
-            self.cam.pan(dx, dy);
+            if dx.abs() > 0.5 || dy.abs() > 0.5 {
+                let dt_input = get_frame_time().max(0.001);
+                self.cam.pan_push(dx, dy, dt_input);
+                self.cam_free_timer = 6.0; // 6 s free-look window
+                self.cam_return_timer = 0.0; // cancel any in-progress glide-back
+            }
             self.last_mouse = (mx, my);
+        }
+
+        // Tick cam timers every frame
+        let ft = get_frame_time();
+        if self.cam_free_timer > 0.0 {
+            let prev = self.cam_free_timer;
+            self.cam_free_timer = (self.cam_free_timer - ft).max(0.0);
+            if self.cam_free_timer == 0.0 && prev > 0.0 {
+                // Free-look just expired — begin the 2-second glide back
+                self.cam_return_timer = 2.0;
+            }
+        } else if self.cam_return_timer > 0.0 {
+            self.cam_return_timer = (self.cam_return_timer - ft).max(0.0);
         }
 
         // Mouse wheel: scroll weapon menu when open, otherwise camera zoom
@@ -456,12 +532,29 @@ impl Game {
             return;
         }
 
-        // Toggle weapon menu with Tab or Q (only on your turn)
+        // Toggle weapon menu with Tab or Q (only on your turn).
+        // If currently charging, cancel the charge first so the player can switch weapon.
         if self.is_my_turn() && (is_key_pressed(KeyCode::Tab) || is_key_pressed(KeyCode::Q)) {
+            if self.charging {
+                self.charging = false;
+                self.charge_power = 0.0;
+                self.phase = Phase::Aiming;
+            }
             self.weapon_menu_open = !self.weapon_menu_open;
             if !self.weapon_menu_open {
                 self.weapon_menu_scroll = 0.0;
             }
+        }
+
+        // ESC or right-click while charging cancels the charge (return to aiming).
+        // Also cancel any click-targeting modes.
+        if self.is_my_turn() && (is_key_pressed(KeyCode::Escape) || is_mouse_button_pressed(MouseButton::Right)) {
+            if self.charging {
+                self.charging = false;
+                self.charge_power = 0.0;
+                self.phase = Phase::Aiming;
+            }
+            self.baseball_bat_mode = false;
         }
         
         // Toggle weapon menu with mouse click on button (only on your turn)
@@ -537,7 +630,7 @@ impl Game {
                         current_y += layout.item_h + layout.item_padding;
                     }
                     
-                    current_y += 4.0; // Space between categories
+                    current_y += layout.cat_spacing; // Space between categories
                 }
             }
             
@@ -608,7 +701,7 @@ impl Game {
             }
         }
 
-        if is_mouse_button_pressed(MouseButton::Left) && !self.has_fired && self.is_my_turn() && self.phase.allows_input() && !self.weapon_menu_open {
+        if is_mouse_button_pressed(MouseButton::Left) && !self.has_fired && self.is_my_turn() && self.phase.allows_input() && !self.weapon_menu_open && !self.left_drag_panning {
             // Handle Build Wall mode: two clicks — first sets position, second sets rotation
             if self.build_wall_mode {
                 let (mx, my) = mouse_position();
@@ -718,7 +811,7 @@ impl Game {
                 if idx < self.balls.len() && self.balls[idx].alive {
                     let ball_x = self.balls[idx].x;
                     let ball_y = self.balls[idx].y;
-                    let bat_range = 70.0;
+                    let bat_range = 100.0;
                     let angle = self.aim_angle;
                     // Strong launch in aim direction + big upward boost
                     let knock_x = angle.cos() * 850.0;
@@ -757,16 +850,11 @@ impl Game {
                 self.phase = Phase::Charging;
             }
         }
-        if self.charging {
+        if self.charging && !self.left_drag_panning {
             self.charge_power = (self.charge_power + CHARGE_SPEED * get_frame_time()).min(100.0);
             if is_mouse_button_released(MouseButton::Left) || self.charge_power >= 100.0 {
                 self.fire();
             }
-        }
-
-        // Only allow ending turn if it's your turn
-        if self.is_my_turn() && is_key_pressed(KeyCode::E) {
-            self.end_turn();
         }
     }
 
@@ -784,6 +872,8 @@ impl Game {
         let angle = self.aim_angle;
         let weapon = self.selected_weapon;
 
+        self.cam_free_timer = 0.0;    // always follow the action when firing
+        self.cam_return_timer = 0.0;   // skip the glide-back phase too
         self.do_fire(idx, angle, power, weapon);
         
         // Don't set has_fired for Baseball Bat, Teleport, and BuildWall - they need a second click
@@ -913,12 +1003,138 @@ impl Game {
                 // Stay in aiming phase, will handle click for wall placement
             },
 
+            // Drill - carve a large tunnel instantly along aim direction
+            Weapon::Drill => {
+                let cos_a = angle.cos();
+                let sin_a = angle.sin();
+                let perp_x = -sin_a;
+                let perp_y =  cos_a;
+                let tunnel_back: i32 = 30;   // carve 30px behind barrel
+                let tunnel_fwd:  i32 = 250;  // carve 250px forward
+                let half_w:      i32 = 30;   // 60px total width
+                let bx = self.balls[idx].x;
+                let by = self.balls[idx].y;
+                for along in -tunnel_back..=tunnel_fwd {
+                    for perp in -half_w..=half_w {
+                        let cx = (bx + cos_a * along as f32 + perp_x * perp as f32) as i32;
+                        let cy = (by + sin_a * along as f32 + perp_y * perp as f32) as i32;
+                        if cx >= 0 && cx < self.terrain.width as i32
+                            && cy >= 0 && cy < self.terrain.height as i32 {
+                            self.terrain.set(cx, cy, 0); // AIR
+                        }
+                    }
+                }
+                self.terrain_dirty = true;
+                self.phase = Phase::Settling;
+                self.settle_timer = 0.0;
+            },
+
             // Teleport - enter teleport mode
             Weapon::Teleport => {
                 self.teleport_mode = true;
                 // Stay in aiming phase, will handle click for teleport
             },
             
+            // Sniper Rifle – instant raycast, no gravity, one-shot kill
+            Weapon::SniperRifle => {
+                let cos_a = angle.cos();
+                let sin_a = angle.sin();
+                let step = 3.0_f32;
+                let max_dist = (self.terrain.width.max(self.terrain.height) as f32) * 2.0;
+
+                let mut hit_x = sx;
+                let mut hit_y = sy;
+                let mut hit_ball: Option<usize> = None;
+                let mut beam_len = max_dist;
+
+                let mut dist = step;
+                while dist <= max_dist {
+                    let rx = sx + cos_a * dist;
+                    let ry = sy + sin_a * dist;
+
+                    // Left the terrain bounds
+                    if rx < 0.0 || rx >= self.terrain.width as f32
+                        || ry < 0.0 || ry >= self.terrain.height as f32 {
+                        hit_x = rx;
+                        hit_y = ry;
+                        beam_len = dist;
+                        break;
+                    }
+
+                    // Hit terrain
+                    if self.terrain.is_solid(rx as i32, ry as i32) {
+                        hit_x = rx;
+                        hit_y = ry;
+                        beam_len = dist;
+                        break;
+                    }
+
+                    // Hit a ball
+                    let mut found = false;
+                    for (bi, w) in self.balls.iter().enumerate() {
+                        if !w.alive || bi == idx { continue; }
+                        let dx = w.x - rx;
+                        let dy = w.y - ry;
+                        if dx * dx + dy * dy < (BALL_RADIUS * 1.4) * (BALL_RADIUS * 1.4) {
+                            hit_x = rx;
+                            hit_y = ry;
+                            hit_ball = Some(bi);
+                            beam_len = dist;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if found { break; }
+
+                    dist += step;
+                }
+
+                // Deal damage + knockback to hit ball
+                if let Some(bi) = hit_ball {
+                    self.balls[bi].take_damage(weapon.base_damage());
+                    let knock = 320.0;
+                    self.balls[bi].apply_knockback(
+                        cos_a * knock,
+                        sin_a * knock - 80.0,
+                    );
+                }
+
+                // Spawn a thin laser-beam flash along the ray
+                let num_sparks = (beam_len / 8.0) as usize;
+                for i in 0..=num_sparks {
+                    let t = i as f32 * 8.0;
+                    self.particles.push(Particle {
+                        x: sx + cos_a * t,
+                        y: sy + sin_a * t,
+                        vx: -sin_a * (rand::gen_range(0.0_f32, 1.0) - 0.5) * 20.0,
+                        vy: -rand::gen_range(0.0_f32, 40.0),
+                        life: 0.15 + rand::gen_range(0.0_f32, 0.1),
+                        color: Color::new(0.8, 1.0, 0.3, 1.0),
+                        size: 1.5,
+                    });
+                }
+                // Bright flash at the hit point
+                for _ in 0..12 {
+                    let spread_angle = rand::gen_range(0.0_f32, std::f32::consts::TAU);
+                    let speed = rand::gen_range(30.0_f32, 120.0);
+                    self.particles.push(Particle {
+                        x: hit_x,
+                        y: hit_y,
+                        vx: spread_angle.cos() * speed,
+                        vy: spread_angle.sin() * speed,
+                        life: 0.3 + rand::gen_range(0.0_f32, 0.2),
+                        color: Color::new(1.0, 1.0, 0.4, 1.0),
+                        size: 2.5,
+                    });
+                }
+
+                // Pan camera to hit point so the player can see where the shot landed
+                self.cam.follow(hit_x, hit_y, 1.0, 1.0);
+
+                self.phase = Phase::Settling;
+                self.settle_timer = 0.0;
+            },
+
             // All other weapons use regular projectile
             _ => {
                 let shooter_team = self.balls[idx].team;
@@ -1115,6 +1331,7 @@ impl Game {
 
     /// Local turn advancement (offline or fallback)
     fn advance_turn(&mut self) {
+        self.last_pos_sent = None; // force a fresh send at the start of each turn
         if self.check_game_over() {
             return;
         }
@@ -1523,6 +1740,15 @@ impl Game {
         }
         self.particles.retain(|p| p.life > 0.0);
 
+        // Apply camera inertia coast (runs every frame; bled away by auto_follow when active)
+        self.cam.apply_momentum(dt);
+
+        // Tick napalm fire pools every frame (persist across turns)
+        for fp in &mut self.fire_pools {
+            fp.tick(&mut self.balls, dt);
+        }
+        self.fire_pools.retain(|fp| fp.alive);
+
         match self.phase {
             Phase::Aiming | Phase::Charging => {
                 self.turn_timer -= dt;
@@ -1594,9 +1820,13 @@ impl Game {
                     self.end_turn();
                 }
                 if self.current_ball < self.balls.len() {
-                    let w = &self.balls[self.current_ball];
-                    if w.alive {
-                        self.cam.follow(w.x, w.y - 30.0, 4.0, dt);
+                    let (wx, wy) = {
+                        let w = &self.balls[self.current_ball];
+                        (w.x, w.y)
+                    };
+                    let alive = self.balls[self.current_ball].alive;
+                    if alive {
+                        self.auto_follow(wx, wy - 30.0, 4.0, dt);
                     }
                 }
             }
@@ -1616,21 +1846,24 @@ impl Game {
                 let mut proj_died = false;
                 
                 // Handle regular projectile
+                let mut proj_follow: Option<(f32, f32)> = None;
                 if let Some(ref mut proj) = self.proj {
                     let (explosion, bomblets) = proj.tick(&mut self.terrain, &mut self.balls, self.wind, dt);
-                    self.cam.follow(proj.x, proj.y, 8.0, dt);
+                    proj_follow = Some((proj.x, proj.y));
                     explosion_opt = explosion;
                     proj_died = !proj.alive;
-                    
-                    // Spawn cluster bomblets if any
                     if !bomblets.is_empty() {
                         self.cluster_bomblets.extend(bomblets);
                     }
-                } 
-                
+                }
+                if let Some((px, py)) = proj_follow {
+                    self.auto_follow(px, py, 8.0, dt);
+                }
+
                 // Handle shotgun pellets
                 if !self.shotgun_pellets.is_empty() {
                     let mut any_active = false;
+                    let mut pellet_follow: Option<(f32, f32)> = None;
                     for pellet in &mut self.shotgun_pellets {
                         if pellet.alive {
                             let hit = pellet.tick(&mut self.terrain, &mut self.balls, dt);
@@ -1639,18 +1872,22 @@ impl Game {
                             }
                             if pellet.alive {
                                 any_active = true;
-                                self.cam.follow(pellet.x, pellet.y, 6.0, dt);
+                                pellet_follow = Some((pellet.x, pellet.y));
                             }
                         }
+                    }
+                    if let Some((px, py)) = pellet_follow {
+                        self.auto_follow(px, py, 6.0, dt);
                     }
                     if !any_active {
                         self.shotgun_pellets.clear();
                     }
                 }
-                
+
                 // Handle Uzi bullets
                 if !self.uzi_bullets.is_empty() {
                     let mut any_active = false;
+                    let mut bullet_follow: Option<(f32, f32)> = None;
                     for bullet in &mut self.uzi_bullets {
                         if bullet.alive {
                             let hit = bullet.tick(&mut self.terrain, &mut self.balls, dt);
@@ -1659,34 +1896,47 @@ impl Game {
                             }
                             if bullet.alive {
                                 any_active = true;
-                                self.cam.follow(bullet.x, bullet.y, 5.0, dt);
+                                bullet_follow = Some((bullet.x, bullet.y));
                             }
                         }
+                    }
+                    if let Some((bx, by)) = bullet_follow {
+                        self.auto_follow(bx, by, 5.0, dt);
                     }
                     if !any_active {
                         self.uzi_bullets.clear();
                     }
                 }
-                
+
                 // Handle airstrike droplets
                 if !self.airstrike_droplets.is_empty() {
                     let mut any_active = false;
+                    let mut droplet_follow: Option<(f32, f32)> = None;
                     let mut explosions = Vec::new();
+                    let mut new_fires: Vec<FirePool> = Vec::new();
                     for droplet in &mut self.airstrike_droplets {
                         if droplet.alive {
-                            if let Some(exp) = droplet.tick(&mut self.terrain, &mut self.balls, dt) {
+                            let (exp_opt, fire_opt) = droplet.tick(&mut self.terrain, &mut self.balls, dt);
+                            if let Some(exp) = exp_opt {
                                 explosions.push(exp);
                                 self.terrain_dirty = true;
                             }
+                            if let Some(fire) = fire_opt {
+                                new_fires.push(fire);
+                            }
                             if droplet.alive {
                                 any_active = true;
-                                self.cam.follow(droplet.x, droplet.y, 7.0, dt);
+                                droplet_follow = Some((droplet.x, droplet.y));
                             }
                         }
+                    }
+                    if let Some((dx, dy)) = droplet_follow {
+                        self.auto_follow(dx, dy, 7.0, dt);
                     }
                     for exp in explosions {
                         self.spawn_explosion_particles(&exp);
                     }
+                    self.fire_pools.extend(new_fires);
                     if !any_active {
                         self.airstrike_droplets.clear();
                     }
@@ -1713,6 +1963,7 @@ impl Game {
                 if !self.cluster_bomblets.is_empty() {
                     let mut explosions = Vec::new();
                     let mut any_active = false;
+                    let mut bomblet_follow: Option<(f32, f32)> = None;
                     for bomblet in &mut self.cluster_bomblets {
                         if bomblet.alive {
                             if let Some(exp) = bomblet.tick(&mut self.terrain, &mut self.balls, dt) {
@@ -1721,9 +1972,12 @@ impl Game {
                             }
                             if bomblet.alive {
                                 any_active = true;
-                                self.cam.follow(bomblet.x, bomblet.y, 6.0, dt);
+                                bomblet_follow = Some((bomblet.x, bomblet.y));
                             }
                         }
+                    }
+                    if let Some((bx, by)) = bomblet_follow {
+                        self.auto_follow(bx, by, 6.0, dt);
                     }
                     for exp in &explosions {
                         self.spawn_explosion_particles(exp);
@@ -1894,11 +2148,24 @@ impl Game {
                 if let Some(bi) = my_ball_opt {
                     if bi < self.balls.len() && self.balls[bi].alive {
                         let b = &self.balls[bi];
-                        let msg = format!(
-                            "{{\"type\":\"pos_update\",\"bi\":{},\"x\":{:.1},\"y\":{:.1},\"vx\":{:.1},\"vy\":{:.1}}}",
-                            bi, b.x, b.y, b.vx, b.vy
-                        );
-                        self.net.send_message(&msg);
+                        // Only transmit when something actually changed (rounds to 1dp precision)
+                        let changed = match self.last_pos_sent {
+                            None => true,
+                            Some((lbi, lx, ly, lvx, lvy)) =>
+                                lbi != bi
+                                || (b.x - lx).abs() >= 0.05
+                                || (b.y - ly).abs() >= 0.05
+                                || (b.vx - lvx).abs() >= 0.05
+                                || (b.vy - lvy).abs() >= 0.05,
+                        };
+                        if changed {
+                            let msg = format!(
+                                "{{\"type\":\"pos_update\",\"bi\":{},\"x\":{:.1},\"y\":{:.1},\"vx\":{:.1},\"vy\":{:.1}}}",
+                                bi, b.x, b.y, b.vx, b.vy
+                            );
+                            self.net.send_message(&msg);
+                            self.last_pos_sent = Some((bi, b.x, b.y, b.vx, b.vy));
+                        }
                         self.last_pos_send = current_time;
                     }
                 }
@@ -2080,6 +2347,18 @@ impl Game {
             }
         }
         
+        // Draw fire pools (napalm burns)
+        for fp in &self.fire_pools {
+            if fp.alive {
+                let alpha = (fp.lifetime / 5.0).min(1.0); // fade as it burns out
+                // Outer glow
+                draw_circle(fp.x, fp.y, fp.radius, Color::new(1.0, 0.35, 0.0, alpha * 0.35));
+                // Inner hot core (flickers based on lifetime)
+                let flicker = ((fp.lifetime * 12.0).sin() * 0.15 + 0.85).max(0.0);
+                draw_circle(fp.x, fp.y, fp.radius * 0.55 * flicker, Color::new(1.0, 0.75, 0.1, alpha * 0.75));
+            }
+        }
+
         // Draw airstrike droplets
         for droplet in &self.airstrike_droplets {
             if droplet.alive {
@@ -2193,8 +2472,8 @@ impl Game {
             draw_line(world_pos.x, world_pos.y + gap,       world_pos.x, world_pos.y + arm + gap, 1.5, c);
         }
 
-        // ConcreteShell tunnel preview: blue rectangle along aim direction
-        if self.selected_weapon == Weapon::ConcreteShell
+        // Drill tunnel preview: blue rectangle along aim direction
+        if self.selected_weapon == Weapon::Drill
             && (self.phase == Phase::Aiming || self.phase == Phase::Charging)
             && !self.has_fired && self.is_my_turn()
         {
@@ -2205,13 +2484,12 @@ impl Game {
                 let angle = self.aim_angle;
                 let cos_a = angle.cos();
                 let sin_a = angle.sin();
-                // Match carve dims from projectile.rs: back=20, fwd=120, half_w=11
-                let half_len = 70.0f32; // (120+20)/2
-                let half_w   = 11.0f32;
-                let mid_off  = 50.0f32; // (-20+120)/2 — center offset from ball
+                // Match carve dims: back=30, fwd=250, half_w=30
+                let half_len = 140.0f32; // (250+30)/2
+                let half_w   = 30.0f32;
+                let mid_off  = 110.0f32; // (250-30)/2 — center offset from ball
                 let cx = bx + cos_a * mid_off;
                 let cy = by + sin_a * mid_off;
-                // Perpendicular
                 let px = -sin_a;
                 let py =  cos_a;
                 let c0 = vec2(cx + cos_a * half_len - px * half_w, cy + sin_a * half_len - py * half_w);
@@ -2287,6 +2565,17 @@ impl Game {
             let sw = screen_width();
             let tw = measure_text(hint, None, 22, 1.0).width;
             draw_text(hint, sw / 2.0 - tw / 2.0, 58.0, 22.0, Color::new(0.4, 0.9, 1.0, 1.0));
+        }
+
+        // Baseball Bat hint
+        if self.selected_weapon == Weapon::BaseballBat
+            && (self.phase == Phase::Aiming || self.phase == Phase::Charging)
+            && !self.has_fired && self.is_my_turn()
+        {
+            let hint = "[ BASEBALL BAT ]  Aim at an enemy and click to swing";
+            let sw = screen_width();
+            let tw = measure_text(hint, None, 22, 1.0).width;
+            draw_text(hint, sw / 2.0 - tw / 2.0, 58.0, 22.0, Color::new(1.0, 0.75, 0.3, 1.0));
         }
 
         // Airstrike / NapalmStrike targeting hint
@@ -2367,34 +2656,239 @@ impl Game {
             return;
         }
         let ball = &self.balls[idx];
+        let bx = ball.x;
+        let by = ball.y;
         let angle = self.aim_angle;
-        let line_len = 50.0 + self.charge_power * 0.5;
-        let ex = ball.x + angle.cos() * line_len;
-        let ey = ball.y + angle.sin() * line_len;
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+        let pi = std::f32::consts::PI;
 
-        draw_line(ball.x, ball.y, ex, ey, 2.0, Color::new(1.0, 1.0, 0.4, 0.8));
+        match self.selected_weapon {
+            // ── Baseball Bat ─────────────────────────────────────────────────
+            Weapon::BaseballBat => {
+                let bat_range = 100.0f32;
+                draw_circle(bx, by, bat_range, Color::new(1.0, 0.55, 0.1, 0.07));
+                draw_circle_lines(bx, by, bat_range, 1.5, Color::new(1.0, 0.65, 0.2, 0.55));
+                for i in 0..8 {
+                    let a = i as f32 * pi * 0.25;
+                    draw_line(
+                        bx + a.cos() * (bat_range - 5.0), by + a.sin() * (bat_range - 5.0),
+                        bx + a.cos() * (bat_range + 5.0), by + a.sin() * (bat_range + 5.0),
+                        1.5, Color::new(1.0, 0.65, 0.2, 0.7),
+                    );
+                }
+                let tip_x = bx + cos_a * bat_range;
+                let tip_y = by + sin_a * bat_range;
+                draw_line(bx, by, tip_x, tip_y, 3.0, Color::new(0.9, 0.7, 0.3, 0.85));
+                draw_circle(tip_x, tip_y, 5.0, Color::new(0.95, 0.8, 0.4, 0.9));
+                draw_circle_lines(tip_x, tip_y, 6.5, 1.5, Color::new(1.0, 0.9, 0.5, 0.8));
+                for (i, w) in self.balls.iter().enumerate() {
+                    if i == idx || !w.alive || w.team == ball.team { continue; }
+                    let dx = w.x - bx;
+                    let dy = w.y - by;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist < bat_range {
+                        let pulse = (get_time() as f32 * 4.0).sin() * 0.25 + 0.75;
+                        draw_circle_lines(w.x, w.y, BALL_RADIUS + 4.0, 2.0,
+                            Color::new(1.0, 0.15, 0.15, pulse));
+                        let label = format!("{:.0}", dist);
+                        draw_text(&label, w.x - 8.0, w.y - BALL_RADIUS - 10.0, 14.0,
+                            Color::new(1.0, 0.7, 0.3, 0.9));
+                    }
+                }
+            }
 
-        draw_circle(ex, ey, 4.0, Color::new(1.0, 0.2, 0.2, 0.8));
-        draw_circle_lines(ex, ey, 6.0, 1.5, WHITE);
+            // ── Sniper Rifle ──────────────────────────────────────────────────
+            Weapon::SniperRifle => {
+                let max_range = 1600.0f32;
+                let mut hit_x = bx + cos_a * max_range;
+                let mut hit_y = by + sin_a * max_range;
+                let mut t = BALL_RADIUS + 4.0;
+                while t < max_range {
+                    let rx = bx + cos_a * t;
+                    let ry = by + sin_a * t;
+                    if self.terrain.is_solid(rx as i32, ry as i32) {
+                        hit_x = rx; hit_y = ry; break;
+                    }
+                    t += 2.0;
+                }
+                // Glow + core beam
+                draw_line(bx, by, hit_x, hit_y, 5.0, Color::new(0.2, 1.0, 0.9, 0.15));
+                draw_line(bx, by, hit_x, hit_y, 2.0, Color::new(0.5, 1.0, 1.0, 0.9));
+                // Impact crosshair
+                let r = 9.0f32;
+                draw_circle_lines(hit_x, hit_y, r, 1.5, Color::new(0.2, 1.0, 0.9, 0.9));
+                let arm = r * 1.6;
+                let gap = r * 0.5;
+                draw_line(hit_x - arm, hit_y, hit_x - gap, hit_y, 1.5, Color::new(0.2, 1.0, 0.9, 0.9));
+                draw_line(hit_x + gap, hit_y, hit_x + arm, hit_y, 1.5, Color::new(0.2, 1.0, 0.9, 0.9));
+                draw_line(hit_x, hit_y - arm, hit_x, hit_y - gap, 1.5, Color::new(0.2, 1.0, 0.9, 0.9));
+                draw_line(hit_x, hit_y + gap, hit_x, hit_y + arm, 1.5, Color::new(0.2, 1.0, 0.9, 0.9));
+            }
 
-        let power_for_preview = if self.charging {
-            self.charge_power
-        } else {
-            50.0
-        };
-        let traj = projectile::simulate_trajectory(
-            ball.x + angle.cos() * (BALL_RADIUS + 4.0),
-            ball.y + angle.sin() * (BALL_RADIUS + 4.0),
-            angle,
-            power_for_preview,
-            self.selected_weapon,
-            self.wind,
-            &self.terrain,
-        );
-        for (i, &(tx, ty)) in traj.iter().enumerate() {
-            if i % 2 == 0 {
-                let alpha = 1.0 - i as f32 / traj.len().max(1) as f32;
-                draw_circle(tx, ty, 1.5, Color::new(1.0, 1.0, 0.6, alpha * 0.6));
+            // ── Uzi ───────────────────────────────────────────────────────────
+            Weapon::Uzi => {
+                let range = 300.0f32;
+                let spread = 0.10f32;
+                let rays = 7usize;
+                for i in 0..rays {
+                    let t_param = i as f32 / (rays - 1) as f32;
+                    let ray_angle = angle - spread + t_param * spread * 2.0;
+                    let ca = ray_angle.cos();
+                    let sa = ray_angle.sin();
+                    let mut ex = bx + ca * range;
+                    let mut ey = by + sa * range;
+                    let mut tr = BALL_RADIUS + 4.0;
+                    while tr < range {
+                        let rx = bx + ca * tr;
+                        let ry = by + sa * tr;
+                        if self.terrain.is_solid(rx as i32, ry as i32) {
+                            ex = rx; ey = ry; break;
+                        }
+                        ex = rx; ey = ry;
+                        tr += 3.0;
+                    }
+                    let is_center = i == rays / 2;
+                    let alpha = if is_center { 0.75 } else { 0.30 };
+                    let w = if is_center { 2.0 } else { 1.0 };
+                    draw_line(bx, by, ex, ey, w, Color::new(0.95, 0.9, 0.25, alpha));
+                    draw_circle(ex, ey, 2.5, Color::new(1.0, 0.95, 0.4, alpha + 0.1));
+                }
+            }
+
+            // ── Shotgun ───────────────────────────────────────────────────────
+            Weapon::Shotgun => {
+                let range = 240.0f32;
+                let spread = 0.22f32;
+                let pellets = 6usize;
+                for i in 0..pellets {
+                    let t_param = i as f32 / (pellets - 1) as f32;
+                    let ray_angle = angle - spread + t_param * spread * 2.0;
+                    let ca = ray_angle.cos();
+                    let sa = ray_angle.sin();
+                    let mut ex = bx + ca * range;
+                    let mut ey = by + sa * range;
+                    let mut tr = BALL_RADIUS + 4.0;
+                    while tr < range {
+                        let rx = bx + ca * tr;
+                        let ry = by + sa * tr;
+                        if self.terrain.is_solid(rx as i32, ry as i32) {
+                            ex = rx; ey = ry; break;
+                        }
+                        ex = rx; ey = ry;
+                        tr += 3.0;
+                    }
+                    draw_line(bx, by, ex, ey, 1.5, Color::new(0.95, 0.85, 0.5, 0.50));
+                    draw_circle(ex, ey, 3.5, Color::new(1.0, 0.9, 0.4, 0.85));
+                }
+                // Spread cone outline
+                let left_x  = bx + (angle - spread).cos() * range;
+                let left_y  = by + (angle - spread).sin() * range;
+                let right_x = bx + (angle + spread).cos() * range;
+                let right_y = by + (angle + spread).sin() * range;
+                draw_line(bx, by, left_x,  left_y,  1.0, Color::new(1.0, 0.8, 0.3, 0.30));
+                draw_line(bx, by, right_x, right_y, 1.0, Color::new(1.0, 0.8, 0.3, 0.30));
+                draw_line(left_x, left_y, right_x, right_y, 1.0, Color::new(1.0, 0.8, 0.3, 0.25));
+            }
+
+            // ── Homing Missile ────────────────────────────────────────────────
+            Weapon::HomingMissile => {
+                // Show trajectory arc
+                let power_for_preview = if self.charging { self.charge_power } else { 50.0 };
+                let traj = projectile::simulate_trajectory(
+                    bx + cos_a * (BALL_RADIUS + 4.0), by + sin_a * (BALL_RADIUS + 4.0),
+                    angle, power_for_preview, Weapon::HomingMissile, self.wind, &self.terrain,
+                );
+                for (i, &(tx, ty)) in traj.iter().enumerate() {
+                    if i % 2 == 0 {
+                        let alpha = 1.0 - i as f32 / traj.len().max(1) as f32;
+                        draw_circle(tx, ty, 1.5, Color::new(1.0, 0.5, 0.2, alpha * 0.6));
+                    }
+                }
+                // Lock-on reticle for nearest enemy
+                let mut closest: Option<(f32, f32)> = None;
+                let mut best_dist = f32::MAX;
+                for (i, w) in self.balls.iter().enumerate() {
+                    if i == idx || !w.alive || w.team == ball.team { continue; }
+                    let dx = w.x - bx; let dy = w.y - by;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist < best_dist { best_dist = dist; closest = Some((w.x, w.y)); }
+                }
+                if let Some((tx, ty)) = closest {
+                    let pulse = (get_time() as f32 * 4.0).sin() * 0.25 + 0.75;
+                    let r = BALL_RADIUS + 8.0;
+                    draw_circle_lines(tx, ty, r, 2.0, Color::new(1.0, 0.2, 0.2, pulse));
+                    let arm = r * 0.5;
+                    let gap = r * 0.65;
+                    for &(sx, sy) in &[(-1.0f32,-1.0f32),(1.0,-1.0),(1.0,1.0),(-1.0,1.0)] {
+                        draw_line(tx+sx*gap, ty+sy*gap, tx+sx*(gap+arm), ty+sy*gap, 2.0, Color::new(1.0,0.2,0.2,1.0));
+                        draw_line(tx+sx*gap, ty+sy*gap, tx+sx*gap, ty+sy*(gap+arm), 2.0, Color::new(1.0,0.2,0.2,1.0));
+                    }
+                    // Line to target
+                    draw_line(bx, by, tx, ty, 1.0, Color::new(1.0, 0.2, 0.2, 0.25));
+                }
+            }
+
+            // ── Mine / Dynamite ───────────────────────────────────────────────
+            Weapon::Mine | Weapon::Dynamite => {
+                let radius = self.selected_weapon.explosion_radius();
+                let pulse = (get_time() as f32 * 2.5).sin() * 0.15 + 0.55;
+                let foot_x = bx;
+                let foot_y = by + BALL_RADIUS + 2.0;
+                draw_circle(foot_x, foot_y, radius, Color::new(1.0, 0.3, 0.1, 0.06));
+                draw_circle_lines(foot_x, foot_y, radius, 1.5, Color::new(1.0, 0.3, 0.1, pulse));
+                draw_circle(foot_x, foot_y, 4.0, Color::new(1.0, 0.3, 0.1, pulse));
+                // Danger stripes on the foot marker
+                for i in 0..4 {
+                    let a = i as f32 * pi * 0.5;
+                    draw_line(foot_x + a.cos()*5.0, foot_y + a.sin()*5.0,
+                              foot_x + a.cos()*12.0, foot_y + a.sin()*12.0,
+                              1.5, Color::new(1.0, 0.85, 0.0, 0.7));
+                }
+            }
+
+            // ── All other projectile weapons ──────────────────────────────────
+            _ => {
+                let line_len = 50.0 + self.charge_power * 0.5;
+                let ex = bx + cos_a * line_len;
+                let ey = by + sin_a * line_len;
+                draw_line(bx, by, ex, ey, 2.0, Color::new(1.0, 1.0, 0.4, 0.8));
+                draw_circle(ex, ey, 4.0, Color::new(1.0, 0.2, 0.2, 0.8));
+                draw_circle_lines(ex, ey, 6.0, 1.5, WHITE);
+
+                let power_for_preview = if self.charging { self.charge_power } else { 50.0 };
+                let traj = projectile::simulate_trajectory(
+                    bx + cos_a * (BALL_RADIUS + 4.0),
+                    by + sin_a * (BALL_RADIUS + 4.0),
+                    angle, power_for_preview,
+                    self.selected_weapon,
+                    self.wind,
+                    &self.terrain,
+                );
+                let impact = traj.last().copied();
+                for (i, &(tx, ty)) in traj.iter().enumerate() {
+                    if i % 2 == 0 {
+                        let alpha = 1.0 - i as f32 / traj.len().max(1) as f32;
+                        draw_circle(tx, ty, 1.5, Color::new(1.0, 1.0, 0.6, alpha * 0.6));
+                    }
+                }
+                // Explosion radius circle at predicted impact point
+                let radius = self.selected_weapon.explosion_radius();
+                if radius > 0.0 {
+                    if let Some((ix, iy)) = impact {
+                        draw_circle(ix, iy, radius, Color::new(1.0, 0.45, 0.1, 0.08));
+                        draw_circle_lines(ix, iy, radius, 1.5, Color::new(1.0, 0.55, 0.2, 0.65));
+                        // Tick marks on explosion circle
+                        for i in 0..8 {
+                            let a = i as f32 * pi * 0.25;
+                            draw_line(
+                                ix + a.cos() * (radius - 4.0), iy + a.sin() * (radius - 4.0),
+                                ix + a.cos() * (radius + 4.0), iy + a.sin() * (radius + 4.0),
+                                1.5, Color::new(1.0, 0.55, 0.2, 0.8),
+                            );
+                        }
+                    }
+                }
             }
         }
     }

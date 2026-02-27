@@ -472,28 +472,6 @@ impl Projectile {
                 return (None, Vec::new());
             }
 
-            // ConcreteShell: carve a walkable tunnel along trajectory, no damage
-            if self.weapon == Weapon::ConcreteShell {
-                let speed = (self.vx * self.vx + self.vy * self.vy).sqrt().max(1.0);
-                let dir_x = self.vx / speed;
-                let dir_y = self.vy / speed;
-                // Perpendicular direction for tunnel width
-                let perp_x = -dir_y;
-                let perp_y = dir_x;
-                let tunnel_half_w: i32 = 11; // ~22px wide — enough to walk through
-                let tunnel_back: i32 = 20;   // carve behind impact point too
-                let tunnel_fwd: i32 = 120;   // carve forward into terrain
-                for along in -tunnel_back..=tunnel_fwd {
-                    for perp in -tunnel_half_w..=tunnel_half_w {
-                        let cx = (self.x + dir_x * along as f32 + perp_x * perp as f32) as i32;
-                        let cy = (self.y + dir_y * along as f32 + perp_y * perp as f32) as i32;
-                        terrain.set(cx, cy, 0); // AIR
-                    }
-                }
-                self.alive = false;
-                return (None, Vec::new());
-            }
-
             self.alive = false;
             return self.create_explosion(terrain, balls);
         }

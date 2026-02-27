@@ -7,12 +7,18 @@ use macroquad::prelude::*;
 /// short axis, giving a close-up view of the current player / projectile.
 const BASE_SHORT_AXIS: f32 = 350.0;
 
+/// Maximum inertia speed in world-units/second.
+const MAX_VEL: f32 = 2500.0;
+
 pub struct GameCamera {
     pub x: f32,
     pub y: f32,
     pub zoom: f32,
     pub target_x: f32,
     pub target_y: f32,
+    /// Momentum velocity in world-units/second. Applied every tick by apply_momentum().
+    pub vel_x: f32,
+    pub vel_y: f32,
 }
 
 impl GameCamera {
@@ -23,15 +29,62 @@ impl GameCamera {
             zoom: 1.2,
             target_x: x,
             target_y: y,
+            vel_x: 0.0,
+            vel_y: 0.0,
         }
     }
 
+    /// Smoothly follow a world-space target. Also bleeds off any residual momentum
+    /// so it doesn't fight the auto-follow interpolation.
     pub fn follow(&mut self, tx: f32, ty: f32, speed: f32, dt: f32) {
         self.target_x = tx;
         self.target_y = ty;
         let rate = (speed * dt).min(1.0);
         self.x += (self.target_x - self.x) * rate;
         self.y += (self.target_y - self.y) * rate;
+        // Drain momentum toward zero at the same rate so inertia doesn't fight the follow
+        self.vel_x *= 1.0 - rate;
+        self.vel_y *= 1.0 - rate;
+    }
+
+    /// Pan by a screen-pixel delta, imparting inertial velocity proportional to swipe speed.
+    /// Immediate position offset is also applied so the view feels 1:1 with the gesture.
+    pub fn pan_push(&mut self, dx_screen: f32, dy_screen: f32, dt: f32) {
+        let vw = self.visible_width();
+        let vh = self.visible_height();
+        let world_dx = -dx_screen / screen_width() * vw;
+        let world_dy = -dy_screen / screen_height() * vh;
+        // Apply position immediately (1:1 with finger/mouse)
+        self.x += world_dx;
+        self.y += world_dy;
+        self.target_x = self.x;
+        self.target_y = self.y;
+        // Impart velocity for the inertia coast after release
+        let dt_safe = dt.max(0.001);
+        let new_vx = (world_dx / dt_safe).clamp(-MAX_VEL, MAX_VEL);
+        let new_vy = (world_dy / dt_safe).clamp(-MAX_VEL, MAX_VEL);
+        // Blend toward new velocity (smooths out jitter from tiny deltas)
+        self.vel_x = self.vel_x * 0.4 + new_vx * 0.6;
+        self.vel_y = self.vel_y * 0.4 + new_vy * 0.6;
+    }
+
+    /// Apply inertial coast. Call every frame unconditionally (even when following).
+    /// When the camera is in auto-follow mode, follow() drains the velocity so this
+    /// becomes a no-op quickly.
+    pub fn apply_momentum(&mut self, dt: f32) {
+        if self.vel_x.abs() < 1.0 && self.vel_y.abs() < 1.0 {
+            self.vel_x = 0.0;
+            self.vel_y = 0.0;
+            return;
+        }
+        self.x += self.vel_x * dt;
+        self.y += self.vel_y * dt;
+        self.target_x = self.x;
+        self.target_y = self.y;
+        // Frame-rate-independent friction (~75% speed remaining after 1 second)
+        let friction = 0.82_f32.powf(dt * 60.0);
+        self.vel_x *= friction;
+        self.vel_y *= friction;
     }
 
     pub fn zoom_by(&mut self, factor: f32) {
@@ -100,6 +153,7 @@ impl GameCamera {
     }
 
     pub fn pan(&mut self, dx_screen: f32, dy_screen: f32) {
+        // Legacy alias — callers should prefer pan_push() for momentum support.
         let vw = self.visible_width();
         let vh = self.visible_height();
         self.x -= dx_screen / screen_width() * vw;

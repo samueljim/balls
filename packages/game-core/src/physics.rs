@@ -12,6 +12,8 @@ const AIR_CONTROL_ACCEL: f32 = 420.0; // Horizontal acceleration applied per-fra
 const MAX_AIR_SPEED: f32 = 105.0;     // Max horizontal speed from air control
 const FALL_DAMAGE_THRESHOLD: f32 = 120.0;
 const FALL_DAMAGE_FACTOR: f32 = 0.25;
+const WALL_IMPACT_THRESHOLD: f32 = 250.0; // min speed to take wall-impact damage
+const WALL_IMPACT_FACTOR: f32 = 0.04;    // damage per unit of excess speed
 const MOVEMENT_BUDGET: f32 = 170.0;   // Slightly more movement per turn
 const COYOTE_TIME: f32 = 0.15;        // Grace window after walking off edge
 const JUMP_BUFFER_TIME: f32 = 0.12;   // Jump pressed just before landing
@@ -172,6 +174,11 @@ impl Ball {
         {
             self.x = (self.x - r).ceil() + r + 1.0;
             if self.vx < 0.0 {
+                let impact = self.vx.abs();
+                if impact > WALL_IMPACT_THRESHOLD {
+                    let dmg = ((impact - WALL_IMPACT_THRESHOLD) * WALL_IMPACT_FACTOR) as i32;
+                    if dmg > 0 { self.take_damage(dmg); }
+                }
                 self.vx = 0.0;
             }
         }
@@ -180,6 +187,11 @@ impl Ball {
         {
             self.x = (self.x + r).floor() - r - 1.0;
             if self.vx > 0.0 {
+                let impact = self.vx.abs();
+                if impact > WALL_IMPACT_THRESHOLD {
+                    let dmg = ((impact - WALL_IMPACT_THRESHOLD) * WALL_IMPACT_FACTOR) as i32;
+                    if dmg > 0 { self.take_damage(dmg); }
+                }
                 self.vx = 0.0;
             }
         }

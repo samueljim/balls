@@ -410,59 +410,107 @@ pub fn generate(seed: u32) -> Terrain {
         }
     }
 
-    // Generate improved lava pools with better visuals
+    // Generate trenches — narrow deep cuts across the terrain surface
     s = lcg(s.wrapping_add(3000));
-    let num_lava = 2 + (s >> 16) as u32 % 3; // 2-4 lava pools
-    
-    for _ in 0..num_lava {
+    let num_trenches = 2 + (s >> 16) as u32 % 2; // 2-3 trenches
+    for _ in 0..num_trenches {
         s = lcg(s);
-        let lx = LAND_START_X as i32 + 150 + (s >> 16) as i32 % (land_width - 300);
+        let tx = LAND_START_X as i32 + 120 + (s >> 16) as i32 % (land_width - 240);
         s = lcg(s);
-        let surface_y = heights[lx as usize] as i32;
-        let ly = surface_y - 20 - (s >> 16) as i32 % 30;
+        let trench_w = 10 + (s >> 16) as i32 % 12; // 10-22px wide
         s = lcg(s);
-        let lava_w = 40 + (s >> 16) as i32 % 60; // Larger pools
-        s = lcg(s);
-        let lava_d = 10 + (s >> 16) as i32 % 18; // Deeper pools
-        
-        // Create bowl-shaped depression with smooth curves
-        for dx in 0..lava_w {
-            let xd = (dx as f32 - lava_w as f32 / 2.0) / (lava_w as f32 / 2.0);
-            // Parabolic bowl shape
-            let depth_factor = 1.0 - (xd * xd);
-            let depth = (lava_d as f32 * depth_factor.sqrt()) as i32;
-            
-            for dy in 0..depth {
-                t.set(lx + dx - lava_w / 2, ly + dy, AIR);
+        let trench_d = 35 + (s >> 16) as i32 % 40; // 35-75px deep
+        let surface_y = heights[tx as usize] as i32;
+        for dx in 0..trench_w {
+            let xd = (dx as f32 - trench_w as f32 * 0.5) / (trench_w as f32 * 0.5);
+            // Slightly deeper in the center
+            let col_depth = (trench_d as f32 * (1.0 - xd * xd * 0.35)) as i32;
+            for dy in 0..col_depth {
+                t.set(tx + dx - trench_w / 2, surface_y + dy, AIR);
             }
-            
-            // Multi-layer lava for depth effect
-            let lava_depth = ((depth as f32 * 0.7) as i32).max(3);
-            for dy in (depth - lava_depth).max(0)..depth {
-                t.set(lx + dx - lava_w / 2, ly + dy, LAVA);
-            }
-            
-            // Add some stone edges for natural look
+            // Stone walls on each side for a fortified look
+            t.set(tx - trench_w / 2 - 1 + dx / trench_w, surface_y, STONE);
+        }
+        // Stone floor
+        for dx in 0..trench_w {
+            t.set(tx + dx - trench_w / 2, surface_y + trench_d, STONE);
+        }
+    }
+
+    // Generate stone ruin clusters — scattered rubble from crumbled structures
+    s = lcg(s.wrapping_add(3500));
+    let num_ruins = 2 + (s >> 16) as u32 % 3; // 2-4 ruin sites
+    for _ in 0..num_ruins {
+        s = lcg(s);
+        let rx = LAND_START_X as i32 + 100 + (s >> 16) as i32 % (land_width - 200);
+        let surface_y = heights[rx as usize] as i32;
+        s = lcg(s);
+        let ruin_spread = 30 + (s >> 16) as i32 % 40; // 30-70px spread
+        // Place 8-14 irregular stone chunks
+        s = lcg(s);
+        let num_chunks = 8 + (s >> 16) as i32 % 7;
+        for _ in 0..num_chunks {
             s = lcg(s);
-            if depth > 2 && (s >> 16) % 3 == 0 {
-                let stone_y = ly + depth - lava_depth - 1;
-                if stone_y > 0 {
-                    t.set(lx + dx - lava_w / 2, stone_y, STONE);
+            let cx = rx + ((s >> 16) as i32 % ruin_spread) - ruin_spread / 2;
+            s = lcg(s);
+            let cy_off = -((s >> 16) as i32 % 12); // slightly above surface
+            s = lcg(s);
+            let cw = 3 + (s >> 16) as i32 % 7; // 3-9 wide
+            s = lcg(s);
+            let ch = 2 + (s >> 16) as i32 % 5; // 2-6 tall
+            for dy in 0..ch {
+                for dx in 0..cw {
+                    let px = cx + dx;
+                    let py = surface_y + cy_off - dy;
+                    if px >= LAND_START_X as i32 && px < LAND_END_X as i32 && py > 0 {
+                        if t.get(px, py) == AIR || t.get(px, py) == GRASS {
+                            t.set(px, py, STONE);
+                        }
+                    }
                 }
             }
         }
-        
-        // Occasionally add small lava vents nearby
+    }
+
+    // Generate pre-made craters — as if the battlefield has already seen combat
+    s = lcg(s.wrapping_add(3800));
+    let num_craters = 2 + (s >> 16) as u32 % 3; // 2-4 craters
+    for _ in 0..num_craters {
         s = lcg(s);
-        if (s >> 16) % 2 == 0 {
+        let crx = LAND_START_X as i32 + 100 + (s >> 16) as i32 % (land_width - 200);
+        let surface_y = heights[crx as usize] as i32;
+        s = lcg(s);
+        let radius = 12 + (s >> 16) as i32 % 18; // 12-30px radius
+        // Carve a circular bowl into the surface
+        for dy in 0..radius {
+            for dx in -radius..=radius {
+                let xd = dx as f32;
+                let yd = dy as f32;
+                let dist = (xd * xd + yd * yd).sqrt();
+                if dist < radius as f32 {
+                    // Deeper in the middle; stone rim at edges
+                    let depth_factor = 1.0 - dist / radius as f32;
+                    let depth = (radius as f32 * depth_factor * 0.6) as i32;
+                    if yd as i32 <= depth {
+                        t.set(crx + dx, surface_y + dy, AIR);
+                    }
+                }
+            }
+        }
+        // Scattered dirt/stone ejecta around rim
+        for _ in 0..8 {
             s = lcg(s);
-            let vent_x = lx + ((s >> 16) as i32 % 20) - 10;
-            let vent_size = 3 + (s >> 16) as i32 % 4;
-            
-            for dy in 0..vent_size {
-                for dx in -vent_size/2..vent_size/2 {
-                    if dx * dx + dy * dy < vent_size * vent_size / 4 {
-                        t.set(vent_x + dx, ly - 10 + dy, LAVA);
+            let ex = crx + ((s >> 16) as i32 % (radius * 3)) - radius;
+            s = lcg(s);
+            let esize = 2 + (s >> 16) as i32 % 4;
+            for dy in 0..esize {
+                for dx in 0..esize {
+                    let px = ex + dx;
+                    let py = surface_y - 1 - dy;
+                    if px >= LAND_START_X as i32 && px < LAND_END_X as i32 && py > 0 {
+                        if t.get(px, py) == AIR {
+                            t.set(px, py, DIRT);
+                        }
                     }
                 }
             }

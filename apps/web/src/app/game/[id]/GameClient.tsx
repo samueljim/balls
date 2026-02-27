@@ -70,6 +70,7 @@ export default function GameView({ overrideId }: { overrideId?: string } = {}) {
     // Try origin static file first, then fall back to API host if needed.
     loadScriptWithFallback([originGlJs, apiGlJs])
       .then(() => loadScript(base + "/js/ws_plugin.js"))
+      .then(() => loadScript(base + "/js/mobile_controls.js"))
       .then(() => {
         const load = (window as unknown as { load?: (url: string) => void }).load;
         if (typeof load === "function") {

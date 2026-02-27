@@ -12,6 +12,8 @@ pub struct Projectile {
     pub bounces: i32,
     pub alive: bool,
     pub trail: Vec<(f32, f32)>,
+    /// Team that fired this projectile — used to avoid friendly-fire targeting
+    pub shooter_team: u32,
 }
 
 pub struct ShotgunPellet {
@@ -179,7 +181,7 @@ impl ClusterBomblet {
 }
 
 impl Projectile {
-    pub fn new(x: f32, y: f32, angle: f32, power: f32, weapon: Weapon) -> Self {
+    pub fn new(x: f32, y: f32, angle: f32, power: f32, weapon: Weapon, shooter_team: u32) -> Self {
         let speed = power * 12.0;
         let vx = angle.cos() * speed;
         let vy = angle.sin() * speed;
@@ -199,6 +201,7 @@ impl Projectile {
             bounces: 0,
             alive: true,
             trail: Vec::new(),
+            shooter_team,
         }
     }
 
@@ -302,6 +305,10 @@ impl Projectile {
             
             for w in balls.iter() {
                 if !w.alive {
+                    continue;
+                }
+                // Only home on enemies, not teammates
+                if w.team == self.shooter_team {
                     continue;
                 }
                 let dx = w.x - self.x;

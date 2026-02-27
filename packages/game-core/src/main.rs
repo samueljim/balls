@@ -71,6 +71,8 @@ struct Game {
     build_wall_anchor: Option<(f32, f32)>,
     /// Airstrike or NapalmStrike waiting for a click-target. Stores which weapon.
     airstrike_mode: Option<Weapon>,
+    /// Countdown before bot fires (resets each turn)
+    bot_think_timer: f32,
 
     cam: GameCamera,
     panning: bool,
@@ -252,6 +254,7 @@ impl Game {
             build_wall_mode: false,
             build_wall_anchor: None,
             airstrike_mode: None,
+            bot_think_timer: 1.5,
             cam: GameCamera::new(cam_x, cam_y),
             panning: false,
             last_mouse: (0.0, 0.0),
@@ -519,10 +522,12 @@ impl Game {
                                 self.selected_weapon = **w;
                                 self.weapon_menu_open = false;
                                 self.weapon_menu_scroll = 0.0;
-                                // Auto-enter click modes immediately — no charge/fire needed
+                // Auto-enter click modes immediately — no charge/fire needed
                                 match self.selected_weapon {
                                     Weapon::Teleport => { self.teleport_mode = true; }
                                     Weapon::BuildWall => { self.build_wall_mode = true; }
+                                    Weapon::Airstrike => { self.airstrike_mode = Some(Weapon::Airstrike); }
+                                    Weapon::NapalmStrike => { self.airstrike_mode = Some(Weapon::NapalmStrike); }
                                     _ => {}
                                 }
                                 return;
@@ -916,7 +921,8 @@ impl Game {
             
             // All other weapons use regular projectile
             _ => {
-                let proj = Projectile::new(sx, sy, angle, power, weapon);
+                let shooter_team = self.balls[idx].team;
+                let proj = Projectile::new(sx, sy, angle, power, weapon, shooter_team);
                 self.proj = Some(proj);
                 self.phase = Phase::ProjectileFlying;
             }
@@ -932,7 +938,8 @@ impl Game {
             let msg = format!("[TURN] end_turn called, is_my_turn={}, connected={}\0", self.is_my_turn(), self.net.connected);
             unsafe { console_log(msg.as_ptr()); }
         }
-        if self.net.connected && self.is_my_turn() {
+        let current_turn_is_bot = self.net.player_is_bot.get(self.current_turn_index).copied().unwrap_or(false);
+        if self.net.connected && (self.is_my_turn() || current_turn_is_bot) {
             // Send ball state snapshot so opponent syncs positions/health
             self.send_ball_state();
             self.net.send_message(r#"{"type":"end_turn"}"#);
@@ -1210,6 +1217,7 @@ impl Game {
         self.build_wall_mode = false;
         self.build_wall_anchor = None;
         self.airstrike_mode = None;
+        self.bot_think_timer = 1.5;
         
         // Reset movement budget for the current ball
         if self.current_ball < self.balls.len() {
@@ -1521,6 +1529,53 @@ impl Game {
                 if self.turn_timer <= 0.0 && self.is_my_turn() {
                     self.end_turn();
                 }
+
+                // ── Bot AI ──────────────────────────────────────────────────────
+                let bot_team = self.current_turn_index;
+                let is_bot_turn = self.net.player_is_bot.get(bot_team).copied().unwrap_or(false);
+                if is_bot_turn && !self.has_fired {
+                    self.bot_think_timer -= dt;
+                    if self.bot_think_timer <= 0.0 {
+                        if let Some(bot_ball_idx) = self.find_ball_for_player(bot_team) {
+                            let bx = self.balls[bot_ball_idx].x;
+                            let by = self.balls[bot_ball_idx].y;
+                            // Find nearest living enemy ball
+                            let mut best_dist = f32::MAX;
+                            let mut best_angle = -0.5f32; // default: slightly upward
+                            let mut found_enemy = false;
+                            for w in &self.balls {
+                                if !w.alive || w.team == bot_team as u32 { continue; }
+                                let dx = w.x - bx;
+                                let dy = w.y - by;
+                                let dist = (dx * dx + dy * dy).sqrt();
+                                if dist < best_dist {
+                                    best_dist = dist;
+                                    // Aim slightly above the target so the missile arcs in
+                                    best_angle = dy.atan2(dx) - 0.25;
+                                    found_enemy = true;
+                                }
+                            }
+                            if found_enemy {
+                                self.current_ball = bot_ball_idx;
+                                self.aim_angle = best_angle;
+                                self.selected_weapon = Weapon::HomingMissile;
+                                let shooter_team = self.balls[bot_ball_idx].team;
+                                let offset = BALL_RADIUS + 4.0;
+                                let sx = bx + best_angle.cos() * offset;
+                                let sy = by + best_angle.sin() * offset;
+                                let proj = Projectile::new(sx, sy, best_angle, 80.0, Weapon::HomingMissile, shooter_team);
+                                self.proj = Some(proj);
+                                self.has_fired = true;
+                                self.phase = Phase::ProjectileFlying;
+                            } else {
+                                self.end_turn();
+                            }
+                        } else {
+                            self.end_turn();
+                        }
+                    }
+                }
+                // ────────────────────────────────────────────────────────────────
                 // Skip physics for remote balls that are network-driven (pos_update stream);
                 // running local physics on them fights the lerp and causes visible teleporting.
                 let my_ball_phys = self.net.my_player_index

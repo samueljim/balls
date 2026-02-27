@@ -1,0 +1,85 @@
+name: Deploy to Cloudflare
+
+on:
+  push:
+    branches: [master]
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy-worker:
+    name: Deploy Worker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Deploy Cloudflare Worker
+        working-directory: apps/worker
+        run: pnpm exec wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+  deploy-web:
+    name: Deploy Web (Pages)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/game-core/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('packages/game-core/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build WASM
+        run: pnpm run build:game
+
+      - name: Copy WASM for web
+        run: cp apps/web/public/wasm/game_core.wasm apps/web/public/wasm/game.wasm
+
+      - name: Build Next.js
+        working-directory: apps/web
+        run: pnpm run build
+        env:
+          NEXT_PUBLIC_API_BASE: https://api.balls.bne.sh
+          NEXT_PUBLIC_WS_BASE: wss://api.balls.bne.sh
+
+      - name: Deploy to Cloudflare Pages
+        run: pnpm --filter balls-worker exec wrangler pages deploy ../web/out --project-name=balls-web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

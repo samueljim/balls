@@ -19,6 +19,9 @@ export default function RootLayout({
           href="https://fonts.googleapis.com/css2?family=Luckiest+Guy&display=swap"
           rel="stylesheet"
         />
+        <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+        <link rel="alternate icon" href="/favicon.svg" />
+        <meta name="theme-color" content="#8257E5" />
       </head>
       <body className="min-h-screen antialiased font-sans" suppressHydrationWarning>
         <Providers>{children}</Providers>

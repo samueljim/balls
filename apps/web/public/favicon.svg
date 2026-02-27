@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="favicon">
+  <title>Favicon</title>
+  <rect width="64" height="64" fill="none"/>
+  <!-- Main circle in team color -->
+  <circle cx="32" cy="32" r="30" fill="#8257E5" />
+  <!-- Slight inner highlight -->
+  <circle cx="24" cy="22" r="10" fill="#ffffff" opacity="0.08" />
+</svg>

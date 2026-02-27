@@ -2,16 +2,14 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import Link from "next/link";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 
 import { API_BASE, apiJson } from "@/lib/api";
+import { pickRandomFunnyName } from "@/lib/funnyNames";
 
 export default function HomePage() {
   const router = useRouter();
   const [creating, setCreating] = useState(false);
-  const [joinCode, setJoinCode] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   async function handleCreate() {
@@ -25,8 +23,9 @@ export default function HomePage() {
         code?: string;
       }>(res);
       if (data.error) throw new Error(data.error);
+      const playerName = pickRandomFunnyName();
       router.push(
-        `/lobby/${data.lobbyId}?host=1&code=${encodeURIComponent(data.code ?? "")}`,
+        `/lobby/${data.lobbyId}?host=1&code=${encodeURIComponent(data.code ?? "")}&playerName=${encodeURIComponent(playerName)}`,
       );
     } catch (e) {
       console.error(e);
@@ -89,44 +88,11 @@ export default function HomePage() {
             >
               {creating ? "LAUNCHING…" : "CREATE GAME"}
             </Button>
-
-            <div className="relative py-4">
-              <div className="absolute inset-0 flex items-center">
-                <span className="w-full border-t-2 border-dashed border-emerald-900/60" />
-              </div>
-              <p className="relative flex justify-center">
-                <span className="bg-stone-900/95 px-4 font-display text-sm text-emerald-600/90 tracking-wider">
-                  OR JOIN WITH CODE
-                </span>
-              </p>
-            </div>
-
-            <div className="flex gap-3">
-              <Input
-                placeholder="ABC123"
-                value={joinCode}
-                onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
-                className="flex-1 h-12 text-center text-lg font-mono font-bold uppercase tracking-[0.3em] rounded-xl border-2 border-stone-600 bg-stone-950/80 placeholder:text-stone-500 focus:border-emerald-500 focus:ring-emerald-500/30"
-                maxLength={6}
-              />
-              <Link
-                href={joinCode.length >= 4 ? `/join/${joinCode}` : "#"}
-                className="flex-shrink-0"
-              >
-                <Button
-                  variant="secondary"
-                  disabled={joinCode.length < 4}
-                  className="h-12 px-6 font-display rounded-xl bg-stone-700 hover:bg-stone-600 border-2 border-stone-500 text-stone-100 disabled:opacity-50 disabled:pointer-events-none"
-                >
-                  JOIN
-                </Button>
-              </Link>
-            </div>
           </div>
         </div>
 
         <p className="mt-8 text-sm text-stone-500">
-          No sign-up. Share the link. Enter your name. Play.
+          No sign-up. Share the lobby link; they enter their name and play.
         </p>
       </div>
     </main>

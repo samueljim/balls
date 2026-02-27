@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { FunPageLayout, FunPanel, funInputClass, funButtonPrimaryClass } from "@/components/layout/FunPageLayout";
 import { API_BASE, apiJson } from "@/lib/api";
+import { pickRandomFunnyName } from "@/lib/funnyNames";
 
 function useSearchDict(searchString: string) {
   const params = new URLSearchParams(searchString || (typeof window !== "undefined" ? window.location.search : ""));
@@ -25,18 +26,36 @@ export default function JoinContent({
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!name.trim()) return;
     setJoining(true);
     setError("");
     try {
+      const playerName = name.trim() || pickRandomFunnyName();
       const res = await fetch(`${API_BASE}/lobby/join`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code, playerName: name.trim() }),
+        body: JSON.stringify({ code, playerName }),
       });
-      const data = await apiJson<{ error?: string; lobbyId?: string; playerId?: string; playerName?: string }>(res);
+      const data = await apiJson<{
+        error?: string;
+        lobbyId?: string;
+        playerId?: string;
+        playerName?: string;
+        gameId?: string;
+        playerOrder?: { playerId: string; isBot: boolean; name: string }[];
+      }>(res);
       if (data.error) throw new Error(data.error);
-      router.push(`/lobby/${data.lobbyId}?playerId=${data.playerId}&playerName=${encodeURIComponent(data.playerName ?? "")}`);
+      if (data.gameId && data.playerOrder?.length) {
+        try {
+          sessionStorage.setItem(`worms:${data.gameId}`, JSON.stringify(data.playerOrder));
+        } catch (_) {}
+        router.push(
+          `/game/${data.gameId}?playerId=${data.playerId}&playerName=${encodeURIComponent(data.playerName ?? "")}`
+        );
+      } else {
+        router.push(
+          `/lobby/${data.lobbyId}?playerId=${data.playerId}&playerName=${encodeURIComponent(data.playerName ?? "")}`
+        );
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Join failed");
       setJoining(false);
@@ -49,10 +68,10 @@ export default function JoinContent({
         <form onSubmit={handleSubmit} className="space-y-5">
           <div>
             <label className="block font-display text-sm text-emerald-600/90 tracking-wider mb-2">
-              YOUR NAME
+              YOUR NAME <span className="text-stone-500 font-normal">(optional)</span>
             </label>
             <Input
-              placeholder="Enter your name"
+              placeholder="Leave blank for a funny name"
               value={name}
               onChange={(e) => setName(e.target.value)}
               maxLength={32}
@@ -66,11 +85,11 @@ export default function JoinContent({
             </div>
           )}
           <Button type="submit" className={funButtonPrimaryClass} disabled={joining}>
-            {joining ? "JOINING…" : "JOIN"}
+            {joining ? "JOINING…" : "JOIN & PLAY"}
           </Button>
         </form>
       </FunPanel>
-      <p className="mt-8 text-sm text-stone-500">No sign-up. Just your name. Then play.</p>
+      <p className="mt-8 text-sm text-stone-500">No sign-up. Name optional — you can change it in the lobby.</p>
     </FunPageLayout>
   );
 }

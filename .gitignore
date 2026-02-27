@@ -1,2 +1,5 @@
 node_modules
 .wrangler
+apps/web/out/_next
+apps/web/out
+packages/game-core/target

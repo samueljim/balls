@@ -2,7 +2,7 @@
   "name": "worms-web",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev --webpack",
     "build": "next build && (cp public/_redirects out/_redirects 2>/dev/null || true)",
     "start": "next start"
   },

@@ -9,8 +9,8 @@ const LobbyContent = dynamic(
   () => import("@/app/lobby/[id]/LobbyContent").then((m) => m.default),
   { ssr: false }
 );
-const GameContent = dynamic(
-  () => import("@/app/game/[id]/GameContent").then((m) => m.default),
+const GameView = dynamic(
+  () => import("@/app/game/[id]/GameClient").then((m) => m.default),
   { ssr: false }
 );
 const JoinContent = dynamic(
@@ -18,17 +18,25 @@ const JoinContent = dynamic(
   { ssr: false }
 );
 
-function usePathnameOrWindow() {
-  const pathnameFromRouter = usePathname();
-  const [pathnameFromWindow, setPathnameFromWindow] = useState("");
-  useEffect(() => {
-    setPathnameFromWindow(window.location.pathname);
-  }, []);
-  return pathnameFromRouter ?? pathnameFromWindow;
-}
+const loadingFallback = (
+  <div className="min-h-screen flex items-center justify-center bg-[#0d1f0d] text-emerald-500 font-display">
+    Loading…
+  </div>
+);
 
 function NotFoundFallbackInner() {
-  const pathname = usePathnameOrWindow();
+  const [mounted, setMounted] = useState(false);
+  const pathnameFromRouter = usePathname();
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  if (!mounted) {
+    return loadingFallback;
+  }
+
+  const pathname = pathnameFromRouter ?? (typeof window !== "undefined" ? window.location.pathname : "");
   const search = typeof window !== "undefined" ? window.location.search : "";
 
   const lobbyMatch = pathname.match(/^\/lobby\/([^/]+)\/?$/);
@@ -37,21 +45,21 @@ function NotFoundFallbackInner() {
 
   if (lobbyMatch) {
     return (
-      <Suspense fallback={<div className="min-h-screen flex items-center justify-center bg-[#0d1f0d] text-emerald-500">Loading…</div>}>
+      <Suspense fallback={loadingFallback}>
         <LobbyContent overrideId={lobbyMatch[1]} overrideSearch={search} />
       </Suspense>
     );
   }
   if (gameMatch) {
     return (
-      <Suspense fallback={<div className="min-h-screen flex items-center justify-center bg-[#0d1f0d] text-emerald-500">Loading…</div>}>
-        <GameContent overrideId={gameMatch[1]} overrideSearch={search} />
+      <Suspense fallback={loadingFallback}>
+        <GameView overrideId={gameMatch[1]} />
       </Suspense>
     );
   }
   if (joinMatch) {
     return (
-      <Suspense fallback={<div className="min-h-screen flex items-center justify-center bg-[#0d1f0d] text-emerald-500">Loading…</div>}>
+      <Suspense fallback={loadingFallback}>
         <JoinContent overrideCode={joinMatch[1]} overrideSearch={search} />
       </Suspense>
     );

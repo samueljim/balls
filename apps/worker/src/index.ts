@@ -86,9 +86,8 @@ export default {
       try {
         const body = await request.json().catch(() => ({})) as { code?: string; playerName?: string };
         const code = (body.code ?? "").toUpperCase().trim();
-        const playerName = (body.playerName ?? "Player").trim().slice(0, 32);
-        if (!code || !playerName) {
-          return corsJson({ error: "code and playerName required" }, { status: 400 });
+        if (!code) {
+          return corsJson({ error: "code required" }, { status: 400 });
         }
         const registry = env.REGISTRY.get(env.REGISTRY.idFromName("default"));
         const getRes = await registry.fetch(new Request(`https://r/get?code=${encodeURIComponent(code)}`));
@@ -101,18 +100,29 @@ export default {
         const addRes = await lobby.fetch(
           new Request("https://in/add", {
             method: "POST",
-            body: JSON.stringify({ playerName }),
+            body: JSON.stringify({ playerName: (body.playerName ?? "").trim() || undefined }),
           })
         );
-        const addData = await addRes.json() as { playerId?: string; playerName?: string; error?: string };
+        const addData = await addRes.json() as {
+          playerId?: string;
+          playerName?: string;
+          error?: string;
+          gameId?: string;
+          playerOrder?: { playerId: string; isBot: boolean; name: string }[];
+        };
         if (addData.error) {
           return corsJson({ error: addData.error }, { status: addRes.status });
         }
-        return corsJson({
+        const payload: Record<string, unknown> = {
           lobbyId,
           playerId: addData.playerId,
           playerName: addData.playerName,
-        });
+        };
+        if (addData.gameId && addData.playerOrder) {
+          payload.gameId = addData.gameId;
+          payload.playerOrder = addData.playerOrder;
+        }
+        return corsJson(payload);
       } catch (err) {
         return corsJson({ error: String(err) }, { status: 500 });
       }
@@ -135,7 +145,7 @@ export default {
       const gameId = url.pathname.slice("/game/".length).split("?")[0];
       if (!gameId) return corsResponse(new Response("gameId required", { status: 400 }), request);
       try {
-        const stub = env.GAME.get(env.GAME.idFromString(gameId));
+        const stub = env.GAME.get(env.GAME.idFromName(gameId));
         return stub.fetch(request);
       } catch {
         return corsResponse(new Response("Invalid game", { status: 400 }), request);
@@ -147,7 +157,7 @@ export default {
     if (gameInitMatch && request.method === "POST") {
       const gameId = gameInitMatch[1];
       try {
-        const stub = env.GAME.get(env.GAME.idFromString(gameId));
+        const stub = env.GAME.get(env.GAME.idFromName(gameId));
         const res = await stub.fetch(new Request(request.url, { method: "POST", body: request.body }));
         return corsResponse(res, request);
       } catch {

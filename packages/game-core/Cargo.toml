@@ -2,15 +2,14 @@
 name = "game-core"
 version = "0.1.0"
 edition = "2021"
-description = "Deterministic Worms-like game engine for WASM"
+description = "Worms-like game engine using macroquad"
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
-[features]
-default = []
+[[bin]]
+name = "game-core"
+path = "src/main.rs"
 
 [dependencies]
-wasm-bindgen = "0.2"
-serde = { version = "1.0", features = ["derive"] }
-serde-wasm-bindgen = "0.6"
+macroquad = "0.4"
+
+[profile.release]
+opt-level = "s"

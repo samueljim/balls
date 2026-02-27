@@ -1,5 +1,6 @@
 import { Suspense } from "react";
 import LobbyContent from "./LobbyContent";
+import { LobbyLoading } from "@/components/LobbyLoading";
 
 export function generateStaticParams() {
   return [{ id: "default" }];
@@ -7,7 +8,7 @@ export function generateStaticParams() {
 
 export default function LobbyPage() {
   return (
-    <Suspense fallback={<div className="min-h-screen flex items-center justify-center bg-[#0d1f0d] text-emerald-500">Loading…</div>}>
+    <Suspense fallback={<LobbyLoading />}>
       <LobbyContent />
     </Suspense>
   );

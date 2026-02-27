@@ -20,6 +20,19 @@ Web-based Worms-style game: invite friends with a link, join with your name, tur
 
 **Local only:** Build WASM, run the worker from `apps/worker`, then run the web app (see below). Local DO bindings can be unreliable; deploy is recommended.
 
+### Local frontend development (hosted backend)
+
+To work on the Next.js UI only, run the web app locally and point it at the deployed API (default):
+
+```bash
+pnpm install
+pnpm dev:web
+```
+
+Then open **http://localhost:3000**. The app uses **https://api.worms.bne.sh** for API and WebSockets by default, so you don’t need a `.env.local` file. Create a game, share the link, join in another tab, etc.
+
+**Game screen (WASM):** The in-browser game canvas needs the WASM build. If you don’t have Rust installed, the lobby and join flows work; the game view will show a load error until WASM is built. From repo root, run `pnpm run build:game` once (install [Rust](https://rustup.rs) and `cargo install wasm-pack` first). When you run `pnpm dev:web`, a watcher copies `packages/game-core/pkg` into `apps/web/public/wasm/` and keeps it in sync — after changing Rust, run `pnpm run build:game` again and refresh the browser to hot-reload WASM.
+
 ### 1. Build the game engine (WASM)
 
 ```bash
@@ -109,36 +122,44 @@ Cloudflare creates the custom domain **api.worms.bne.sh** and the DNS record (bn
 
 1. In [Cloudflare Dashboard](https://dash.cloudflare.com) go to **Workers & Pages** → **Create** → **Pages** → **Connect to Git**.
 2. Select this repo and branch.
-3. **Build configuration**:
-   - **Framework preset**: Next.js (Static HTML Export)
-   - **Root directory**: `apps/web`
-   - **Build command**: `pnpm install && pnpm run build` (or `npm run build` if you use npm in the build)
-   - **Build output directory**: `out` (see note below)
-4. **Environment variables** (Production): add **NEXT_PUBLIC_API_BASE** = `https://api.worms.bne.sh`
-5. Save and deploy. After the first deploy, go to the project → **Custom domains** → **Set up a custom domain** → add **worms.bne.sh**.
+3. **Build configuration** (choose one):
 
-**Alternative (CLI):** From repo root run `pnpm deploy:web` to build and deploy the static export to Cloudflare Pages (project name `worms-web`). The app defaults to **api.worms.bne.sh** for API and WebSockets, so you don’t need to set env vars for that.
+   **Option A — With WASM (game canvas works):** Build from repo root so Rust can run. The script installs Rust in the cloud if needed.
+   - **Root directory**: leave blank (repo root)
+   - **Build command**: `pnpm install && pnpm run build:web`
+   - **Build output directory**: `apps/web/out`
+   - **Environment variables** (Production): **NEXT_PUBLIC_API_BASE** = `https://api.worms.bne.sh`
+
+   **Option B — Without WASM (lobby/join only):** Build from `apps/web` only (no Rust in cloud).
+   - **Root directory**: `apps/web`
+   - **Build command**: `pnpm install && pnpm run build`
+   - **Build output directory**: `out`
+
+4. Save and deploy. After the first deploy, go to the project → **Custom domains** → **Set up a custom domain** → add **worms.bne.sh**.
+
+**Alternative (CLI):** From repo root run `pnpm deploy:web`. This **requires Rust + wasm-pack** on your machine: it builds the game WASM, copies it into the web app, builds the static export, and deploys to Cloudflare Pages (project name `worms-web`). The app defaults to **api.worms.bne.sh** for API and WebSockets.
 
 **Use worms.bne.sh instead of *.pages.dev:** In [Cloudflare Dashboard](https://dash.cloudflare.com) go to **Workers & Pages** → your Pages project (**worms-web**) → **Custom domains** → **Set up a custom domain** → enter **worms.bne.sh** and save. Cloudflare will add the DNS record (bne.sh must be your zone). After that, the site is available at **https://worms.bne.sh** as well as the *.pages.dev URL.
 
 **Build output directory:** If your Next.js app is set to static export (`output: 'export'` in `next.config.js`), the output directory is `out`. If you use the default Next.js build (no static export), Cloudflare may expect `.next` and run a Node server; in that case pick the preset that matches (e.g. “Next.js” and the output directory your build produces). For a client-only app, static export is simplest: set `output: 'export'` in `apps/web/next.config.js`, then Build output directory = `out`.
 
-### 3. Build the game engine (WASM)
+### 3. Game engine (WASM) on the site
 
-So the in-browser game runs on worms.bne.sh:
-
-```bash
-cd packages/game-core && wasm-pack build --target web --out-dir pkg
-cp -r pkg/* ../../apps/web/public/wasm/
-```
-
-Commit and push (if using Git deploy), or include `public/wasm/` in your upload. Then open **https://worms.bne.sh**: create a game, share the link (e.g. https://worms.bne.sh/join/CODE), and play.
+If you used **Option A** (build:web from repo root) or **`pnpm deploy:web`**, the WASM build is already part of the deploy and the in-browser game runs. If you used Option B (apps/web only), either switch to Option A for the next deploy or build locally: `pnpm run build:game`, copy `packages/game-core/pkg/*` to `apps/web/public/wasm/`, commit and push. Then open **https://worms.bne.sh**: create a game, share the link (e.g. https://worms.bne.sh/join/CODE), and play.
 
 ## Troubleshooting
 
 **"Durable Objects not loaded" (503 when creating a game)**
 
 The app defaults to **https://api.worms.bne.sh** (local and on Pages). So the worker must be deployed: run `pnpm deploy:worker` from repo root. Ensure **bne.sh** is your Cloudflare zone so the custom domain **api.worms.bne.sh** is created. To use a local worker instead, set **NEXT_PUBLIC_API_BASE** = `http://localhost:8787` in `apps/web/.env.local`.
+
+**`GET /wasm/game_core.js` 404 (WASM load failed)**
+
+The game canvas needs the WASM build in the deployed site. **Git-based Pages:** use **Option A** in “Deploy the frontend” (repo root, build command `pnpm run build:web`) so the cloud build installs Rust and builds WASM. **CLI deploy:** run **`pnpm deploy:web`** from your machine (requires Rust + wasm-pack; builds WASM and deploys). Optional: set **NEXT_PUBLIC_WASM_BASE** if you host WASM elsewhere.
+
+**WebSocket connection to api.worms.bne.sh failed**
+
+The game and lobby use WebSockets on the same host as the API. Ensure the **worker** is deployed and **api.worms.bne.sh** (or your worker URL) resolves to it: run `pnpm deploy:worker` and check Cloudflare Dashboard → Workers & Pages → your worker → Custom domains. If you use a different API URL, set **NEXT_PUBLIC_API_BASE** (and **NEXT_PUBLIC_WS_BASE** if the WebSocket host differs) in the web app’s build env (e.g. in Pages → Settings → Environment variables).
 
 ## Notes
 

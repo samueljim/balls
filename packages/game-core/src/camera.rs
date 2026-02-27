@@ -1,5 +1,12 @@
 use macroquad::prelude::*;
 
+/// World units visible along the shorter screen axis at zoom 1.0.
+/// This anchors the view to screen shape rather than terrain width, so the
+/// camera stays tight and action-focused on any orientation or window size.
+/// Smaller value = more zoomed in. At default zoom 1.2 → ~290 units on the
+/// short axis, giving a close-up view of the current player / projectile.
+const BASE_SHORT_AXIS: f32 = 350.0;
+
 pub struct GameCamera {
     pub x: f32,
     pub y: f32,
@@ -31,12 +38,31 @@ impl GameCamera {
         self.zoom = (self.zoom * factor).clamp(0.4, 3.0);
     }
 
+    /// World units visible horizontally.
+    /// On landscape screens the width axis is the long one; on portrait/narrow
+    /// windows (e.g. devtools open) the width axis is the short one — both are
+    /// handled correctly because we anchor to the shorter screen dimension.
     pub fn visible_width(&self) -> f32 {
-        crate::terrain::WIDTH as f32 / self.zoom
+        let short_axis = BASE_SHORT_AXIS / self.zoom;
+        if screen_width() <= screen_height() {
+            // Portrait / square: width is the short axis
+            short_axis
+        } else {
+            // Landscape: height is the short axis, scale width proportionally
+            short_axis * screen_width() / screen_height()
+        }
     }
 
+    /// World units visible vertically. Always `visible_width * (h/w)`.
     pub fn visible_height(&self) -> f32 {
-        self.visible_width() * screen_height() / screen_width()
+        let short_axis = BASE_SHORT_AXIS / self.zoom;
+        if screen_height() <= screen_width() {
+            // Landscape / square: height is the short axis
+            short_axis
+        } else {
+            // Portrait: width is the short axis, scale height proportionally
+            short_axis * screen_height() / screen_width()
+        }
     }
 
     pub fn screen_to_world(&self, sx: f32, sy: f32) -> (f32, f32) {

@@ -192,6 +192,8 @@ impl Projectile {
             weapon,
             fuse: match weapon {
                 Weapon::Grenade => 3.0,
+                Weapon::Sheep => 5.0,
+                Weapon::SuperSheep => 10.0,
                 _ => -1.0,
             },
             bounces: 0,
@@ -212,6 +214,70 @@ impl Projectile {
 
         const GRAVITY: f32 = 480.0;
         let air_resistance = if self.weapon == Weapon::Bazooka { 0.99 } else { 0.98 };
+
+        // ── Sheep / SuperSheep: walk along the terrain surface ──────────────────
+        if self.weapon == Weapon::Sheep || self.weapon == Weapon::SuperSheep {
+            let walk_speed = if self.weapon == Weapon::SuperSheep { 140.0 } else { 90.0 };
+            let dir = if self.vx >= 0.0 { 1.0f32 } else { -1.0f32 };
+
+            // Gravity so the sheep falls off ledges naturally
+            self.vy += GRAVITY * dt;
+
+            // Horizontal walk
+            self.x += dir * walk_speed * dt;
+            self.y += self.vy * dt;
+
+            // If now inside solid terrain, push up (walk over slopes up to 12px)
+            if terrain.is_solid(self.x as i32, self.y as i32) {
+                let mut stepped = false;
+                for step in 1i32..=12 {
+                    if !terrain.is_solid(self.x as i32, (self.y - step as f32) as i32) {
+                        self.y -= step as f32;
+                        self.vy = 0.0;
+                        stepped = true;
+                        break;
+                    }
+                }
+                if !stepped {
+                    // Completely blocked by a wall – reverse direction
+                    self.x -= dir * walk_speed * dt * 2.0;
+                    self.vx = -self.vx;
+                }
+            } else {
+                // Snap smoothly onto ground when falling onto it (small gaps)
+                for step in 1i32..=4 {
+                    if terrain.is_solid(self.x as i32, (self.y + step as f32) as i32) {
+                        self.y += step as f32 - 1.0;
+                        self.vy = 0.0;
+                        break;
+                    }
+                }
+            }
+
+            // Fuse countdown → explode
+            if self.fuse > 0.0 {
+                self.fuse -= dt;
+                if self.fuse <= 0.0 {
+                    self.alive = false;
+                    return self.create_explosion(terrain, balls);
+                }
+            }
+
+            // Boundary / water checks
+            let px = self.x as i32;
+            let py = self.y as i32;
+            if px < -100 || px >= terrain.width as i32 + 100 || py >= terrain.height as i32 + 100 {
+                self.alive = false;
+                return (None, Vec::new());
+            }
+            if py >= crate::terrain::WATER_LEVEL as i32 {
+                self.alive = false;
+                return (Some(Explosion { x: self.x, y: self.y, radius: 0.0, is_water: true }), Vec::new());
+            }
+
+            return (None, Vec::new());
+        }
+        // ────────────────────────────────────────────────────────────────────────
 
         // Homing Missile behavior - track nearest ball
         if self.weapon == Weapon::HomingMissile {
@@ -288,6 +354,36 @@ impl Projectile {
                 radius: 0.0,
                 is_water: true,
             }), Vec::new());
+        }
+
+        // Check direct ball collision — scan first (immutable), then act (mutable)
+        let hit_radius_sq = 14.0f32 * 14.0f32;
+        let hit_idx = balls.iter().enumerate()
+            .find(|(_, w)| {
+                if !w.alive { return false; }
+                let dx = w.x - self.x;
+                let dy = w.y - self.y;
+                dx * dx + dy * dy < hit_radius_sq
+            })
+            .map(|(i, _)| i);
+
+        if let Some(bi) = hit_idx {
+            self.alive = false;
+            if self.weapon.explosion_radius() > 0.0 {
+                // Explosive on direct hit: full explosion at impact point
+                return self.create_explosion(terrain, balls);
+            } else {
+                // Non-explosive (SniperRifle, etc.): direct damage + directional knockback
+                let damage = self.weapon.base_damage();
+                let speed = (self.vx * self.vx + self.vy * self.vy).sqrt().max(1.0);
+                let knock_scale = 200.0_f32.max(damage as f32 * 0.2);
+                balls[bi].take_damage(damage);
+                balls[bi].apply_knockback(
+                    (self.vx / speed) * knock_scale,
+                    (self.vy / speed) * knock_scale - 80.0,
+                );
+                return (None, Vec::new());
+            }
         }
 
         if terrain.is_solid(px, py) {

@@ -137,9 +137,9 @@ Cloudflare creates the custom domain **api.balls.bne.sh** and the DNS record (bn
 
 4. Save and deploy. After the first deploy, go to the project → **Custom domains** → **Set up a custom domain** → add **balls.bne.sh**.
 
-**Alternative (CLI):** From repo root run `pnpm deploy:web`. This **requires Rust + wasm-pack** on your machine: it builds the game WASM, copies it into the web app, builds the static export, and deploys to Cloudflare Pages (project name `balls-web`). The app defaults to **api.balls.bne.sh** for API and WebSockets.
+**Alternative (CLI):** From repo root run `pnpm deploy:web`. This **requires Rust + wasm-pack** on your machine: it builds the game WASM, copies it into the web app, builds the static export, and deploys to Cloudflare Pages (project name `worms-web`). The app defaults to **api.balls.bne.sh** for API and WebSockets.
 
-**Use balls.bne.sh instead of *.pages.dev:** In [Cloudflare Dashboard](https://dash.cloudflare.com) go to **Workers & Pages** → your Pages project (**balls-web**) → **Custom domains** → **Set up a custom domain** → enter **balls.bne.sh** and save. Cloudflare will add the DNS record (bne.sh must be your zone). After that, the site is available at **https://balls.bne.sh** as well as the *.pages.dev URL.
+**Use balls.bne.sh instead of *.pages.dev:** In [Cloudflare Dashboard](https://dash.cloudflare.com) go to **Workers & Pages** → your Pages project (**worms-web**) → **Custom domains** → **Set up a custom domain** → enter **balls.bne.sh** and save. Cloudflare will add the DNS record (bne.sh must be your zone). After that, the site is available at **https://balls.bne.sh** as well as the *.pages.dev URL.
 
 **Build output directory:** If your Next.js app is set to static export (`output: 'export'` in `next.config.js`), the output directory is `out`. If you use the default Next.js build (no static export), Cloudflare may expect `.next` and run a Node server; in that case pick the preset that matches (e.g. “Next.js” and the output directory your build produces). For a client-only app, static export is simplest: set `output: 'export'` in `apps/web/next.config.js`, then Build output directory = `out`.
 

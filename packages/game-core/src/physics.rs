@@ -2,14 +2,19 @@ use crate::terrain::Terrain;
 
 pub const BALL_RADIUS: f32 = 8.0;
 const GRAVITY: f32 = 480.0;
-const WALK_SPEED: f32 = 100.0;
-const JUMP_VEL: f32 = -270.0;
-const MAX_CLIMB: i32 = 7;
+const WALK_SPEED: f32 = 115.0;         // Slightly snappier
+const JUMP_VEL: f32 = -320.0;          // More air — bigger, floatier jump
+const JUMP_HORIZONTAL_BOOST: f32 = 75.0; // Extra run on jump
+const MAX_CLIMB: i32 = 8;              // Can hop up one extra pixel
 const GROUND_FRICTION: f32 = 0.80;
-const AIR_FRICTION: f32 = 0.98;
+const AIR_FRICTION: f32 = 0.985;       // Slightly less air drag
+const AIR_CONTROL_ACCEL: f32 = 420.0; // Horizontal acceleration applied per-frame while airborne
+const MAX_AIR_SPEED: f32 = 105.0;     // Max horizontal speed from air control
 const FALL_DAMAGE_THRESHOLD: f32 = 120.0;
 const FALL_DAMAGE_FACTOR: f32 = 0.25;
-const MOVEMENT_BUDGET: f32 = 150.0; // Maximum horizontal distance a ball can move per turn
+const MOVEMENT_BUDGET: f32 = 170.0;   // Slightly more movement per turn
+const COYOTE_TIME: f32 = 0.15;        // Grace window after walking off edge
+const JUMP_BUFFER_TIME: f32 = 0.12;   // Jump pressed just before landing
 
 pub const TEAM_COLORS: [(f32, f32, f32); 4] = [
     (0.85, 0.25, 0.25),
@@ -35,6 +40,10 @@ pub struct Ball {
     pub damage_timer: f32,
     pub movement_budget: f32,
     pub movement_used: f32,
+    /// Grace period after walking off an edge — still allows jumping
+    pub coyote_timer: f32,
+    /// Queued jump — executes on next landing if within window
+    pub jump_buffer: f32,
 }
 
 impl Ball {
@@ -56,6 +65,8 @@ impl Ball {
             damage_timer: 0.0,
             movement_budget: MOVEMENT_BUDGET,
             movement_used: 0.0,
+            coyote_timer: 0.0,
+            jump_buffer: 0.0,
         }
     }
 
@@ -129,6 +140,29 @@ impl Ball {
 
         if !self.on_ground && was_on_ground && self.vy >= 0.0 {
             self.fall_start_y = self.y;
+        }
+
+        // Coyote time: grant a grace window to jump after walking off an edge
+        if self.on_ground {
+            self.coyote_timer = 0.0;
+        } else if was_on_ground && self.vy >= 0.0 {
+            // Just walked off edge (vy positive = not a jump); start coyote window
+            self.coyote_timer = COYOTE_TIME;
+        } else if self.coyote_timer > 0.0 {
+            self.coyote_timer -= dt;
+        }
+
+        // Jump buffer: if jump was pressed in air, fire when we land
+        if self.jump_buffer > 0.0 {
+            self.jump_buffer -= dt;
+            if self.on_ground && self.jump_buffer > 0.0 {
+                self.vy = JUMP_VEL;
+                self.vx += self.facing * JUMP_HORIZONTAL_BOOST;
+                self.on_ground = false;
+                self.fall_start_y = self.y;
+                self.jump_buffer = 0.0;
+                self.coyote_timer = 0.0;
+            }
         }
 
         let head_y = (self.y - r * 0.5) as i32;
@@ -209,16 +243,32 @@ impl Ball {
 }
 
 pub fn walk(ball: &mut Ball, terrain: &Terrain, dir: f32) {
-    if !ball.on_ground || !ball.alive {
+    if !ball.alive {
         return;
     }
-    
+
     // Check if movement budget is exhausted
     if !ball.can_move() {
         return;
     }
-    
+
     ball.facing = dir;
+
+    // ── Air control ───────────────────────────────────────────────────────
+    // While airborne, nudge horizontal velocity instead of snapping position.
+    // This lets the player steer jumps to reach higher spots.
+    if !ball.on_ground {
+        let push = dir * AIR_CONTROL_ACCEL * (1.0 / 60.0);
+        // Only push if we haven't hit the air-speed cap in that direction
+        if (dir > 0.0 && ball.vx < MAX_AIR_SPEED) || (dir < 0.0 && ball.vx > -MAX_AIR_SPEED) {
+            ball.vx = (ball.vx + push).clamp(-MAX_AIR_SPEED, MAX_AIR_SPEED);
+            // Cost ~half a ground-walk step so budget isn't drained fast
+            ball.movement_used = (ball.movement_used + 1.2).min(ball.movement_budget);
+        }
+        return;
+    }
+
+    // ── Ground walk ───────────────────────────────────────────────────────
     let step = dir * WALK_SPEED * (1.0 / 60.0);
     let movement_distance = step.abs();
     
@@ -274,21 +324,33 @@ pub fn walk(ball: &mut Ball, terrain: &Terrain, dir: f32) {
 }
 
 pub fn jump(ball: &mut Ball) {
-    if !ball.on_ground || !ball.alive {
+    if !ball.alive {
         return;
     }
-    ball.vy = JUMP_VEL;
-    ball.vx += ball.facing * 60.0;
-    ball.on_ground = false;
-    ball.fall_start_y = ball.y;
+    if ball.on_ground || ball.coyote_timer > 0.0 {
+        // Normal jump or coyote-time jump
+        ball.vy = JUMP_VEL;
+        ball.vx += ball.facing * JUMP_HORIZONTAL_BOOST;
+        ball.on_ground = false;
+        ball.coyote_timer = 0.0;
+        ball.jump_buffer = 0.0;
+        ball.fall_start_y = ball.y;
+    } else {
+        // In the air — buffer the jump for when we land
+        ball.jump_buffer = JUMP_BUFFER_TIME;
+    }
 }
 
 pub fn backflip(ball: &mut Ball) {
-    if !ball.on_ground || !ball.alive {
+    if !ball.alive {
         return;
     }
-    ball.vy = JUMP_VEL - 60.0;
-    ball.vx += -ball.facing * 120.0;
-    ball.on_ground = false;
-    ball.fall_start_y = ball.y;
+    if ball.on_ground || ball.coyote_timer > 0.0 {
+        ball.vy = JUMP_VEL - 70.0;          // Extra height for backflip
+        ball.vx += -ball.facing * 130.0;
+        ball.on_ground = false;
+        ball.coyote_timer = 0.0;
+        ball.jump_buffer = 0.0;
+        ball.fall_start_y = ball.y;
+    }
 }

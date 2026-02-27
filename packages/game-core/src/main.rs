@@ -66,6 +66,9 @@ struct Game {
     placed_explosives: Vec<PlacedExplosive>,
     teleport_mode: bool,
     baseball_bat_mode: bool,
+    build_wall_mode: bool,
+    /// First click anchor for Build Wall (world coords). None = waiting for pos, Some = waiting for rotation.
+    build_wall_anchor: Option<(f32, f32)>,
 
     cam: GameCamera,
     panning: bool,
@@ -89,10 +92,17 @@ struct Game {
     pending_turn_sync: Option<usize>,
     /// Deferred restart seed
     restart_seed: Option<u32>,
-    /// Throttle for network movement messages (seconds since last send)
-    last_movement_send: f32,
+    /// Set after re-connecting so the next `state` message always forces a turn sync
+    /// regardless of whether current_turn_index appears unchanged from the freshly
+    /// re-initialised value of 0.
+    just_reconnected: bool,
     /// Throttle for network aim messages (seconds since last send)
     last_aim_send: f32,
+    /// Throttle for position-streaming messages (seconds since last send)
+    last_pos_send: f32,
+    /// Per-ball lerp targets received from pos_update messages: (x, y, vx, vy)
+    /// Used to smoothly interpolate remote balls toward their authoritative positions.
+    ball_lerp_targets: Vec<Option<(f32, f32, f32, f32)>>,
     /// Track last logged turn state to reduce console spam
     last_logged_turn_state: (usize, Option<usize>),
     /// Track which ball index was last used per team for round-robin rotation
@@ -237,6 +247,8 @@ impl Game {
             placed_explosives: Vec::new(),
             teleport_mode: false,
             baseball_bat_mode: false,
+            build_wall_mode: false,
+            build_wall_anchor: None,
             cam: GameCamera::new(cam_x, cam_y),
             panning: false,
             last_mouse: (0.0, 0.0),
@@ -251,8 +263,13 @@ impl Game {
             num_teams,
             pending_turn_sync: None,
             restart_seed: None,
-            last_movement_send: 0.0,
+            just_reconnected: false,
             last_aim_send: 0.0,
+            last_pos_send: 0.0,
+            ball_lerp_targets: {
+                let total = num_teams * 3; // balls_per_team = 3
+                vec![None; total]
+            },
             last_logged_turn_state: (0, None),
             retreat_timer: 0.0,
             last_ball_per_team: {
@@ -389,24 +406,11 @@ impl Game {
                     let ball = &mut self.balls[wi];
                     let can_move = ball.can_move();
 
-                    let current_time = get_time() as f32;
-                    let should_send_movement = self.net.connected && (current_time - self.last_movement_send > 0.1);
-
                     if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) {
                         physics::walk(ball, &self.terrain, -1.0);
-                        if should_send_movement {
-                            let msg = r#"{"type":"input","input":"{\"Walk\":{\"dir\":-1.0}}"}"#;
-                            self.net.send_message(msg);
-                            self.last_movement_send = current_time;
-                        }
                     }
                     if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) {
                         physics::walk(ball, &self.terrain, 1.0);
-                        if should_send_movement {
-                            let msg = r#"{"type":"input","input":"{\"Walk\":{\"dir\":1.0}}"}"#;
-                            self.net.send_message(msg);
-                            self.last_movement_send = current_time;
-                        }
                     }
 
                     if can_move {
@@ -562,24 +566,11 @@ impl Game {
             let ball = &mut self.balls[self.current_ball];
             let can_move = ball.can_move();
             
-            let current_time = get_time() as f32;
-            let should_send_movement = self.net.connected && (current_time - self.last_movement_send > 0.1);
-            
             if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) {
                 physics::walk(ball, &self.terrain, -1.0);
-                if should_send_movement {
-                    let msg = r#"{"type":"input","input":"{\"Walk\":{\"dir\":-1.0}}"}"#;
-                    self.net.send_message(msg);
-                    self.last_movement_send = current_time;
-                }
             }
             if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) {
                 physics::walk(ball, &self.terrain, 1.0);
-                if should_send_movement {
-                    let msg = r#"{"type":"input","input":"{\"Walk\":{\"dir\":1.0}}"}"#;
-                    self.net.send_message(msg);
-                    self.last_movement_send = current_time;
-                }
             }
             
             // Only allow jumping if there's movement budget
@@ -604,8 +595,48 @@ impl Game {
         }
 
         if is_mouse_button_pressed(MouseButton::Left) && !self.has_fired && self.is_my_turn() && self.phase.allows_input() && !self.weapon_menu_open {
+            // Handle Build Wall mode: two clicks — first sets position, second sets rotation
+            if self.build_wall_mode {
+                let (mx, my) = mouse_position();
+                let world_pos = self.cam.to_macroquad().screen_to_world(vec2(mx, my));
+
+                if self.build_wall_anchor.is_none() {
+                    // First click: lock in the wall's centre position
+                    self.build_wall_anchor = Some((world_pos.x, world_pos.y));
+                } else {
+                    // Second click: derive angle from anchor → mouse, then stamp terrain
+                    let (ax, ay) = self.build_wall_anchor.unwrap();
+                    let dx = world_pos.x - ax;
+                    let dy = world_pos.y - ay;
+                    let angle = if dx.abs() < 0.5 && dy.abs() < 0.5 {
+                        self.aim_angle // fallback if both clicks are on same pixel
+                    } else {
+                        dy.atan2(dx)
+                    };
+                    let cos_a = angle.cos();
+                    let sin_a = angle.sin();
+                    let half_len = 35i32;
+                    let half_thick = 4i32;
+                    for i in -half_len..=half_len {
+                        for j in -half_thick..=half_thick {
+                            let wx = (ax + i as f32 * cos_a - j as f32 * sin_a).round() as i32;
+                            let wy = (ay + i as f32 * sin_a + j as f32 * cos_a).round() as i32;
+                            if wx >= 0 && wx < self.terrain.width as i32
+                                && wy >= 0 && wy < self.terrain.height as i32 {
+                                self.terrain.set(wx, wy, terrain::WOOD);
+                            }
+                        }
+                    }
+                    self.terrain_dirty = true;
+                    self.build_wall_anchor = None;
+                    self.build_wall_mode = false;
+                    self.has_fired = true;
+                    self.phase = Phase::Settling;
+                    self.settle_timer = 0.0;
+                }
+            }
             // Handle Teleport mode
-            if self.teleport_mode {
+            else if self.teleport_mode {
                 let (mx, my) = mouse_position();
                 let world_pos = self.cam.to_macroquad().screen_to_world(vec2(mx, my));
                 
@@ -702,8 +733,8 @@ impl Game {
 
         self.do_fire(idx, angle, power, weapon);
         
-        // Don't set has_fired for Baseball Bat and Teleport - they need a second click
-        if weapon != Weapon::BaseballBat && weapon != Weapon::Teleport {
+        // Don't set has_fired for Baseball Bat, Teleport, and BuildWall - they need a second click
+        if weapon != Weapon::BaseballBat && weapon != Weapon::Teleport && weapon != Weapon::BuildWall {
             self.has_fired = true;
         }
         self.charge_power = 0.0;
@@ -848,27 +879,10 @@ impl Game {
                 // Stay in aiming phase, will handle click for bat swing
             },
 
-            // Build Wall - place wood in a small rectangle at the impact point
+            // Build Wall - enter placement mode; actual terrain is placed on next click
             Weapon::BuildWall => {
-                // Build dimensions scale slightly with power
-                let build_w = (40.0 + power * 0.6).round() as i32; // width in pixels
-                let build_h = (14.0 + (power * 0.08)).round() as i32; // height in pixels
-                let cx = sx as i32;
-                let cy = sy as i32;
-                // Place wall centered horizontally, and with base at cy (so it rises upward)
-                let half_w = build_w / 2;
-                for dx in -half_w..=half_w {
-                    for dy in 0..build_h {
-                        let x = cx + dx;
-                        let y = cy - dy;
-                        self.terrain.set(x, y, terrain::WOOD);
-                    }
-                }
-                self.terrain_dirty = true;
-                // Apply a very small settle so physics can run
-                self.phase = Phase::Settling;
-                self.settle_timer = 0.0;
-                self.has_fired = true;
+                self.build_wall_mode = true;
+                // Stay in aiming phase, will handle click for wall placement
             },
 
             // Teleport - enter teleport mode
@@ -1168,6 +1182,10 @@ impl Game {
         self.retreat_timer = 0.0;
         self.charging = false;
         self.charge_power = 0.0;
+        self.teleport_mode = false;
+        self.baseball_bat_mode = false;
+        self.build_wall_mode = false;
+        self.build_wall_anchor = None;
         
         // Reset movement budget for the current ball
         if self.current_ball < self.balls.len() {
@@ -1208,6 +1226,9 @@ impl Game {
                 }
                 
                 self.net.connected = true;
+                // Any `init` message means we (re)connected. Force a full turn sync
+                // once the subsequent state/game_resync arrives.
+                self.just_reconnected = true;
                 if let Some(idx) = parse_json_number(&msg, "myPlayerIndex") {
                     self.net.my_player_index = Some(idx as usize);
                     #[cfg(target_arch = "wasm32")]
@@ -1234,9 +1255,15 @@ impl Game {
                         let debug_msg = format!("[apply_network] Got seed={}, num_players={}, current rng_state={}\0", seed_u32, num_players, self.rng_state);
                         unsafe { console_log(debug_msg.as_ptr()); }
                     }
-                    if seed_u32 != self.rng_state || num_players != self.num_teams {
+                // Always flag reconnect so state/game_resync handlers force-sync
+                // unconditionally, even if turn index happens to already be 0.
+                self.just_reconnected = true;
+                if seed_u32 != self.rng_state || num_players != self.num_teams {
                         // Regenerate terrain with proper seed and team count
                         *self = Game::new_with_teams(seed_u32, num_players);
+                        // Flag that we just reconnected — next `state` or `game_resync`
+                        // must unconditionally sync the current turn/ball regardless of index.
+                        self.just_reconnected = true;
                         // Restore network state that was just set
                         self.net.connected = true;
                         self.net.my_player_index = parse_json_number(&msg, "myPlayerIndex").map(|i| i as usize);
@@ -1251,6 +1278,22 @@ impl Game {
                         if let Some(bots_str) = parse_json_string(&msg, "playerBots") {
                             self.net.player_is_bot = bots_str.split(',').map(|s| s == "1").collect();
                         }
+                    }
+                }
+                continue;
+            }
+            if msg.contains("\"type\":\"force_advance\"") || msg.contains("\"type\": \"force_advance\"") {
+                // Server watchdog forced a turn skip — immediately sync to the authoritative state.
+                // The server will also broadcast turn_advanced/state, but we act immediately
+                // so the game visually unsticks even before those messages arrive.
+                match self.phase {
+                    Phase::Aiming | Phase::Charging | Phase::TurnEnd | Phase::Retreat => {
+                        // Will be overwritten by the coming turn_advanced, but unstick now
+                        self.phase = Phase::TurnEnd;
+                        self.turn_end_timer = 0.1;
+                    }
+                    _ => {
+                        // During projectile/settling, just note that a sync is coming
                     }
                 }
                 continue;
@@ -1282,13 +1325,14 @@ impl Game {
                 if let Some(current_turn_index) = parse_state_turn_index(&msg) {
                     #[cfg(target_arch = "wasm32")]
                     {
-                        let debug_msg = format!("[apply_network] State message: current_turn_index={}, ours={}\0", current_turn_index, self.current_turn_index);
+                        let debug_msg = format!("[apply_network] State message: current_turn_index={}, ours={}, just_reconnected={}\0", current_turn_index, self.current_turn_index, self.just_reconnected);
                         unsafe { console_log(debug_msg.as_ptr()); }
                     }
-                    // Only process if the turn index actually changed — echoed state
-                    // messages (e.g. after firing) carry the same index and must NOT
-                    // reset the phase/pending_turn_sync.
-                    if current_turn_index != self.current_turn_index {
+                    // Always sync on reconnect (handles the case where both sides are 0)
+                    // otherwise only sync when the index changed.
+                    let should_sync = self.just_reconnected || current_turn_index != self.current_turn_index;
+                    self.just_reconnected = false;
+                    if should_sync {
                         self.current_turn_index = current_turn_index;
                         match self.phase {
                             Phase::Aiming | Phase::Charging | Phase::TurnEnd => {
@@ -1299,6 +1343,48 @@ impl Game {
                             }
                         }
                     }
+                }
+                continue;
+            }
+            if msg.contains("\"type\":\"game_resync\"") || msg.contains("\"type\": \"game_resync\"") {
+                // Full reconnect sync: restore positions, health, phase, and turn timer.
+                // Apply ball state (same key "balls" as ball_state message)
+                self.apply_ball_state(&msg);
+                // Clear lerp targets — no stale remote data should fight the authoritative snap
+                for t in &mut self.ball_lerp_targets {
+                    *t = None;
+                }
+                // Determine the authoritative turn to sync to
+                let turn_idx = parse_json_number(&msg, "currentTurnIndex")
+                    .map(|v| v as usize)
+                    .unwrap_or(self.current_turn_index);
+                // sync_to_player_turn resets phase to Aiming and timer to TURN_TIME.
+                // We will override both immediately after.
+                self.current_turn_index = turn_idx;
+                self.sync_to_player_turn(turn_idx);
+                // Restore phase from server
+                let restored_phase = if let Some(phase_str) = parse_json_string(&msg, "phase") {
+                    match phase_str {
+                        "retreat"   => Phase::Retreat,
+                        "projectile" | "settling" => Phase::Settling, // missed the flight — settle
+                        "turn_end"  => Phase::TurnEnd,
+                        _           => Phase::Aiming,
+                    }
+                } else {
+                    Phase::Aiming
+                };
+                self.phase = restored_phase;
+                // Restore turn timer from remaining time on server
+                if let Some(remaining_ms) = parse_json_number(&msg, "turnTimeRemainingMs") {
+                    self.turn_timer = (remaining_ms / 1000.0) as f32;
+                }
+                // Clear reconnect flag — full state has been applied
+                self.just_reconnected = false;
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let debug_msg = format!("[RESYNC] game_resync applied: turn={}, phase={:?}, timer={:.1}\0",
+                        turn_idx, self.phase, self.turn_timer);
+                    unsafe { console_log(debug_msg.as_ptr()); }
                 }
                 continue;
             }
@@ -1347,13 +1433,29 @@ impl Game {
                 continue;
             }
             if msg.contains("\"type\":\"ball_state\"") || msg.contains("\"type\": \"ball_state\"") {
-                // Apply ball positions/health from the active player
+                // Hard-sync from the active player — clear lerp targets to avoid fighting the snap
+                for t in &mut self.ball_lerp_targets {
+                    *t = None;
+                }
                 self.apply_ball_state(&msg);
                 continue;
             }
             if msg.contains("\"type\":\"terrain_sync\"") || msg.contains("\"type\": \"terrain_sync\"") {
                 // Replay terrain damage events received from server on reconnect
                 self.apply_terrain_sync(&msg);
+                continue;
+            }
+            if msg.contains("\"type\":\"pos_update\"") || msg.contains("\"type\": \"pos_update\"") {
+                // Real-time position stream from another player — store as lerp target.
+                // Skip our own echoes.
+                if let Some((bi, x, y, vx, vy)) = parse_pos_update_message(&msg) {
+                    let is_own_ball = self.net.my_player_index
+                        .and_then(|pi| self.find_ball_for_player(pi))
+                        == Some(bi);
+                    if !is_own_ball && bi < self.ball_lerp_targets.len() {
+                        self.ball_lerp_targets[bi] = Some((x, y, vx, vy));
+                    }
+                }
                 continue;
             }
             if msg.contains("\"type\":\"aim\"") || msg.contains("\"type\": \"aim\"") {
@@ -1395,7 +1497,17 @@ impl Game {
                 if self.turn_timer <= 0.0 && self.is_my_turn() {
                     self.end_turn();
                 }
-                for w in &mut self.balls {
+                // Skip physics for remote balls that are network-driven (pos_update stream);
+                // running local physics on them fights the lerp and causes visible teleporting.
+                let my_ball_phys = self.net.my_player_index
+                    .and_then(|pi| self.find_ball_for_player(pi));
+                for (bi, w) in self.balls.iter_mut().enumerate() {
+                    if self.net.connected
+                        && Some(bi) != my_ball_phys
+                        && self.ball_lerp_targets.get(bi).copied().flatten().is_some()
+                    {
+                        continue; // position driven by network; no local physics needed
+                    }
                     w.tick(&self.terrain, dt);
                 }
                 // If the current ball died (walked into water/lava), end turn immediately
@@ -1410,7 +1522,15 @@ impl Game {
                 }
             }
             Phase::ProjectileFlying => {
-                for w in &mut self.balls {
+                let my_ball_phys2 = self.net.my_player_index
+                    .and_then(|pi| self.find_ball_for_player(pi));
+                for (bi, w) in self.balls.iter_mut().enumerate() {
+                    if self.net.connected
+                        && Some(bi) != my_ball_phys2
+                        && self.ball_lerp_targets.get(bi).copied().flatten().is_some()
+                    {
+                        continue;
+                    }
                     w.tick(&self.terrain, dt);
                 }
                 let mut explosion_opt = None;
@@ -1611,8 +1731,16 @@ impl Game {
             }
             Phase::Retreat => {
                 self.retreat_timer -= dt;
-                // Tick ball physics (gravity, etc) during retreat
-                for w in &mut self.balls {
+                // Tick ball physics — skip remote network-driven balls to avoid teleporting
+                let my_ball_phys3 = self.net.my_player_index
+                    .and_then(|pi| self.find_ball_for_player(pi));
+                for (bi, w) in self.balls.iter_mut().enumerate() {
+                    if self.net.connected
+                        && Some(bi) != my_ball_phys3
+                        && self.ball_lerp_targets.get(bi).copied().flatten().is_some()
+                    {
+                        continue;
+                    }
                     w.tick(&self.terrain, dt);
                 }
                 // If current ball died during retreat (fell in water/lava), end turn now
@@ -1645,8 +1773,19 @@ impl Game {
                         self.sync_to_player_turn(player_idx);
                     } else if !self.net.connected {
                         self.advance_turn();
+                    } else {
+                        // Still waiting for turn_advanced from server. Count down an extra
+                        // safety window (turn_end_timer is already ≤0 and going further
+                        // negative — we treat -8.0 as "server is silent, force locally").
+                        if self.turn_end_timer < -8.0 {
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                let s = "[TURN] Safety timeout: force-advancing because server never sent turn_advanced\0";
+                                unsafe { console_log(s.as_ptr()); }
+                            }
+                            self.advance_turn();
+                        }
                     }
-                    // When connected without pending sync, keep waiting for turn_advanced
                 }
             }
             Phase::GameOver => {}
@@ -1654,6 +1793,64 @@ impl Game {
 
         self.cam
             .clamp_to_world(terrain::PLAYABLE_LAND_WIDTH, self.terrain.height as f32);
+
+        // ── Position streaming ──────────────────────────────────────────────
+        // The active player streams their ball position at ~30 Hz.  Remote
+        // clients receive this and use it to lerp-correct their local copy.
+        if self.net.connected {
+            let current_time = get_time() as f32;
+            if current_time - self.last_pos_send > 0.016 {  // ~60 Hz — one update per frame
+                // Which ball should we stream?  During retreat we always control
+                // current_ball; during other phases, find our own ball.
+                let my_ball_opt = self.net.my_player_index.and_then(|pi| {
+                    match self.phase {
+                        Phase::Aiming | Phase::Charging => {
+                            if self.is_my_turn() { Some(self.current_ball) } else { None }
+                        }
+                        Phase::Retreat => Some(self.current_ball),
+                        Phase::ProjectileFlying => self.find_ball_for_player(pi),
+                        _ => None,
+                    }
+                });
+                if let Some(bi) = my_ball_opt {
+                    if bi < self.balls.len() && self.balls[bi].alive {
+                        let b = &self.balls[bi];
+                        let msg = format!(
+                            "{{\"type\":\"pos_update\",\"bi\":{},\"x\":{:.1},\"y\":{:.1},\"vx\":{:.1},\"vy\":{:.1}}}",
+                            bi, b.x, b.y, b.vx, b.vy
+                        );
+                        self.net.send_message(&msg);
+                        self.last_pos_send = current_time;
+                    }
+                }
+            }
+        }
+
+        // ── Lerp correction for remote balls ────────────────────────────────
+        // After local physics ticked, nudge remote balls toward the
+        // authoritative positions streamed by the other player.
+        if self.net.connected {
+            let my_ball = self.net.my_player_index
+                .and_then(|pi| self.find_ball_for_player(pi));
+            let n = self.balls.len().min(self.ball_lerp_targets.len());
+            for bi in 0..n {
+                // Never lerp our own ball
+                if my_ball == Some(bi) {
+                    continue;
+                }
+                if let Some((tx, ty, tvx, tvy)) = self.ball_lerp_targets[bi] {
+                    let ball = &mut self.balls[bi];
+                    if !ball.alive { continue; }
+                    // Physics is skipped for network-driven balls, so snap directly to the
+                    // authoritative position received from the active client (~60 Hz).
+                    // With no local physics fighting the target, this produces smooth movement.
+                    ball.x = tx;
+                    ball.y = ty;
+                    ball.vx = tvx;
+                    ball.vy = tvy;
+                }
+            }
+        }
 
         if self.terrain_dirty {
             self.terrain_image = self.terrain.bake_image();
@@ -1854,6 +2051,53 @@ impl Game {
             self.draw_aim();
         }
 
+        // Build Wall placement preview
+        if self.build_wall_mode && self.is_my_turn() {
+            let (mx, my) = mouse_position();
+            let world_pos = self.cam.to_macroquad().screen_to_world(vec2(mx, my));
+
+            let (cx, cy, angle) = match self.build_wall_anchor {
+                None => {
+                    // Phase 1: wall follows cursor, uses aim angle for rotation preview
+                    (world_pos.x, world_pos.y, self.aim_angle)
+                }
+                Some((ax, ay)) => {
+                    // Phase 2: wall is anchored, rotates toward cursor
+                    let dx = world_pos.x - ax;
+                    let dy = world_pos.y - ay;
+                    let a = if dx.abs() < 0.5 && dy.abs() < 0.5 { self.aim_angle } else { dy.atan2(dx) };
+                    (ax, ay, a)
+                }
+            };
+
+            let cos_a = angle.cos();
+            let sin_a = angle.sin();
+            let hl = 35.0f32;
+            let ht = 4.0f32;
+
+            let c0 = vec2(cx + hl * cos_a - ht * (-sin_a), cy + hl * sin_a - ht * cos_a);
+            let c1 = vec2(cx - hl * cos_a - ht * (-sin_a), cy - hl * sin_a - ht * cos_a);
+            let c2 = vec2(cx - hl * cos_a + ht * (-sin_a), cy - hl * sin_a + ht * cos_a);
+            let c3 = vec2(cx + hl * cos_a + ht * (-sin_a), cy + hl * sin_a + ht * cos_a);
+
+            let fill   = Color::new(0.55, 0.35, 0.15, 0.50);
+            let border = Color::new(0.9, 0.7, 0.3, 1.0);
+
+            draw_triangle(c0, c1, c2, fill);
+            draw_triangle(c0, c2, c3, fill);
+            draw_line(c0.x, c0.y, c1.x, c1.y, 2.0, border);
+            draw_line(c1.x, c1.y, c2.x, c2.y, 2.0, border);
+            draw_line(c2.x, c2.y, c3.x, c3.y, 2.0, border);
+            draw_line(c3.x, c3.y, c0.x, c0.y, 2.0, border);
+
+            // Phase 2: draw a rotation guide line from anchor to cursor
+            if let Some((ax, ay)) = self.build_wall_anchor {
+                draw_line(ax, ay, world_pos.x, world_pos.y, 1.0,
+                    Color::new(0.9, 0.9, 0.4, 0.6));
+                draw_circle(ax, ay, 3.0, Color::new(0.9, 0.7, 0.3, 1.0));
+            }
+        }
+
         for p in &self.particles {
             let alpha = (p.life / 1.0).min(1.0);
             let c = Color::new(p.color.r, p.color.g, p.color.b, p.color.a * alpha);
@@ -1861,6 +2105,18 @@ impl Game {
         }
 
         set_default_camera();
+
+        // Build Wall mode: show placement hint at top of screen
+        if self.build_wall_mode && self.is_my_turn() {
+            let hint = if self.build_wall_anchor.is_none() {
+                "[ BUILD WALL ]  Click to set position"
+            } else {
+                "[ BUILD WALL ]  Click to set rotation"
+            };
+            let sw = screen_width();
+            let tw = measure_text(hint, None, 22, 1.0).width;
+            draw_text(hint, sw / 2.0 - tw / 2.0, 58.0, 22.0, Color::new(0.9, 0.75, 0.3, 1.0));
+        }
 
         let is_my_turn = self.is_my_turn();
         let turn_owner = self.turn_owner_label();
@@ -1899,24 +2155,23 @@ impl Game {
     fn draw_water(&self) {
         let water_y = terrain::WATER_LEVEL;
         let t = get_time() as f32;
-        let vw = self.cam.visible_width();
-        let left = self.cam.x - vw / 2.0;
+        let level_w = self.terrain.width as f32;
 
-        // Draw full-width water at the bottom
+        // Draw water bounded to the level width (not viewport width)
         draw_rectangle(
-            left - 10.0,
+            0.0,
             water_y,
-            vw + 20.0,
+            level_w,
             self.terrain.height as f32 - water_y + 100.0,
             Color::new(0.08, 0.25, 0.55, 0.85),
         );
 
-        // Draw waves across the top of the water
+        // Draw waves across the top of the water, bounded to level width
         let wave_h = 3.0;
         let wave_len = 40.0;
-        let steps = (vw / 4.0) as i32 + 2;
+        let steps = (level_w / 4.0) as i32 + 2;
         for i in 0..steps {
-            let wx = left + i as f32 * 4.0;
+            let wx = i as f32 * 4.0;
             let wy = water_y + (wx / wave_len + t * 2.0).sin() * wave_h;
             draw_rectangle(wx, wy - 2.0, 5.0, 4.0, Color::new(0.2, 0.45, 0.8, 0.6));
         }
@@ -2077,6 +2332,17 @@ fn parse_json_string<'a>(s: &'a str, key: &str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// Parse a pos_update message: {"type":"pos_update","bi":N,"x":..,"y":..,"vx":..,"vy":..}
+/// Returns (ball_index, x, y, vx, vy)
+fn parse_pos_update_message(msg: &str) -> Option<(usize, f32, f32, f32, f32)> {
+    let bi = parse_json_number(msg, "bi")? as usize;
+    let x  = parse_json_number(msg, "x")? as f32;
+    let y  = parse_json_number(msg, "y")? as f32;
+    let vx = parse_json_number(msg, "vx")? as f32;
+    let vy = parse_json_number(msg, "vy")? as f32;
+    Some((bi, x, y, vx, vy))
 }
 
 fn window_conf() -> Conf {

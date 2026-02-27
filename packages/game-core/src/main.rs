@@ -69,6 +69,8 @@ struct Game {
     build_wall_mode: bool,
     /// First click anchor for Build Wall (world coords). None = waiting for pos, Some = waiting for rotation.
     build_wall_anchor: Option<(f32, f32)>,
+    /// Airstrike or NapalmStrike waiting for a click-target. Stores which weapon.
+    airstrike_mode: Option<Weapon>,
 
     cam: GameCamera,
     panning: bool,
@@ -249,6 +251,7 @@ impl Game {
             baseball_bat_mode: false,
             build_wall_mode: false,
             build_wall_anchor: None,
+            airstrike_mode: None,
             cam: GameCamera::new(cam_x, cam_y),
             panning: false,
             last_mouse: (0.0, 0.0),
@@ -516,6 +519,12 @@ impl Game {
                                 self.selected_weapon = **w;
                                 self.weapon_menu_open = false;
                                 self.weapon_menu_scroll = 0.0;
+                                // Auto-enter click modes immediately — no charge/fire needed
+                                match self.selected_weapon {
+                                    Weapon::Teleport => { self.teleport_mode = true; }
+                                    Weapon::BuildWall => { self.build_wall_mode = true; }
+                                    _ => {}
+                                }
                                 return;
                             }
                         }
@@ -635,6 +644,46 @@ impl Game {
                     self.settle_timer = 0.0;
                 }
             }
+            // Handle Airstrike / NapalmStrike click-targeting
+            else if let Some(airstrike_weapon) = self.airstrike_mode {
+                let (mx, my) = mouse_position();
+                let world_pos = self.cam.to_macroquad().screen_to_world(vec2(mx, my));
+                let target_x = world_pos.x;
+
+                self.airstrike_droplets.clear();
+                match airstrike_weapon {
+                    Weapon::Airstrike => {
+                        let spacing = 80.0;
+                        for i in 0..5 {
+                            let x = target_x + (i as f32 - 2.0) * spacing;
+                            self.airstrike_droplets.push(AirstrikeDroplet {
+                                x,
+                                y: -50.0,
+                                vy: 0.0,
+                                alive: true,
+                                weapon_type: AirstrikeType::Explosive,
+                            });
+                        }
+                    },
+                    Weapon::NapalmStrike => {
+                        let spacing = 60.0;
+                        for i in 0..7 {
+                            let x = target_x + (i as f32 - 3.0) * spacing;
+                            self.airstrike_droplets.push(AirstrikeDroplet {
+                                x,
+                                y: -50.0,
+                                vy: 0.0,
+                                alive: true,
+                                weapon_type: AirstrikeType::Napalm,
+                            });
+                        }
+                    },
+                    _ => {}
+                }
+                self.airstrike_mode = None;
+                self.has_fired = true;
+                self.phase = Phase::ProjectileFlying;
+            }
             // Handle Teleport mode
             else if self.teleport_mode {
                 let (mx, my) = mouse_position();
@@ -662,14 +711,15 @@ impl Game {
             else if self.baseball_bat_mode {
                 let idx = self.current_ball;
                 if idx < self.balls.len() && self.balls[idx].alive {
-                    // Store necessary values to avoid borrowing issues
                     let ball_x = self.balls[idx].x;
                     let ball_y = self.balls[idx].y;
-                    let bat_range = 60.0;
+                    let bat_range = 70.0;
                     let angle = self.aim_angle;
-                    let knockback_power = 15.0;
+                    // Strong launch in aim direction + big upward boost
+                    let knock_x = angle.cos() * 850.0;
+                    let knock_y = angle.sin() * 850.0 - 300.0;
                     
-                    // Find balls in range and knock them back
+                    let mut hit_any = false;
                     for i in 0..self.balls.len() {
                         if i == idx { continue; }
                         if !self.balls[i].alive { continue; }
@@ -679,15 +729,13 @@ impl Game {
                         let dist = (dx*dx + dy*dy).sqrt();
                         
                         if dist < bat_range {
-                            // Apply knockback based on aim direction
-                            self.balls[i].vx += angle.cos() * knockback_power;
-                            self.balls[i].vy += angle.sin() * knockback_power;
-                            
-                            // Deal minimal damage
-                            self.balls[i].health = self.balls[i].health.saturating_sub(10);
+                            // apply_knockback clears on_ground so the velocity actually takes effect
+                            self.balls[i].apply_knockback(knock_x, knock_y);
+                            self.balls[i].health = self.balls[i].health.saturating_sub(20);
                             if self.balls[i].health == 0 {
                                 self.balls[i].alive = false;
                             }
+                            hit_any = true;
                         }
                     }
                     
@@ -734,7 +782,8 @@ impl Game {
         self.do_fire(idx, angle, power, weapon);
         
         // Don't set has_fired for Baseball Bat, Teleport, and BuildWall - they need a second click
-        if weapon != Weapon::BaseballBat && weapon != Weapon::Teleport && weapon != Weapon::BuildWall {
+        if weapon != Weapon::BaseballBat && weapon != Weapon::Teleport && weapon != Weapon::BuildWall
+            && weapon != Weapon::Airstrike && weapon != Weapon::NapalmStrike {
             self.has_fired = true;
         }
         self.charge_power = 0.0;
@@ -822,42 +871,16 @@ impl Game {
                 self.phase = Phase::ProjectileFlying;
             },
             
-            // Airstrike - 5 droplets from above
+            // Airstrike - enter click-targeting mode
             Weapon::Airstrike => {
-                self.airstrike_droplets.clear();
-                let ball_x = ball.x;
-                let spacing = 80.0;
-                
-                for i in 0..5 {
-                    let x = ball_x + (i as f32 - 2.0) * spacing;
-                    self.airstrike_droplets.push(AirstrikeDroplet {
-                        x,
-                        y: -50.0,
-                        vy: 0.0,
-                        alive: true,
-                        weapon_type: AirstrikeType::Explosive,
-                    });
-                }
-                self.phase = Phase::ProjectileFlying;
+                self.airstrike_mode = Some(Weapon::Airstrike);
+                // Stay in Aiming phase; droplets spawn on click
             },
             
-            // Napalm Strike - 7 droplets in a line
+            // Napalm Strike - enter click-targeting mode
             Weapon::NapalmStrike => {
-                self.airstrike_droplets.clear();
-                let ball_x = ball.x;
-                let spacing = 60.0;
-                
-                for i in 0..7 {
-                    let x = ball_x + (i as f32 - 3.0) * spacing;
-                    self.airstrike_droplets.push(AirstrikeDroplet {
-                        x,
-                        y: -50.0,
-                        vy: 0.0,
-                        alive: true,
-                        weapon_type: AirstrikeType::Napalm,
-                    });
-                }
-                self.phase = Phase::ProjectileFlying;
+                self.airstrike_mode = Some(Weapon::NapalmStrike);
+                // Stay in Aiming phase; droplets spawn on click
             },
             
             // Dynamite - place at ball position
@@ -1186,6 +1209,7 @@ impl Game {
         self.baseball_bat_mode = false;
         self.build_wall_mode = false;
         self.build_wall_anchor = None;
+        self.airstrike_mode = None;
         
         // Reset movement budget for the current ball
         if self.current_ball < self.balls.len() {
@@ -2098,6 +2122,90 @@ impl Game {
             }
         }
 
+        // Teleport preview: ghost circle + crosshair at cursor
+        if self.teleport_mode && self.is_my_turn() {
+            let (mx, my) = mouse_position();
+            let world_pos = self.cam.to_macroquad().screen_to_world(vec2(mx, my));
+            let r = BALL_RADIUS;
+            draw_circle(world_pos.x, world_pos.y, r, Color::new(0.4, 0.85, 1.0, 0.35));
+            draw_circle_lines(world_pos.x, world_pos.y, r, 2.0, Color::new(0.4, 0.9, 1.0, 0.9));
+            let gap = r * 0.5;
+            let arm = r * 1.5;
+            let c = Color::new(0.4, 0.9, 1.0, 0.8);
+            draw_line(world_pos.x - arm - gap, world_pos.y, world_pos.x - gap, world_pos.y, 1.5, c);
+            draw_line(world_pos.x + gap,       world_pos.y, world_pos.x + arm + gap, world_pos.y, 1.5, c);
+            draw_line(world_pos.x, world_pos.y - arm - gap, world_pos.x, world_pos.y - gap, 1.5, c);
+            draw_line(world_pos.x, world_pos.y + gap,       world_pos.x, world_pos.y + arm + gap, 1.5, c);
+        }
+
+        // ConcreteShell tunnel preview: blue rectangle along aim direction
+        if self.selected_weapon == Weapon::ConcreteShell
+            && (self.phase == Phase::Aiming || self.phase == Phase::Charging)
+            && !self.has_fired && self.is_my_turn()
+        {
+            let idx = self.current_ball;
+            if idx < self.balls.len() && self.balls[idx].alive {
+                let bx = self.balls[idx].x;
+                let by = self.balls[idx].y;
+                let angle = self.aim_angle;
+                let cos_a = angle.cos();
+                let sin_a = angle.sin();
+                // Match carve dims from projectile.rs: back=20, fwd=120, half_w=11
+                let half_len = 70.0f32; // (120+20)/2
+                let half_w   = 11.0f32;
+                let mid_off  = 50.0f32; // (-20+120)/2 — center offset from ball
+                let cx = bx + cos_a * mid_off;
+                let cy = by + sin_a * mid_off;
+                // Perpendicular
+                let px = -sin_a;
+                let py =  cos_a;
+                let c0 = vec2(cx + cos_a * half_len - px * half_w, cy + sin_a * half_len - py * half_w);
+                let c1 = vec2(cx - cos_a * half_len - px * half_w, cy - sin_a * half_len - py * half_w);
+                let c2 = vec2(cx - cos_a * half_len + px * half_w, cy - sin_a * half_len + py * half_w);
+                let c3 = vec2(cx + cos_a * half_len + px * half_w, cy + sin_a * half_len + py * half_w);
+                let fill   = Color::new(0.3, 0.4, 0.9, 0.22);
+                let border = Color::new(0.5, 0.6, 1.0, 0.9);
+                draw_triangle(c0, c1, c2, fill);
+                draw_triangle(c0, c2, c3, fill);
+                draw_line(c0.x, c0.y, c1.x, c1.y, 1.5, border);
+                draw_line(c1.x, c1.y, c2.x, c2.y, 1.5, border);
+                draw_line(c2.x, c2.y, c3.x, c3.y, 1.5, border);
+                draw_line(c3.x, c3.y, c0.x, c0.y, 1.5, border);
+            }
+        }
+
+        // Airstrike / NapalmStrike preview: vertical drop lines at each target X
+        if let Some(airstrike_weapon) = self.airstrike_mode {
+            if self.is_my_turn() {
+                let (mx, my) = mouse_position();
+                let world_pos = self.cam.to_macroquad().screen_to_world(vec2(mx, my));
+                let top_y = self.cam.y - self.cam.visible_height() / 2.0 - 50.0;
+                let bot_y = self.cam.y + self.cam.visible_height() / 2.0;
+                let (count, spacing, color) = match airstrike_weapon {
+                    Weapon::NapalmStrike => (7usize, 60.0f32, Color::new(1.0, 0.45, 0.1, 0.75)),
+                    _ =>                   (5usize, 80.0f32, Color::new(1.0, 0.15, 0.15, 0.75)),
+                };
+                let half = count / 2;
+                for i in 0..count {
+                    let x = world_pos.x + (i as f32 - half as f32) * spacing;
+                    // Dashed line: alternate drawn/gap segments
+                    let segments = 20;
+                    let seg_h = (bot_y - top_y) / (segments as f32 * 2.0);
+                    for s in 0..segments {
+                        let y0 = top_y + s as f32 * seg_h * 2.0;
+                        draw_line(x, y0, x, y0 + seg_h, 2.0, color);
+                    }
+                    // Arrow head
+                    draw_triangle(
+                        vec2(x, bot_y - 20.0),
+                        vec2(x - 8.0, bot_y - 35.0),
+                        vec2(x + 8.0, bot_y - 35.0),
+                        color,
+                    );
+                }
+            }
+        }
+
         for p in &self.particles {
             let alpha = (p.life / 1.0).min(1.0);
             let c = Color::new(p.color.r, p.color.g, p.color.b, p.color.a * alpha);
@@ -2116,6 +2224,27 @@ impl Game {
             let sw = screen_width();
             let tw = measure_text(hint, None, 22, 1.0).width;
             draw_text(hint, sw / 2.0 - tw / 2.0, 58.0, 22.0, Color::new(0.9, 0.75, 0.3, 1.0));
+        }
+
+        // Teleport hint
+        if self.teleport_mode && self.is_my_turn() {
+            let hint = "[ TELEPORT ]  Click destination";
+            let sw = screen_width();
+            let tw = measure_text(hint, None, 22, 1.0).width;
+            draw_text(hint, sw / 2.0 - tw / 2.0, 58.0, 22.0, Color::new(0.4, 0.9, 1.0, 1.0));
+        }
+
+        // Airstrike / NapalmStrike targeting hint
+        if let Some(airstrike_weapon) = self.airstrike_mode {
+            if self.is_my_turn() {
+                let hint = match airstrike_weapon {
+                    Weapon::NapalmStrike => "[ NAPALM STRIKE ]  Click to set target",
+                    _ =>                   "[ AIRSTRIKE ]  Click to set target",
+                };
+                let sw = screen_width();
+                let tw = measure_text(hint, None, 22, 1.0).width;
+                draw_text(hint, sw / 2.0 - tw / 2.0, 58.0, 22.0, Color::new(1.0, 0.5, 0.2, 1.0));
+            }
         }
 
         let is_my_turn = self.is_my_turn();

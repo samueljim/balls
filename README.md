@@ -1,6 +1,6 @@
 # Balls (web)
 
-Web-based Balls-style game: invite friends with a link, join with your name, turn-based artillery with destructible terrain. Built with Next.js, Tailwind, Cloudflare Workers + Durable Objects, and a Rust WASM game engine.
+Web-based worms-style game: invite friends with a link, join with your name, turn-based artillery with destructible terrain. Built with Next.js, Cloudflare Workers + Durable Objects, and a Rust WASM game engine.
 
 ## Structure
 

@@ -1,6 +1,8 @@
 import type { GameState } from "./types";
 
 const TURN_TIME_MS = 45_000;
+/** Max retreat phase duration on server (client gets 5 s; +3 s covers network lag and settling animation) */
+const RETREAT_TIME_MS = 8_000;
 
 interface BallSnapshot {
   x: number; y: number; vx: number; vy: number; hp: number; alive: boolean;
@@ -151,16 +153,14 @@ export class Game implements DurableObject {
         }));
       } catch (_) {}
 
-      // On reconnect, send terrain damage log and a comprehensive resync message
-      // so the client can fully restore game state without a reset.
-      if (this.terrainDamageLog.length > 0) {
-        try {
-          server.send(JSON.stringify({
-            type: "terrain_sync",
-            log: this.terrainDamageLog,
-          }));
-        } catch (_) {}
-      }
+      // On reconnect, always send terrain_sync first (even if empty) to guarantee
+      // it arrives before game_resync on the client and ordering is deterministic.
+      try {
+        server.send(JSON.stringify({
+          type: "terrain_sync",
+          log: this.terrainDamageLog,
+        }));
+      } catch (_) {}
       // Send game_resync: full snapshot including phase and turn timer remaining.
       // Only include ball positions once the game has actually progressed and the
       // server has received real positions from the active player.  On a fresh game
@@ -219,12 +219,14 @@ export class Game implements DurableObject {
     this.gameState.phase = "aiming";
     this.gameState.turnEndTime = Date.now() + TURN_TIME_MS;
     this.phaseStartTime = Date.now();
-    this.broadcast({ type: "turn_advanced", turnIndex: this.gameState.currentTurnIndex });
-    // Broadcast authoritative terrain state at every turn boundary so all live clients
-    // can correct any divergence before the next player takes their shot.
-    if (this.terrainDamageLog.length > 0) {
-      this.broadcast({ type: "terrain_sync", log: this.terrainDamageLog });
-    }
+    // Include authoritative ball positions and terrain log at each turn boundary
+    // so all live clients can reconcile any divergence before the next shot.
+    this.broadcast({
+      type: "turn_advanced",
+      turnIndex: this.gameState.currentTurnIndex,
+      balls: this.ballSnapshots,
+      terrainLog: this.terrainDamageLog,
+    });
     this.broadcast({ type: "state", state: this.gameState });
     this.scheduleWatchdog();
     this.persistState();
@@ -236,6 +238,8 @@ export class Game implements DurableObject {
     const deadline =
       this.gameState.phase === "projectile"
         ? this.phaseStartTime + PROJECTILE_TIMEOUT_MS
+        : this.gameState.phase === "retreat"
+        ? this.phaseStartTime + RETREAT_TIME_MS
         : this.gameState.turnEndTime + WATCHDOG_GRACE_MS;
     try {
       this.state.storage.setAlarm(deadline);
@@ -258,6 +262,17 @@ export class Game implements DurableObject {
         this.advanceTurnAndMaybeBot();
       } else {
         // Not yet expired — re-arm
+        this.scheduleWatchdog();
+      }
+      return;
+    }
+
+    if (this.gameState.phase === "retreat") {
+      if (now >= this.phaseStartTime + RETREAT_TIME_MS) {
+        // Retreat phase timed out — force-advance
+        this.broadcast({ type: "force_advance", reason: "retreat_timeout" });
+        this.advanceTurnAndMaybeBot();
+      } else {
         this.scheduleWatchdog();
       }
       return;
@@ -473,19 +488,18 @@ export class Game implements DurableObject {
     const idx = this.playerIdToIndex.get(playerId);
     if (idx === undefined) return;
 
-    // Accept terrain_damages from the active player to keep the server log current.
-    // Relay to all other clients so they can apply any entries they may have missed,
-    // keeping terrain in sync during live play without waiting for a reconnect.
+    // Accept terrain_damages only from the current-turn player — they are the only
+    // source of authoritative terrain changes this turn.  Messages sent just before
+    // end_turn are still valid because WebSocket ordering within one connection
+    // guarantees terrain_damages arrives before end_turn on the server.
     try {
       const parsed = JSON.parse(data) as { type: string; [k: string]: unknown };
       if (parsed.type === "terrain_damages") {
+        if (idx !== this.gameState.currentTurnIndex) return;
         const dmgMsg = parsed as { type: string; log?: number[][] };
         if (Array.isArray(dmgMsg.log) && dmgMsg.log.length >= this.terrainDamageLog.length) {
           this.terrainDamageLog = dmgMsg.log;
           this.persistState();
-          // Relay the updated log to all other clients as terrain_sync so they can
-          // apply any missing entries before the next turn begins.
-          this.broadcastExcept(playerId, { type: "terrain_sync", log: this.terrainDamageLog });
         }
         return;
       }
@@ -508,6 +522,28 @@ export class Game implements DurableObject {
       }
     } catch (_) {}
 
+    // Restart can be sent by any connected player (e.g., from the game-over screen).
+    // Handle it before the current-turn guard so it is never silently dropped.
+    try {
+      const restartMsg = JSON.parse(data) as { type: string; seed?: number };
+      if (restartMsg.type === "restart" && typeof restartMsg.seed === "number") {
+        const seed = restartMsg.seed;
+        this.gameState.rngSeed = seed;
+        this.gameState.inputLog = [];
+        this.gameState.currentTurnIndex = 0;
+        this.gameState.phase = "aiming";
+        this.gameState.turnEndTime = Date.now() + TURN_TIME_MS;
+        this.phaseStartTime = Date.now();
+        this.ballSnapshots = [];
+        this.terrainDamageLog = [];
+        this.broadcast({ type: "restart", seed });
+        this.broadcast({ type: "state", state: this.gameState });
+        this.scheduleWatchdog();
+        this.persistState();
+        return;
+      }
+    } catch (_) {}
+
     // All other message types require it to be the current turn player
     if (this.gameState.currentTurnIndex !== idx) return;
 
@@ -516,24 +552,6 @@ export class Game implements DurableObject {
 
     try {
       const msg = JSON.parse(data) as { type: string; input?: string; aim?: number };
-        // Allow clients to request a restart which we broadcast to all clients
-        if (msg.type === "restart" && typeof (msg as any).seed === "number") {
-          const seed = (msg as any).seed as number;
-          // Reset server-side minimal state for the new game
-          this.gameState.rngSeed = seed;
-          this.gameState.inputLog = [];
-          this.gameState.currentTurnIndex = 0;
-          this.gameState.phase = "aiming";
-          this.gameState.turnEndTime = Date.now() + TURN_TIME_MS;
-          this.phaseStartTime = Date.now();
-          this.ballSnapshots = [];
-          this.terrainDamageLog = [];
-          this.broadcast({ type: "restart", seed });
-          this.broadcast({ type: "state", state: this.gameState });
-          this.scheduleWatchdog();
-          this.persistState();
-          return;
-        }
       if (msg.type === "input" && typeof msg.input === "string") {
         // Check if this is a firing action (not movement)
         const isFiring = msg.input.includes('"Fire"');
@@ -576,6 +594,17 @@ export class Game implements DurableObject {
         // Relay to other clients for position/health sync
         this.broadcast(msg as { type: string; [k: string]: unknown });
         this.persistState();
+      } else if (msg.type === "retreat_start") {
+        // Active player entered the post-fire retreat window.
+        // Switch to retreat phase so the watchdog uses the retreat timeout
+        // instead of the projectile timeout.  Only valid after a fire action
+        // (server must already be in "projectile" phase).
+        if (this.gameState.phase === "projectile") {
+          this.gameState.phase = "retreat";
+          this.phaseStartTime = Date.now();
+          this.scheduleWatchdog();
+          this.persistState();
+        }
       } else if (msg.type === "end_turn") {
         this.advanceTurn();
         this.maybeBotTurn();

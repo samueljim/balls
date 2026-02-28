@@ -1054,6 +1054,11 @@ impl Game {
             }
             let msg = format!(r#"{{"type":"input","input":"{}"}}"#, escaped);
             self.net.send_message(&msg);
+            // Dynamite enters Retreat directly (not via Settling), so notify the server
+            // here so the retreat-phase watchdog fires correctly.
+            if self.phase == Phase::Retreat {
+                self.net.send_message(r#"{"type":"retreat_start"}"#);
+            }
         }
     }
 
@@ -1099,10 +1104,12 @@ impl Game {
                 let spread = 0.15;
                 let base_speed = power * 15.0;
                 
-                for i in 0..bullet_count {
-                    let offset_angle = (rand::gen_range(0.0, 1.0) - 0.5) * spread;
+                for _ in 0..bullet_count {
+                    self.rng_state = lcg(self.rng_state);
+                    let offset_angle = ((self.rng_state >> 16) as f32 / 65536.0 - 0.5) * spread;
                     let bullet_angle = angle + offset_angle;
-                    let speed = base_speed * (0.95 + rand::gen_range(0.0, 0.1));
+                    self.rng_state = lcg(self.rng_state);
+                    let speed = base_speed * (0.95 + (self.rng_state >> 16) as f32 / 65536.0 * 0.1);
                     
                     self.uzi_bullets.push(UziBullet {
                         x: sx,
@@ -1445,10 +1452,17 @@ impl Game {
     /// Apply terrain ops log received from server on reconnect.
     /// Handles [0,cx,cy,r] explosions, [1,bx,by,amrad] drills, [2,ax,ay,amrad] walls.
     /// Also handles legacy 3-element [cx,cy,r] entries (old format = explosion).
+    /// Accepts both the standard "log" key (terrain_sync messages) and
+    /// the "terrainLog" key embedded in turn_advanced messages.
     fn apply_terrain_sync(&mut self, msg: &str) {
-        let key = "\"log\":[";
+        // Try "terrainLog" first (turn_advanced), then fall back to "log" (terrain_sync).
+        let (key, key_len) = if msg.contains("\"terrainLog\":[") {
+            ("\"terrainLog\":[", "\"terrainLog\":[".len())
+        } else {
+            ("\"log\":[", "\"log\":[".len())
+        };
         let start = match msg.find(key) {
-            Some(i) => i + key.len(),
+            Some(i) => i + key_len,
             None => return,
         };
         let mut depth = 1i32;
@@ -1851,9 +1865,18 @@ impl Game {
                         self.phase = Phase::TurnEnd;
                         self.turn_end_timer = 0.1;
                     }
-                    _ => {
-                        // During projectile/settling, just note that a sync is coming
+                    Phase::ProjectileFlying | Phase::Settling => {
+                        // Abort all in-flight projectiles so settling completes immediately
+                        // and the pending turn_advanced can be applied without further delay.
+                        self.proj = None;
+                        self.shotgun_pellets.clear();
+                        self.uzi_bullets.clear();
+                        self.airstrike_droplets.clear();
+                        self.cluster_bomblets.clear();
+                        self.phase = Phase::TurnEnd;
+                        self.turn_end_timer = 0.1;
                     }
+                    Phase::GameOver => {}
                 }
                 continue;
             }
@@ -1861,6 +1884,21 @@ impl Game {
                 if let Some(player_index) = parse_turn_index_from_message(&msg) {
                     // Always update our stored turn index
                     self.current_turn_index = player_index;
+                    // Apply authoritative ball positions embedded in the message (if any).
+                    // These snapshots are the server's last-known state before the new
+                    // turn, so they're the reference point for the incoming player.
+                    if msg.contains("\"balls\":") {
+                        // Clear stale lerp targets before snapping to authoritative positions
+                        for t in &mut self.ball_lerp_targets {
+                            *t = None;
+                        }
+                        self.apply_ball_state(&msg);
+                    }
+                    // Apply authoritative terrain log if the server included it.
+                    // apply_terrain_sync handles the "terrainLog" key from turn_advanced.
+                    if msg.contains("\"terrainLog\":") {
+                        self.apply_terrain_sync(&msg);
+                    }
                     match self.phase {
                         Phase::Aiming | Phase::Charging | Phase::TurnEnd => {
                             self.sync_to_player_turn(player_index);
@@ -2543,6 +2581,11 @@ impl Game {
                         // Reset movement budget for retreat
                         if self.current_ball < self.balls.len() {
                             self.balls[self.current_ball].reset_movement_budget();
+                        }
+                        // Notify server we've entered the retreat window so the
+                        // watchdog uses the retreat timeout instead of projectile.
+                        if self.net.connected {
+                            self.net.send_message(r#"{"type":"retreat_start"}"#);
                         }
                     } else if !self.net.connected {
                         self.end_turn();

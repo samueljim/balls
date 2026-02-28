@@ -44,6 +44,8 @@ export type GameMessage =
   | { type: "input"; input: string; turnIndex: number }
   | { type: "aim"; aim: number; turnIndex: number }
   | { type: "turn_advanced"; turnIndex: number }
+  | { type: "player_connected"; playerIndex: number }
+  | { type: "player_disconnected"; playerIndex: number }
   | { type: "error"; message: string };
 
 export type GameClientMessage =

@@ -19,6 +19,8 @@ interface PersistedGameData {
 const WATCHDOG_GRACE_MS = 5_000;
 /** Max time (ms) a "projectile" phase can last before the server force-advances */
 const PROJECTILE_TIMEOUT_MS = 20_000;
+/** How long (ms) to wait before force-advancing after the current-turn player disconnects */
+const DISCONNECT_ADVANCE_MS = 12_000;
 
 export class Game implements DurableObject {
   private state: DurableObjectState;
@@ -33,6 +35,8 @@ export class Game implements DurableObject {
   };
   private sockets: Map<string, WebSocket> = new Map();
   private playerIdToIndex: Map<string, number> = new Map();
+  /** Set of playerIds whose WebSocket is currently open */
+  private connectedPlayerIds: Set<string> = new Set();
   /** Accumulated terrain damage events [[cx,cy,r], ...] for replay on reconnect */
   private terrainDamageLog: number[][] = [];
   /** Latest per-ball snapshot (positions + health) for reconnect sync */
@@ -140,7 +144,8 @@ export class Game implements DurableObject {
     this.state.acceptWebSocket(server);
     // Reconnecting with same playerId takes back that slot (we never remove from playerOrder on disconnect)
     this.sockets.set(playerId, server);
-    
+    this.connectedPlayerIds.add(playerId);
+
     // Send authoritative player identity and game seed
     const myPlayerIndex = this.playerIdToIndex.get(playerId);
     if (myPlayerIndex !== undefined) {
@@ -178,9 +183,12 @@ export class Game implements DurableObject {
           balls: gameHasProgressed ? this.ballSnapshots : undefined,
         }));
       } catch (_) {}
+
+      // Notify all other connected players that this player is back online
+      this.broadcastExcept(playerId, { type: "player_connected", playerIndex: myPlayerIndex });
     }
     
-    // Then send current game state
+    // Send current game state to all (including the reconnecting client)
     this.broadcast({ type: "state", state: this.gameState });
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -275,6 +283,18 @@ export class Game implements DurableObject {
       } else {
         this.scheduleWatchdog();
       }
+      return;
+    }
+
+    // Aiming phase: check whether the active player is currently disconnected.
+    // If so, skip their turn immediately rather than waiting for the full grace period.
+    // activePid being undefined means currentTurnIndex is out of range (corrupted state)
+    // — treat as disconnected so the game advances rather than stalling.
+    const activePid = this.gameState.playerOrder[this.gameState.currentTurnIndex]?.playerId;
+    const activeIsConnected = activePid !== undefined && this.connectedPlayerIds.has(activePid);
+    if (!activeIsConnected) {
+      this.broadcast({ type: "force_advance", reason: "player_disconnected" });
+      this.advanceTurnAndMaybeBot();
       return;
     }
 
@@ -503,21 +523,30 @@ export class Game implements DurableObject {
         }
         return;
       }
-      // pos_update is a real-time position stream — relay from ANY player so
+      // pos_update is a real-time position stream — relay from the owning player so
       // all clients can smoothly interpolate remote balls.
-      // Also update our persisted snapshots so reconnecting clients get
-      // fresh positions, not stale end-of-turn data.
+      // Ownership: in the interleaved spawn layout ball index `bi` belongs to
+      // player `bi % numPlayers` — only accept updates the sender actually owns.
       if (parsed.type === "pos_update") {
         const pu = parsed as { bi?: number; x?: number; y?: number; vx?: number; vy?: number };
         const bi = pu.bi;
-        if (typeof bi === "number" && bi >= 0 && bi < this.ballSnapshots.length) {
+        const numPlayers = this.gameState.playerOrder.length;
+        // Reject all pos_updates when playerOrder is not set (game not yet started)
+        // or when the ball does not belong to the sending player.
+        if (
+          typeof bi === "number" &&
+          bi >= 0 &&
+          bi < this.ballSnapshots.length &&
+          numPlayers > 0 &&
+          bi % numPlayers === idx
+        ) {
           const snap = this.ballSnapshots[bi];
           if (typeof pu.x === "number") snap.x = pu.x;
           if (typeof pu.y === "number") snap.y = pu.y;
           if (typeof pu.vx === "number") snap.vx = pu.vx;
           if (typeof pu.vy === "number") snap.vy = pu.vy;
+          this.broadcast(parsed as { type: string; [k: string]: unknown });
         }
-        this.broadcast(parsed as { type: string; [k: string]: unknown });
         return;
       }
     } catch (_) {}
@@ -641,14 +670,23 @@ export class Game implements DurableObject {
         stepIdx++;
         setTimeout(doStep, 180);
       } else {
-        // Fire
+        // Fire — guard against stale turns before committing the action
+        if (this.gameState.currentTurnIndex !== turnIndex) return;
         this.gameState.inputLog.push(fireInput);
         this.broadcast({ type: "input", input: fireInput, turnIndex });
         this.gameState.phase = "projectile";
         this.phaseStartTime = Date.now();
         this.scheduleWatchdog();
         this.broadcast({ type: "state", state: this.gameState });
-        setTimeout(() => this.advanceTurnAndMaybeBot(), 1500);
+        setTimeout(() => {
+          // This check is intentionally separate from the synchronous guard above:
+          // the alarm watchdog (projectile_timeout) may fire within the 1500 ms window
+          // and call advanceTurnAndMaybeBot() independently.  Without this guard the
+          // bot's delayed callback would fire a second advance and skip an extra turn.
+          if (this.gameState.currentTurnIndex === turnIndex) {
+            this.advanceTurnAndMaybeBot();
+          }
+        }, 1500);
       }
     };
 
@@ -669,6 +707,28 @@ export class Game implements DurableObject {
         break;
       }
     }
-    if (pid) this.sockets.delete(pid);
+    if (pid) {
+      this.sockets.delete(pid);
+      this.connectedPlayerIds.delete(pid);
+
+      const playerIndex = this.playerIdToIndex.get(pid);
+      if (playerIndex !== undefined) {
+        // Notify remaining players that someone went offline
+        this.broadcast({ type: "player_disconnected", playerIndex });
+
+        // If the disconnected player is the active turn player during the aiming phase,
+        // schedule a short watchdog so the game doesn't stall for the full turn timer.
+        // We use DISCONNECT_ADVANCE_MS (12 s) giving them time to reconnect on a flaky
+        // connection before force-advancing — the regular watchdog (50 s) is too long.
+        const isActiveTurnPlayer =
+          playerIndex === this.gameState.currentTurnIndex &&
+          (this.gameState.phase === "aiming");
+        if (isActiveTurnPlayer && this.gameState.playerOrder.length > 0) {
+          try {
+            this.state.storage.setAlarm(Date.now() + DISCONNECT_ADVANCE_MS);
+          } catch (_) {}
+        }
+      }
+    }
   }
 }

@@ -1032,11 +1032,16 @@ impl Game {
                     bx, by, angle
                 )
             } else {
+                // Include the ball's world position so remote clients fire from the
+                // identical origin and produce the same projectile path/terrain damage.
+                // idx is always valid here: the caller already returned if idx >= balls.len().
+                let bx = self.balls[idx].x;
+                let by = self.balls[idx].y;
                 let angle_deg = angle.to_degrees();
                 let weapon_name = weapon.name();
                 format!(
-                    r#"{{"Fire":{{"weapon":"{}","angle_deg":{},"power_percent":{}}}}}"#,
-                    weapon_name, angle_deg, power
+                    r#"{{"Fire":{{"weapon":"{}","angle_deg":{},"power_percent":{},"bx":{},"by":{}}}}}"#,
+                    weapon_name, angle_deg, power, bx, by
                 )
             };
             let mut escaped = String::new();
@@ -1981,7 +1986,22 @@ impl Game {
                     };
                     if let Some(ball_idx) = ball_idx_opt {
                         // Parse and apply different input types
-                        if let Some((angle_rad, power, weapon)) = parse_fire_input(&input_str) {
+                        if let Some((angle_rad, power, weapon, ball_pos)) = parse_fire_input(&input_str) {
+                            // Snap the ball to the authoritative position sent by the active client
+                            // so the projectile starts from the exact same world coordinate on all
+                            // clients, preventing divergent projectile paths and terrain damage.
+                            if let Some((bx, by)) = ball_pos {
+                                if ball_idx < self.balls.len() {
+                                    self.balls[ball_idx].x = bx;
+                                    self.balls[ball_idx].y = by;
+                                } else {
+                                    #[cfg(target_arch = "wasm32")]
+                                    {
+                                        let dbg = format!("[FIRE] ball_pos snap skipped: ball_idx={} out of range ({})\0", ball_idx, self.balls.len());
+                                        unsafe { console_log(dbg.as_ptr()); }
+                                    }
+                                }
+                            }
                             self.do_fire(ball_idx, angle_rad, power, weapon);
                             self.has_fired = true;
                             // Reset budget on the firing ball so remote players also get
@@ -3534,7 +3554,7 @@ fn parse_input_message(msg: &str) -> Option<(usize, String)> {
     Some((turn_index, unescaped))
 }
 
-fn parse_fire_input(input: &str) -> Option<(f32, f32, Weapon)> {
+fn parse_fire_input(input: &str) -> Option<(f32, f32, Weapon, Option<(f32, f32)>)> {
     if !input.contains("Fire") {
         return None;
     }
@@ -3542,7 +3562,11 @@ fn parse_fire_input(input: &str) -> Option<(f32, f32, Weapon)> {
     let power_percent = parse_json_number(input, "power_percent")? as f32;
     let weapon_name = parse_json_string(input, "weapon")?;
     let weapon = Weapon::from_name(weapon_name)?;
-    Some((angle_deg.to_radians(), power_percent, weapon))
+    // Optional ball origin transmitted so all clients start the projectile from the same position
+    let ball_pos = parse_json_number(input, "bx")
+        .zip(parse_json_number(input, "by"))
+        .map(|(bx, by)| (bx as f32, by as f32));
+    Some((angle_deg.to_radians(), power_percent, weapon, ball_pos))
 }
 
 fn parse_walk_input(input: &str) -> Option<f32> {

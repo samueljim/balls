@@ -82,13 +82,21 @@ impl Terrain {
         self.regrow_grass_near(cx, cy, radius);
     }
 
-    /// Replay a damage log on this terrain (e.g. after regenerating from seed on reconnect)
+    /// Replay a damage log on this terrain (e.g. after regenerating from seed on reconnect).
+    /// Only applies entries beyond what the local log already contains, so calling this on a
+    /// live client (turn-boundary sync) is idempotent and never duplicates entries.
     pub fn replay_damage(&mut self, log: &[(i32, i32, i32)]) {
-        for &(cx, cy, r) in log {
-            self.apply_damage_no_log(cx, cy, r);
+        let local_len = self.damage_log.len();
+        for (i, &(cx, cy, r)) in log.iter().enumerate() {
+            if i >= local_len {
+                self.apply_damage_no_log(cx, cy, r);
+            }
         }
-        // Store the replayed events so future sends include them
-        self.damage_log.extend_from_slice(log);
+        // Replace the local log with the authoritative received log when it is longer.
+        // This ensures future sends reflect the canonical server state exactly.
+        if log.len() > local_len {
+            self.damage_log = log.to_vec();
+        }
     }
 
     /// Regrow grass over any rectangular area (used after drill carvings).

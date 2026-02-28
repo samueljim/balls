@@ -202,6 +202,17 @@ export class Game implements DurableObject {
     }
   }
 
+  /** Send a message to all connected players except the one with the given playerId. */
+  private broadcastExcept(excludePlayerId: string, msg: { type: string; [k: string]: unknown }): void {
+    const data = JSON.stringify(msg);
+    for (const [pid, ws] of this.sockets) {
+      if (pid === excludePlayerId) continue;
+      try {
+        ws.send(data);
+      } catch (_) {}
+    }
+  }
+
   private advanceTurn(): void {
     this.gameState.currentTurnIndex =
       (this.gameState.currentTurnIndex + 1) % this.gameState.playerOrder.length;
@@ -209,6 +220,11 @@ export class Game implements DurableObject {
     this.gameState.turnEndTime = Date.now() + TURN_TIME_MS;
     this.phaseStartTime = Date.now();
     this.broadcast({ type: "turn_advanced", turnIndex: this.gameState.currentTurnIndex });
+    // Broadcast authoritative terrain state at every turn boundary so all live clients
+    // can correct any divergence before the next player takes their shot.
+    if (this.terrainDamageLog.length > 0) {
+      this.broadcast({ type: "terrain_sync", log: this.terrainDamageLog });
+    }
     this.broadcast({ type: "state", state: this.gameState });
     this.scheduleWatchdog();
     this.persistState();
@@ -457,8 +473,9 @@ export class Game implements DurableObject {
     const idx = this.playerIdToIndex.get(playerId);
     if (idx === undefined) return;
 
-    // Accept terrain_damages from ANY connected player (not just current turn)
-    // so the worker always has the latest cumulative damage log.
+    // Accept terrain_damages from the active player to keep the server log current.
+    // Relay to all other clients so they can apply any entries they may have missed,
+    // keeping terrain in sync during live play without waiting for a reconnect.
     try {
       const parsed = JSON.parse(data) as { type: string; [k: string]: unknown };
       if (parsed.type === "terrain_damages") {
@@ -466,6 +483,9 @@ export class Game implements DurableObject {
         if (Array.isArray(dmgMsg.log) && dmgMsg.log.length >= this.terrainDamageLog.length) {
           this.terrainDamageLog = dmgMsg.log;
           this.persistState();
+          // Relay the updated log to all other clients as terrain_sync so they can
+          // apply any missing entries before the next turn begins.
+          this.broadcastExcept(playerId, { type: "terrain_sync", log: this.terrainDamageLog });
         }
         return;
       }

@@ -91,6 +91,21 @@ impl Terrain {
         self.damage_log.extend_from_slice(log);
     }
 
+    /// Regrow grass over any rectangular area (used after drill carvings).
+    pub fn refresh_grass_in_area(&mut self, x1: i32, y1: i32, x2: i32, y2: i32) {
+        let margin = 4;
+        for y in (y1 - margin).max(1)..=(y2 + margin).min(self.height as i32 - 1) {
+            for x in (x1 - margin).max(0)..=(x2 + margin).min(self.width as i32 - 1) {
+                if self.get(x, y) != AIR {
+                    continue;
+                }
+                if self.get(x, y + 1) == DIRT || self.get(x, y + 1) == STONE {
+                    self.set(x, y, GRASS);
+                }
+            }
+        }
+    }
+
     fn regrow_grass_near(&mut self, cx: i32, cy: i32, radius: i32) {
         let margin = 3;
         for dy in -(radius + margin)..=(radius + margin) {
@@ -178,6 +193,19 @@ fn lcg(s: u32) -> u32 {
     s.wrapping_mul(1103515245).wrapping_add(12345)
 }
 
+/// Simple integer-hash based 2D noise in [0,1). Lightweight and deterministic.
+fn noise_2d(x: f32, y: f32, seed: f32) -> f32 {
+    let ix = x as i32;
+    let iy = y as i32;
+    let is = seed as i32;
+    let mut h = (ix as u32).wrapping_mul(374761393)
+        .wrapping_add((iy as u32).wrapping_mul(668265263))
+        .wrapping_add((is as u32).wrapping_mul(982451653));
+    h = (h ^ (h >> 13)).wrapping_mul(1274126177);
+    h = h ^ (h >> 16);
+    (h & 0x00FFFFFF) as f32 / 16777216.0
+}
+
 pub fn generate(seed: u32) -> Terrain {
     let w = WIDTH;
     let h = HEIGHT;
@@ -194,7 +222,7 @@ pub fn generate(seed: u32) -> Terrain {
     // ---- Layer 1: Define 4-8 distinct hill "segments" across the map ----
     // This creates the classic Balls look of distinct hills separated by valleys
     s = lcg(s);
-    let num_hills = 4 + (s >> 16) as u32 % 5; // 4-8 hills
+    let num_hills = 3 + (s >> 16) as u32 % 3; // 3-5 hills
     struct HillDef { center: f32, width: f32, height: f32, flat_top: f32 }
     let mut hill_defs: Vec<HillDef> = Vec::new();
     
@@ -204,7 +232,7 @@ pub fn generate(seed: u32) -> Terrain {
         let jitter = ((s >> 16) as f32 / 65535.0 - 0.5) * segment_width * 0.4;
         let center = LAND_START_X + segment_width * (i as f32 + 0.5) + jitter;
         s = lcg(s);
-        let hill_height = 100.0 + (s >> 16) as f32 / 65535.0 * 200.0; // 100-300px tall
+        let hill_height = 60.0 + (s >> 16) as f32 / 65535.0 * 100.0; // 60-160px tall
         s = lcg(s);
         let hill_width = 60.0 + (s >> 16) as f32 / 65535.0 * 120.0; // 60-180px half-width
         s = lcg(s);
@@ -231,11 +259,11 @@ pub fn generate(seed: u32) -> Terrain {
     // ---- Layer 2: Add noise-based variation on top of the hill shapes ----
     for x in 0..w {
         let fx = x as f32;
-        let h2 = (smooth_noise(fx, 90.0, sf + 100.0) - 0.5) * 40.0;  // medium undulation
-        let h3 = (smooth_noise(fx, 35.0, sf + 200.0) - 0.5) * 20.0;  // small bumps
-        let h4 = (smooth_noise(fx, 12.0, sf + 300.0) - 0.5) * 8.0;   // fine detail
+        let h2 = (smooth_noise(fx, 90.0, sf + 100.0) - 0.5) * 22.0;  // medium undulation
+        let h3 = (smooth_noise(fx, 35.0, sf + 200.0) - 0.5) * 12.0;  // small bumps
+        let h4 = (smooth_noise(fx, 12.0, sf + 300.0) - 0.5) * 5.0;   // fine detail
         // Ridged noise for occasional sharp features
-        let ridge = (ridged_noise(fx, 180.0, sf + 400.0) - 0.5) * 35.0;
+        let ridge = (ridged_noise(fx, 180.0, sf + 400.0) - 0.5) * 18.0;
         heights[x as usize] += h2 + h3 + h4 + ridge;
     }
 
@@ -275,6 +303,66 @@ pub fn generate(seed: u32) -> Terrain {
             let factor = (LAND_START_X - edge_dist) / LAND_START_X;
             // Smoothly transition to deep water
             heights[x] -= factor * factor * 300.0;
+        }
+    }
+
+    // Apply a multi-island mask so central island(s) stay higher and channels form between them.
+    {
+        let mut s_is = lcg(seed.wrapping_add(8000));
+        let num_islands = 1 + (s_is >> 16) as u32 % 3; // 1-3 islands
+        let mut island_centers: Vec<f32> = Vec::new();
+        for _ in 0..num_islands {
+            s_is = lcg(s_is);
+            let cx = LAND_START_X + 80.0 + (s_is >> 16) as f32 / 65535.0 * (PLAYABLE_LAND_WIDTH - 160.0);
+            island_centers.push(cx);
+        }
+
+        let half_width = (PLAYABLE_LAND_WIDTH * 0.5) as f32;
+        for x in 0..w as usize {
+            let xf = x as f32;
+            if xf >= LAND_START_X && xf <= LAND_END_X {
+                // distance to nearest island center (normalized)
+                let mut best = 99999.0f32;
+                for &c in &island_centers {
+                    let d = (xf - c).abs();
+                    if d < best { best = d; }
+                }
+                let norm = (best / half_width).clamp(0.0, 1.0);
+                // Sharpen the falloff so islands are pronounced and channels appear
+                let mask = 1.0 - norm.powf(1.8);
+                // Center boost: lower the height value to raise island tops
+                let center_boost = 80.0;
+                // Edge depth: increase height value to deepen channels/water
+                let edge_depth = 110.0;
+                heights[x] -= mask * center_boost; // raise island centres
+                heights[x] += (1.0 - mask) * edge_depth; // deepen channels
+            }
+        }
+    }
+
+    // Carve a porous cave field using 2D noise so maps get lots of natural caverns.
+    // This runs before the chamber+worm pass to produce interconnected voids.
+    {
+        let mut s_cave = lcg(seed.wrapping_add(2500));
+        let cave_scale = 0.05; // coarser noise for big caverns
+        let cave_threshold = 0.26; // lower -> more air; slightly stricter to protect surface
+        for x in LAND_START_X as i32..=LAND_END_X as i32 {
+            if x < 0 || x >= w as i32 { continue; }
+            let ground = heights[x as usize] as i32;
+            // create caves starting a bit below surface and extending downward
+            let y0 = (ground + 14).max(10);
+            let y1 = (ground + 160).min(h as i32 - 10);
+            for y in y0..=y1 {
+                let nx = x as f32 * cave_scale;
+                let ny = y as f32 * cave_scale;
+                // combine a couple of noise samples for variety
+                let n1 = noise_2d(nx, ny, sf + 6000.0);
+                let n2 = noise_2d(nx * 1.7 + 17.0, ny * 0.9 + 53.0, sf + 7000.0) * 0.6;
+                let n = n1 * 0.7 + n2 * 0.3;
+                if n < cave_threshold {
+                    t.set(x, y, AIR);
+                }
+            }
         }
     }
 
@@ -328,7 +416,7 @@ pub fn generate(seed: u32) -> Terrain {
 
     // Generate improved caves with more variety
     s = lcg(s.wrapping_add(2000));
-    let num_caves = 3 + (s >> 16) as u32 % 4; // More caves (3-6 instead of 2-4)
+    let num_caves = 6 + (s >> 16) as u32 % 4; // Many caves (6-9)
     let mut cave_positions = Vec::new();
     
     for i in 0..num_caves {
@@ -337,9 +425,9 @@ pub fn generate(seed: u32) -> Terrain {
         s = lcg(s);
         let cy = 100 + (s >> 16) as i32 % ((heights[cx as usize] as i32) - 120);
         s = lcg(s);
-        let cave_w = 50 + (s >> 16) as i32 % 80; // Larger caves (50-130 vs 40-90)
+        let cave_w = 60 + (s >> 16) as i32 % 100; // Generous width (60-160)
         s = lcg(s);
-        let cave_h = 35 + (s >> 16) as i32 % 50; // Taller caves (35-85 vs 25-60)
+        let cave_h = 40 + (s >> 16) as i32 % 60; // Generous height (40-100)
         
         cave_positions.push((cx, cy));
         
@@ -383,26 +471,75 @@ pub fn generate(seed: u32) -> Terrain {
             }
         }
         
-        // Occasionally connect caves with tunnels
-        if i > 0 && (s >> 16) % 3 == 0 && cave_positions.len() >= 2 {
+        // Connect most caves with tunnels
+        if i > 0 && (s >> 16) % 2 == 0 && cave_positions.len() >= 2 {
             let prev_idx = cave_positions.len() - 2;
             let (prev_cx, prev_cy) = cave_positions[prev_idx];
             
-            // Create winding tunnel between caves
-            let steps = 20;
-            for step in 0..=steps {
-                let t_param = step as f32 / steps as f32;
-                let tunnel_x = prev_cx + ((cx - prev_cx) as f32 * t_param) as i32;
-                let tunnel_y = prev_cy + ((cy - prev_cy) as f32 * t_param) as i32;
-                
-                // Add some waviness to the tunnel
-                let wave = ((step as f32 * 0.5).sin() * 8.0) as i32;
-                
-                // Carve tunnel
-                for dy in -6..=6 {
-                    for dx in -6..=6 {
-                        if dx * dx + dy * dy < 36 { // Circular tunnel
-                            t.set(tunnel_x + dx + wave, tunnel_y + dy, AIR);
+            // Create winding, worm-like tunnel between caves using a noisy walk.
+            // This produces curvier tunnels that can cross over themselves and branch.
+            {
+                let mut px = prev_cx as f32;
+                let mut py = prev_cy as f32;
+                let txf = cx as f32;
+                let tyf = cy as f32;
+                let total_dist = ((txf - px).hypot(tyf - py)).max(1.0);
+                // More steps for longer tunnels
+                let steps = (total_dist / 3.0).max(30.0) as i32;
+
+                for _ in 0..steps {
+                    // steer toward target but with jitter
+                    let desired = (tyf - py).atan2(txf - px);
+                    s = lcg(s);
+                    let jitter = ((s >> 16) as f32 / 65535.0 - 0.5) * 1.6; // +/- ~0.8 rad
+                    let angle = desired + jitter;
+
+                    s = lcg(s);
+                    let step_len = 2.5 + ((s >> 16) as f32 / 65535.0) * 4.0; // 2.5-6.5 px
+                    px += angle.cos() * step_len;
+                    py += angle.sin() * step_len;
+
+                    // varying radius for organic tunnels
+                    s = lcg(s);
+                    let base_r = 4.0 + ((s >> 16) as f32 / 65535.0) * 5.0; // 4-9
+                    let wobble = ((px * 0.12).sin() + (py * 0.15).cos()) * 1.5;
+                    let radius_f = (base_r + wobble).max(3.0);
+                    let radius = radius_f as i32;
+
+                    let ix = px as i32;
+                    let iy = py as i32;
+                    for dy in -radius - 1..=radius + 1 {
+                        for dx in -radius - 1..=radius + 1 {
+                            if dx * dx + dy * dy <= radius * radius {
+                                t.set(ix + dx, iy + dy, AIR);
+                            }
+                        }
+                    }
+
+                    // occasional side-branches for variety
+                    s = lcg(s);
+                    if (s >> 16) % 30 == 0 {
+                        // small branching tunnel
+                        s = lcg(s);
+                        let mut bx = px;
+                        let mut by = py;
+                        let branch_angle = angle + ((s >> 16) as f32 / 65535.0 - 0.5) * 3.14 * 0.5;
+                        s = lcg(s);
+                        let blen = 8 + (s >> 16) as i32 % 20;
+                        for _b in 0..blen {
+                            s = lcg(s);
+                            bx += branch_angle.cos() * (1.8 + ((s >> 16) as f32 / 65535.0) * 2.2);
+                            by += branch_angle.sin() * (1.8 + ((s >> 16) as f32 / 65535.0) * 2.2);
+                            let br = 2 + ((s >> 16) as i32 % 4);
+                            let bix = bx as i32;
+                            let biy = by as i32;
+                            for dy in -br..=br {
+                                for dx in -br..=br {
+                                    if dx * dx + dy * dy <= br * br {
+                                        t.set(bix + dx, biy + dy, AIR);
+                                    }
+                                }
+                            }
                         }
                     }
                 }

@@ -166,7 +166,7 @@ impl Weapon {
             Weapon::BananaBomb => 10.0,
             Weapon::HolyHandGrenade => 7.0,
             Weapon::HomingMissile => 15.0,
-            Weapon::Mortar => 11.0,
+            Weapon::Mortar => 41.0,
             Weapon::Sheep => 5.0,
             Weapon::SniperRifle => 1000.0,
             Weapon::BananaBonanza => 10.0,
@@ -332,7 +332,7 @@ impl Weapon {
     pub fn description(&self) -> &str {
         match self {
             Weapon::Bazooka => "Direct fire explosive. No bounce.",
-            Weapon::Grenade => "Bounces before exploding after 3s",
+            Weapon::Grenade => "Bounces 3 times before exploding",
             Weapon::Shotgun => "Fires 6 pellets in a spread",
             Weapon::ClusterBomb => "Splits into 5 bomblets on impact",
             Weapon::BananaBomb => "Bounces 5x, clusters into 6 bombs",

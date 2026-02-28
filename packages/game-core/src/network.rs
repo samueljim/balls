@@ -54,11 +54,28 @@ impl NetworkState {
             let _ = msg;
         }
     }
+
+    /// Dispatch a UI event (hit, died, turn_start, game_over) to the JS layer.
+    /// The JS side listens and converts this into React toast notifications.
+    pub fn send_game_event(&self, event_json: &str) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let bytes = event_json.as_bytes();
+            unsafe {
+                js_game_event(bytes.as_ptr(), bytes.len() as u32);
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = event_json;
+        }
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
 extern "C" {
     fn js_send_ws(ptr: *const u8, len: u32);
+    fn js_game_event(ptr: *const u8, len: u32);
 }
 
 #[no_mangle]

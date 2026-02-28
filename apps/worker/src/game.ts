@@ -161,15 +161,21 @@ export class Game implements DurableObject {
           }));
         } catch (_) {}
       }
-      // Send game_resync: full snapshot including phase and turn timer remaining
+      // Send game_resync: full snapshot including phase and turn timer remaining.
+      // Only include ball positions once the game has actually progressed and the
+      // server has received real positions from the active player.  On a fresh game
+      // start, ballSnapshots are all (0,0), and including them would overwrite the
+      // deterministic spawn positions the client already computed from the seed.
       const turnTimeRemainingMs = Math.max(0, this.gameState.turnEndTime - Date.now());
+      const gameHasProgressed = this.gameState.inputLog.length > 0 || this.gameState.currentTurnIndex > 0;
       try {
         server.send(JSON.stringify({
           type: "game_resync",
           phase: this.gameState.phase,
           currentTurnIndex: this.gameState.currentTurnIndex,
           turnTimeRemainingMs,
-          balls: this.ballSnapshots,
+          // Only ship authoritative ball data once we have real positions from clients
+          balls: gameHasProgressed ? this.ballSnapshots : undefined,
         }));
       } catch (_) {}
     }
@@ -180,6 +186,14 @@ export class Game implements DurableObject {
   }
 
   private broadcast(msg: { type: string; [k: string]: unknown }): void {
+    // Inject a relative turnTimeRemainingMs alongside any absolute turnEndTime so
+    // WASM clients don't need wall-clock math to compute the remaining time.
+    if (msg.type === "state") {
+      const state = msg.state as Partial<GameState> | undefined;
+      if (state && typeof state.turnEndTime === "number") {
+        (msg as Record<string, unknown>).turnTimeRemainingMs = Math.max(0, state.turnEndTime - Date.now());
+      }
+    }
     const data = JSON.stringify(msg);
     for (const ws of this.sockets.values()) {
       try {

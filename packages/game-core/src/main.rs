@@ -21,6 +21,8 @@ const TURN_TIME: f32 = 45.0;
 const TURN_END_DELAY: f32 = 1.5;
 const SETTLE_TIMEOUT: f32 = 5.0;
 const CHARGE_SPEED: f32 = 55.0;
+/// Default camera zoom level. Values > 1 mean “more zoomed in” relative to BASE_SHORT_AXIS.
+const DEFAULT_ZOOM: f32 = 2.0;
 
 #[cfg(target_arch = "wasm32")]
 extern "C" {
@@ -72,6 +74,10 @@ struct Game {
     build_wall_anchor: Option<(f32, f32)>,
     /// Airstrike or NapalmStrike waiting for a click-target. Stores which weapon.
     airstrike_mode: Option<Weapon>,
+    /// Cumulative log of wall placements for reconnect sync: (ax, ay, angle_mrad)
+    wall_log: Vec<(i32, i32, i32)>,
+    /// Cumulative log of drill tunnels for reconnect sync: (bx, by, angle_mrad)
+    drill_log: Vec<(i32, i32, i32)>,
     /// Countdown before bot fires (resets each turn)
     bot_think_timer: f32,
 
@@ -88,6 +94,9 @@ struct Game {
     /// After cam_free_timer expires, glide back to the action over this many seconds.
     /// Speed ramps up from ~5 % to 100 % as this timer counts down to 0.
     cam_return_timer: f32,
+    /// Zoom level the camera smoothly returns to when cam_return_timer is active.
+    /// Reset to DEFAULT_ZOOM on every turn start.
+    cam_target_zoom: f32,
 
     wind: f32,
     rng_state: u32,
@@ -124,6 +133,10 @@ struct Game {
     last_logged_turn_state: (usize, Option<usize>),
     /// Track which ball index was last used per team for round-robin rotation
     last_ball_per_team: Vec<Option<usize>>,
+    /// Watchdog: seconds spent in ProjectileFlying/Retreat; force-ends turn if too long
+    stuck_phase_timer: f32,
+    /// Per-ball cooldown (seconds) for game-event toasts — prevents spam from fires/DoT
+    ball_event_cooldown: Vec<f32>,
 }
 
 impl Game {
@@ -268,6 +281,8 @@ impl Game {
             build_wall_mode: false,
             build_wall_anchor: None,
             airstrike_mode: None,
+            wall_log: Vec::new(),
+            drill_log: Vec::new(),
             bot_think_timer: 1.5,
             cam: GameCamera::new(cam_x, cam_y),
             panning: false,
@@ -276,6 +291,7 @@ impl Game {
             left_drag_panning: false,
             cam_free_timer: 0.0,
             cam_return_timer: 0.0,
+            cam_target_zoom: DEFAULT_ZOOM,
             wind,
             rng_state: rng,
             particles: Vec::new(),
@@ -297,6 +313,8 @@ impl Game {
             },
             last_logged_turn_state: (0, None),
             retreat_timer: 0.0,
+            stuck_phase_timer: 0.0,
+            ball_event_cooldown: vec![0.0; num_teams * 3],
             last_ball_per_team: {
                 // Pre-record that ball 0 (team 0's first ball) is the initial
                 // current_ball, so the next sync_to_player_turn(0) knows to
@@ -447,12 +465,42 @@ impl Game {
         if wheel.abs() > 0.1 {
             if self.weapon_menu_open {
                 let layout = hud::WeaponMenuLayout::new();
-                self.weapon_menu_scroll = (self.weapon_menu_scroll - wheel * 30.0)
+                // Normalize scroll so it feels consistent across input devices:
+                //   - Desktop mouse (Windows/Linux): browser deltaY ≈ ±100 per notch → snap one item
+                //   - macOS trackpad / mobile swipe: small deltas (≤5) → smooth proportional scroll
+                let item_step = layout.item_h + layout.item_padding;
+                let delta = if wheel.abs() > 5.0 {
+                    wheel.signum() * item_step   // one item per scroll click
+                } else {
+                    wheel * (item_step / 3.0)    // smooth trackpad / touch swipe
+                };
+                self.weapon_menu_scroll = (self.weapon_menu_scroll - delta)
                     .clamp(0.0, layout.max_scroll());
             } else {
-                let factor = if wheel > 0.0 { 1.1 } else { 1.0 / 1.1 };
-                self.cam.zoom_by(factor);
+                // Smooth trackpad pinch / fine scroll wheel use a proportional factor;
+                // discrete mouse clicks (large delta) snap by a fixed step.
+                let factor = if wheel.abs() > 5.0 {
+                    // Discrete mouse wheel notch
+                    if wheel > 0.0 { 1.15 } else { 1.0 / 1.15 }
+                } else {
+                    // Continuous trackpad — proportional zoom so it feels silky
+                    1.0 + wheel * 0.015
+                };
+                // Zoom toward the cursor position so the point under the mouse stays put
+                self.cam.zoom_toward_screen_point(mx, my, factor);
+                // Pin cam_target_zoom to the new level so the auto-return lerp doesn't fight
+                self.cam_target_zoom = self.cam.zoom;
             }
+        }
+
+        // Keyboard zoom: + / = to zoom in, - to zoom out (toward screen centre)
+        if is_key_pressed(KeyCode::Equal) || is_key_pressed(KeyCode::KpAdd) {
+            self.cam.zoom_by(1.25);
+            self.cam_target_zoom = self.cam.zoom;
+        }
+        if is_key_pressed(KeyCode::Minus) || is_key_pressed(KeyCode::KpSubtract) {
+            self.cam.zoom_by(1.0 / 1.25);
+            self.cam_target_zoom = self.cam.zoom;
         }
 
         if self.phase == Phase::GameOver {
@@ -475,8 +523,8 @@ impl Game {
             // During ProjectileFlying the non-active player can also move; use
             // find_ball_for_player so they control one of their own balls.
             let ball_idx_opt = if self.phase == Phase::Retreat {
-                // Always the ball that fired (current_ball)
-                Some(self.current_ball)
+                // Only let the local human player retreat their own ball; block bot turns
+                if self.is_my_turn() { Some(self.current_ball) } else { None }
             } else if self.net.connected {
                 self.net.my_player_index.and_then(|pi| self.find_ball_for_player(pi))
             } else {
@@ -740,6 +788,25 @@ impl Game {
                     self.has_fired = true;
                     self.phase = Phase::Settling;
                     self.settle_timer = 0.0;
+                    // Record in wall log for reconnect sync
+                    self.wall_log.push((ax as i32, ay as i32, (angle * 1000.0) as i32));
+                    // Sync wall placement to other players
+                    if self.net.connected {
+                        let input_json = format!(
+                            r#"{{"BuildWallPlace":{{"ax":{},"ay":{},"angle":{}}}}}"#,
+                            ax, ay, angle
+                        );
+                        let mut escaped = String::new();
+                        for c in input_json.chars() {
+                            match c {
+                                '"' => escaped.push_str("\\\""),
+                                '\\' => escaped.push_str("\\\\"),
+                                _ => escaped.push(c),
+                            }
+                        }
+                        let msg = format!(r#"{{"type":"input","input":"{}"}}"#, escaped);
+                        self.net.send_message(&msg);
+                    }
                 }
             }
             // Handle Airstrike / NapalmStrike click-targeting
@@ -781,6 +848,31 @@ impl Game {
                 self.airstrike_mode = None;
                 self.has_fired = true;
                 self.phase = Phase::ProjectileFlying;
+                // Fresh budget so the active player can dodge during the airstrike
+                if self.current_ball < self.balls.len() {
+                    self.balls[self.current_ball].reset_movement_budget();
+                }
+                // Sync airstrike target to other players
+                if self.net.connected {
+                    let weapon_name = match airstrike_weapon {
+                        Weapon::NapalmStrike => "NapalmStrike",
+                        _ => "Airstrike",
+                    };
+                    let input_json = format!(
+                        r#"{{"AirstrikeTarget":{{"weapon":"{}","x":{}}}}}"#,
+                        weapon_name, target_x
+                    );
+                    let mut escaped = String::new();
+                    for c in input_json.chars() {
+                        match c {
+                            '"' => escaped.push_str("\\\""),
+                            '\\' => escaped.push_str("\\\\"),
+                            _ => escaped.push(c),
+                        }
+                    }
+                    let msg = format!(r#"{{"type":"input","input":"{}"}}"#, escaped);
+                    self.net.send_message(&msg);
+                }
             }
             // Handle Teleport mode
             else if self.teleport_mode {
@@ -803,6 +895,23 @@ impl Game {
                     self.has_fired = true;
                     self.phase = Phase::Settling;
                     self.settle_timer = 0.0;
+                    // Sync teleport destination to other players
+                    if self.net.connected {
+                        let input_json = format!(
+                            r#"{{"TeleportTo":{{"x":{},"y":{}}}}}"#,
+                            target_x, target_y
+                        );
+                        let mut escaped = String::new();
+                        for c in input_json.chars() {
+                            match c {
+                                '"' => escaped.push_str("\\\""),
+                                '\\' => escaped.push_str("\\\\"),
+                                _ => escaped.push(c),
+                            }
+                        }
+                        let msg = format!(r#"{{"type":"input","input":"{}"}}"#, escaped);
+                        self.net.send_message(&msg);
+                    }
                 }
             }
             // Handle Baseball Bat mode
@@ -841,6 +950,23 @@ impl Game {
                     self.has_fired = true;
                     self.phase = Phase::Settling;
                     self.settle_timer = 0.0;
+                    // Sync bat swing to other players
+                    if self.net.connected {
+                        let input_json = format!(
+                            r#"{{"BatSwing":{{"angle":{}}}}}"#,
+                            angle
+                        );
+                        let mut escaped = String::new();
+                        for c in input_json.chars() {
+                            match c {
+                                '"' => escaped.push_str("\\\""),
+                                '\\' => escaped.push_str("\\\\"),
+                                _ => escaped.push(c),
+                            }
+                        }
+                        let msg = format!(r#"{{"type":"input","input":"{}"}}"#, escaped);
+                        self.net.send_message(&msg);
+                    }
                 }
             }
             // Normal weapon charging
@@ -875,7 +1001,13 @@ impl Game {
         self.cam_free_timer = 0.0;    // always follow the action when firing
         self.cam_return_timer = 0.0;   // skip the glide-back phase too
         self.do_fire(idx, angle, power, weapon);
-        
+
+        // Give the firing player a fresh movement budget so they can dodge
+        // while the projectile is in the air.
+        if self.phase == Phase::ProjectileFlying && idx < self.balls.len() {
+            self.balls[idx].reset_movement_budget();
+        }
+
         // Don't set has_fired for Baseball Bat, Teleport, and BuildWall - they need a second click
         if weapon != Weapon::BaseballBat && weapon != Weapon::Teleport && weapon != Weapon::BuildWall
             && weapon != Weapon::Airstrike && weapon != Weapon::NapalmStrike {
@@ -889,12 +1021,24 @@ impl Game {
         }
 
         if self.net.connected {
-            let angle_deg = angle.to_degrees();
-            let weapon_name = weapon.name();
-            let input_json = format!(
-                r#"{{"Fire":{{"weapon":"{}","angle_deg":{},"power_percent":{}}}}}"#,
-                weapon_name, angle_deg, power
-            );
+            // Drill: send exact ball origin so all clients carve the identical tunnel.
+            // Generic Fire message would make remotes use their own (potentially different)
+            // ball position. DrillFire is broadcast just like any other input type.
+            let input_json = if weapon == Weapon::Drill && idx < self.balls.len() {
+                let bx = self.balls[idx].x as i32;
+                let by = self.balls[idx].y as i32;
+                format!(
+                    r#"{{"DrillFire":{{"bx":{},"by":{},"angle":{}}}}}"#,
+                    bx, by, angle
+                )
+            } else {
+                let angle_deg = angle.to_degrees();
+                let weapon_name = weapon.name();
+                format!(
+                    r#"{{"Fire":{{"weapon":"{}","angle_deg":{},"power_percent":{}}}}}"#,
+                    weapon_name, angle_deg, power
+                )
+            };
             let mut escaped = String::new();
             for c in input_json.chars() {
                 match c {
@@ -978,7 +1122,7 @@ impl Game {
                 // Stay in Aiming phase; droplets spawn on click
             },
             
-            // Dynamite - place at ball position
+            // Dynamite - place at ball position, then retreat so player can run
             Weapon::Dynamite => {
                 self.placed_explosives.push(PlacedExplosive {
                     x: ball.x,
@@ -988,7 +1132,11 @@ impl Game {
                     radius: 45.0,
                     damage: 50,
                 });
-                self.phase = Phase::ProjectileFlying;
+                self.phase = Phase::Retreat;
+                self.retreat_timer = 5.0;
+                if self.current_ball < self.balls.len() {
+                    self.balls[self.current_ball].reset_movement_budget();
+                }
             },
             
             // Baseball Bat - enter melee mode
@@ -1005,28 +1153,13 @@ impl Game {
 
             // Drill - carve a large tunnel instantly along aim direction
             Weapon::Drill => {
-                let cos_a = angle.cos();
-                let sin_a = angle.sin();
-                let perp_x = -sin_a;
-                let perp_y =  cos_a;
-                let tunnel_back: i32 = 30;   // carve 30px behind barrel
-                let tunnel_fwd:  i32 = 250;  // carve 250px forward
-                let half_w:      i32 = 30;   // 60px total width
                 let bx = self.balls[idx].x;
                 let by = self.balls[idx].y;
-                for along in -tunnel_back..=tunnel_fwd {
-                    for perp in -half_w..=half_w {
-                        let cx = (bx + cos_a * along as f32 + perp_x * perp as f32) as i32;
-                        let cy = (by + sin_a * along as f32 + perp_y * perp as f32) as i32;
-                        if cx >= 0 && cx < self.terrain.width as i32
-                            && cy >= 0 && cy < self.terrain.height as i32 {
-                            self.terrain.set(cx, cy, 0); // AIR
-                        }
-                    }
-                }
-                self.terrain_dirty = true;
+                self.apply_drill_at(bx, by, angle);
                 self.phase = Phase::Settling;
                 self.settle_timer = 0.0;
+                // Record in drill log for reconnect sync
+                self.drill_log.push((bx as i32, by as i32, (angle * 1000.0) as i32));
             },
 
             // Teleport - enter teleport mode
@@ -1135,6 +1268,36 @@ impl Game {
                 self.settle_timer = 0.0;
             },
 
+            // Mine - place at ball position as a timed trap, then retreat
+            Weapon::Mine => {
+                self.placed_explosives.push(PlacedExplosive {
+                    x: ball.x,
+                    y: ball.y + BALL_RADIUS - 2.0,
+                    fuse: 3.0,
+                    alive: true,
+                    radius: 30.0,
+                    damage: 45,
+                });
+                self.phase = Phase::Retreat;
+                self.retreat_timer = 5.0;
+                if self.current_ball < self.balls.len() {
+                    self.balls[self.current_ball].reset_movement_budget();
+                }
+            },
+
+            // Mortar - fire as projectile but enter Retreat immediately so player
+            // can move while the shell (and its cluster bomblets) are in flight.
+            Weapon::Mortar => {
+                let shooter_team = self.balls[idx].team;
+                let proj = Projectile::new(sx, sy, angle, power, weapon, shooter_team);
+                self.proj = Some(proj);
+                self.phase = Phase::Retreat;
+                self.retreat_timer = 5.0;
+                if self.current_ball < self.balls.len() {
+                    self.balls[self.current_ball].reset_movement_budget();
+                }
+            },
+
             // All other weapons use regular projectile
             _ => {
                 let shooter_team = self.balls[idx].team;
@@ -1154,10 +1317,11 @@ impl Game {
             let msg = format!("[TURN] end_turn called, is_my_turn={}, connected={}\0", self.is_my_turn(), self.net.connected);
             unsafe { console_log(msg.as_ptr()); }
         }
-        let current_turn_is_bot = self.net.player_is_bot.get(self.current_turn_index).copied().unwrap_or(false);
-        if self.net.connected && (self.is_my_turn() || current_turn_is_bot) {
-            // Send ball state snapshot so opponent syncs positions/health
+        if self.net.connected {
+            // Always send—the worker ignores end_turn from non-active players,
+            // so it is safe to call unconditionally and removes a class of race conditions.
             self.send_ball_state();
+            self.send_terrain_damages();
             self.net.send_message(r#"{"type":"end_turn"}"#);
         }
         self.phase = Phase::TurnEnd;
@@ -1181,31 +1345,107 @@ impl Game {
         self.net.send_message(&msg);
     }
 
-    /// Send the full terrain damage log to the server for persistence across reconnects
+    /// Carve a drill tunnel at the given ball origin and angle.
+    /// Used by both do_fire (local) and the DrillFire network receive handler (remote)
+    /// so all clients carve the exact same tunnel at the same world coordinates.
+    fn apply_drill_at(&mut self, bx: f32, by: f32, angle: f32) {
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+        let perp_x = -sin_a;
+        let perp_y =  cos_a;
+        let tunnel_back: f32 = 30.0;
+        let tunnel_fwd:  f32 = 260.0;
+        let half_w:      f32 = 35.0;   // 70px wide — clean enough for any worm to pass
+
+        // Compute the 4 corners of the rotated rectangle in world space
+        let corners = [
+            (bx + cos_a * (-tunnel_back) + perp_x * (-half_w),
+             by + sin_a * (-tunnel_back) + perp_y * (-half_w)),
+            (bx + cos_a * (-tunnel_back) + perp_x * half_w,
+             by + sin_a * (-tunnel_back) + perp_y * half_w),
+            (bx + cos_a * tunnel_fwd + perp_x * (-half_w),
+             by + sin_a * tunnel_fwd + perp_y * (-half_w)),
+            (bx + cos_a * tunnel_fwd + perp_x * half_w,
+             by + sin_a * tunnel_fwd + perp_y * half_w),
+        ];
+        // Axis-aligned bounding box of those corners
+        let bb_min_x = corners.iter().map(|c| c.0).fold(f32::INFINITY, f32::min).floor() as i32 - 1;
+        let bb_max_x = corners.iter().map(|c| c.0).fold(f32::NEG_INFINITY, f32::max).ceil()  as i32 + 1;
+        let bb_min_y = corners.iter().map(|c| c.1).fold(f32::INFINITY, f32::min).floor() as i32 - 1;
+        let bb_max_y = corners.iter().map(|c| c.1).fold(f32::NEG_INFINITY, f32::max).ceil()  as i32 + 1;
+
+        let w = self.terrain.width as i32;
+        let h = self.terrain.height as i32;
+        let mut min_x = i32::MAX; let mut max_x = i32::MIN;
+        let mut min_y = i32::MAX; let mut max_y = i32::MIN;
+
+        // Iterate over every pixel in the bounding box and test inclusion in the
+        // rotated rectangle using dot-products. This guarantees no pixels are missed
+        // regardless of tunnel angle, unlike iterating in rotated-space and truncating.
+        for px in bb_min_x.max(0)..=bb_max_x.min(w - 1) {
+            for py in bb_min_y.max(0)..=bb_max_y.min(h - 1) {
+                let dx = px as f32 - bx;
+                let dy = py as f32 - by;
+                // Project onto tunnel axis and perpendicular axis
+                let along = dx * cos_a  + dy * sin_a;
+                let perp  = dx * perp_x + dy * perp_y;
+                if along >= -tunnel_back && along <= tunnel_fwd
+                    && perp >= -half_w && perp <= half_w
+                {
+                    self.terrain.set(px, py, terrain::AIR);
+                    if px < min_x { min_x = px; }
+                    if px > max_x { max_x = px; }
+                    if py < min_y { min_y = py; }
+                    if py > max_y { max_y = py; }
+                }
+            }
+        }
+        // Regrow grass on surfaces newly exposed around the tunnel edges
+        if min_x <= max_x && min_y <= max_y {
+            self.terrain.refresh_grass_in_area(min_x, min_y, max_x, max_y);
+        }
+        self.terrain_dirty = true;
+    }
+
+    /// Send the full terrain ops log to the server for persistence across reconnects.
+    /// Format: [[type,a,b,c],...] where type 0=explosion, 1=drill, 2=wall.
     fn send_terrain_damages(&self) {
-        let log = &self.terrain.damage_log;
-        if log.is_empty() {
+        let explosions = &self.terrain.damage_log;
+        let total = explosions.len() + self.wall_log.len() + self.drill_log.len();
+        if total == 0 {
             return;
         }
         let mut arr = String::from("[");
-        for (i, &(cx, cy, r)) in log.iter().enumerate() {
-            if i > 0 { arr.push(','); }
-            arr.push_str(&format!("[{},{},{}]", cx, cy, r));
+        let mut first = true;
+        for &(cx, cy, r) in explosions.iter() {
+            if !first { arr.push(','); }
+            arr.push_str(&format!("[0,{},{},{}]", cx, cy, r));
+            first = false;
+        }
+        for &(bx, by, amrad) in self.drill_log.iter() {
+            if !first { arr.push(','); }
+            arr.push_str(&format!("[1,{},{},{}]", bx, by, amrad));
+            first = false;
+        }
+        for &(ax, ay, amrad) in self.wall_log.iter() {
+            if !first { arr.push(','); }
+            arr.push_str(&format!("[2,{},{},{}]", ax, ay, amrad));
+            first = false;
         }
         arr.push(']');
         let msg = format!("{{\"type\":\"terrain_damages\",\"log\":{}}}", arr);
         self.net.send_message(&msg);
     }
 
-    /// Apply terrain damage log received from server on reconnect
+    /// Apply terrain ops log received from server on reconnect.
+    /// Handles [0,cx,cy,r] explosions, [1,bx,by,amrad] drills, [2,ax,ay,amrad] walls.
+    /// Also handles legacy 3-element [cx,cy,r] entries (old format = explosion).
     fn apply_terrain_sync(&mut self, msg: &str) {
-        // Format: {"type":"terrain_sync","log":[[cx,cy,r],[cx,cy,r],...]}
         let key = "\"log\":[";
         let start = match msg.find(key) {
             Some(i) => i + key.len(),
             None => return,
         };
-        // Find the matching closing bracket
         let mut depth = 1i32;
         let mut end = start;
         for (i, ch) in msg[start..].char_indices() {
@@ -1213,24 +1453,17 @@ impl Game {
                 '[' => depth += 1,
                 ']' => {
                     depth -= 1;
-                    if depth == 0 {
-                        end = start + i;
-                        break;
-                    }
+                    if depth == 0 { end = start + i; break; }
                 }
                 _ => {}
             }
         }
         let content = &msg[start..end];
-        if content.is_empty() {
-            return;
-        }
+        if content.is_empty() { return; }
 
-        // Parse array of [cx,cy,r] triples
-        let mut damages: Vec<(i32, i32, i32)> = Vec::new();
+        let mut explosions: Vec<(i32, i32, i32)> = Vec::new();
         let mut pos = 0;
         while pos < content.len() {
-            // Find next sub-array
             let sub_start = match content[pos..].find('[') {
                 Some(i) => pos + i + 1,
                 None => break,
@@ -1239,27 +1472,58 @@ impl Game {
                 Some(i) => sub_start + i,
                 None => break,
             };
-            let triple = &content[sub_start..sub_end];
-            let nums: Vec<&str> = triple.split(',').collect();
-            if nums.len() == 3 {
-                if let (Ok(cx), Ok(cy), Ok(r)) = (
-                    nums[0].trim().parse::<i32>(),
-                    nums[1].trim().parse::<i32>(),
-                    nums[2].trim().parse::<i32>(),
-                ) {
-                    damages.push((cx, cy, r));
+            let entry = &content[sub_start..sub_end];
+            let nums: Vec<i32> = entry.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            match nums.as_slice() {
+                // Legacy 3-element = explosion
+                [cx, cy, r] => { explosions.push((*cx, *cy, *r)); }
+                // type 0 = explosion
+                [0, cx, cy, r] => { explosions.push((*cx, *cy, *r)); }
+                // type 1 = drill tunnel
+                [1, bx, by, amrad] => {
+                    let bxf = *bx as f32; let byf = *by as f32;
+                    let angle = *amrad as f32 / 1000.0;
+                    self.apply_drill_at(bxf, byf, angle);
+                    // Track in log so this client can also upload it
+                    if !self.drill_log.iter().any(|&(x,y,a)| x==*bx && y==*by && a==*amrad) {
+                        self.drill_log.push((*bx, *by, *amrad));
+                    }
                 }
+                // type 2 = build wall
+                [2, ax, ay, amrad] => {
+                    let ax = *ax as f32; let ay = *ay as f32;
+                    let angle = *amrad as f32 / 1000.0;
+                    let cos_a = angle.cos(); let sin_a = angle.sin();
+                    let half_len = 35i32; let half_thick = 4i32;
+                    for i in -half_len..=half_len {
+                        for j in -half_thick..=half_thick {
+                            let wx = (ax + i as f32 * cos_a - j as f32 * sin_a).round() as i32;
+                            let wy = (ay + i as f32 * sin_a + j as f32 * cos_a).round() as i32;
+                            if wx >= 0 && wx < self.terrain.width as i32
+                                && wy >= 0 && wy < self.terrain.height as i32 {
+                                self.terrain.set(wx, wy, terrain::WOOD);
+                            }
+                        }
+                    }
+                    self.terrain_dirty = true;
+                    // Track in log so this client can also upload it
+                    let aix = ax as i32; let aiy = ay as i32;
+                    if !self.wall_log.iter().any(|&(x,y,a)| x==aix && y==aiy && a==*amrad) {
+                        self.wall_log.push((aix, aiy, *amrad));
+                    }
+                }
+                _ => {}
             }
             pos = sub_end + 1;
         }
 
-        if !damages.is_empty() {
+        if !explosions.is_empty() {
             #[cfg(target_arch = "wasm32")]
             {
-                let debug_msg = format!("[SYNC] Replaying {} terrain damage events\0", damages.len());
+                let debug_msg = format!("[SYNC] Replaying {} terrain ops\0", explosions.len());
                 unsafe { console_log(debug_msg.as_ptr()); }
             }
-            self.terrain.replay_damage(&damages);
+            self.terrain.replay_damage(&explosions);
             self.terrain_dirty = true;
         }
     }
@@ -1352,6 +1616,11 @@ impl Game {
             }
         }
         self.current_ball = next;
+        // CRITICAL: keep current_turn_index in sync with the ball's team so that
+        // is_my_turn() remains accurate when advance_turn() is used as a fallback.
+        if next < self.balls.len() {
+            self.current_turn_index = self.balls[next].team as usize;
+        }
         self.reset_turn_state();
     }
 
@@ -1423,6 +1692,19 @@ impl Game {
     }
 
     fn reset_turn_state(&mut self) {
+        // Emit turn_start event so the UI can show whose turn it is
+        if self.current_ball < self.balls.len() {
+            let ball = &self.balls[self.current_ball];
+            let player_name = self.net.player_names
+                .get(ball.team as usize)
+                .cloned()
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| ball.name.clone());
+            let event = format!("{{\"type\":\"turn_start\",\"name\":\"{}\",\"ball\":\"{}\"}}",
+                sanitize_event_name(&player_name),
+                sanitize_event_name(&ball.name));
+            self.net.send_game_event(&event);
+        }
         self.phase = Phase::Aiming;
         self.turn_timer = TURN_TIME;
         self.has_fired = false;
@@ -1435,6 +1717,7 @@ impl Game {
         self.build_wall_anchor = None;
         self.airstrike_mode = None;
         self.bot_think_timer = 1.5;
+        self.stuck_phase_timer = 0.0;
         
         // Reset movement budget for the current ball
         if self.current_ball < self.balls.len() {
@@ -1448,6 +1731,14 @@ impl Game {
         
         self.rng_state = lcg(self.rng_state);
         self.wind = ((self.rng_state >> 16) as f32 / 65536.0 - 0.5) * 6.0;
+
+        // Snap camera back to the new active ball after every turn change.
+        // Clear free-look so auto_follow re-activates immediately, then start a
+        // 2-second glide so the transition feels smooth rather than instant.
+        // cam_target_zoom drives the zoom smoothly back to the default level.
+        self.cam_free_timer = 0.0;
+        self.cam_return_timer = 2.0;
+        self.cam_target_zoom = DEFAULT_ZOOM;
     }
 
     fn check_game_over(&mut self) -> bool {
@@ -1460,6 +1751,20 @@ impl Game {
         if alive_teams.len() <= 1 {
             self.phase = Phase::GameOver;
             self.winning_team = alive_teams.first().copied();
+            // Emit game_over event for UI toast
+            let winner_name = self.winning_team
+                .and_then(|t| self.net.player_names.get(t as usize).cloned())
+                .filter(|n| !n.is_empty())
+                .or_else(|| {
+                    // Fall back to ball name
+                    self.winning_team.and_then(|t| {
+                        self.balls.iter().find(|b| b.team == t).map(|b| b.name.clone())
+                    })
+                })
+                .unwrap_or_else(|| String::from("Someone"));
+            let event = format!("{{\"type\":\"game_over\",\"winner\":\"{}\"}}",
+                sanitize_event_name(&winner_name));
+            self.net.send_game_event(&event);
             return true;
         }
         false
@@ -1552,10 +1857,12 @@ impl Game {
                     // Always update our stored turn index
                     self.current_turn_index = player_index;
                     match self.phase {
-                        Phase::Aiming | Phase::Charging | Phase::TurnEnd | Phase::Retreat => {
+                        Phase::Aiming | Phase::Charging | Phase::TurnEnd => {
                             self.sync_to_player_turn(player_index);
                         }
                         _ => {
+                            // Defer during Retreat / ProjectileFlying / Settling so we
+                            // don't abort an in-progress retreat or mid-flight projectile.
                             self.pending_turn_sync = Some(player_index);
                         }
                     }
@@ -1581,6 +1888,21 @@ impl Game {
                     // otherwise only sync when the index changed.
                     let should_sync = self.just_reconnected || current_turn_index != self.current_turn_index;
                     self.just_reconnected = false;
+                    // Sync the local turn timer from the relative `turnTimeRemainingMs`
+                    // field injected by the server into every state broadcast.
+                    // This is reliable across clients since it's already a relative
+                    // duration, unlike the absolute epoch-ms `turnEndTime` whose
+                    // conversion requires wall-clock time (unavailable in WASM via
+                    // macroquad's get_time() which counts from program start).
+                    if let Some(remaining_ms) = parse_json_number(&msg, "turnTimeRemainingMs") {
+                        let remaining_s = (remaining_ms / 1000.0) as f32;
+                        self.turn_timer = remaining_s.min(TURN_TIME).max(0.0);
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            let debug_msg = format!("[NET] state: synced turn_timer from turnTimeRemainingMs -> {:.1}s\0", self.turn_timer);
+                            unsafe { console_log(debug_msg.as_ptr()); }
+                        }
+                    }
                     if should_sync {
                         self.current_turn_index = current_turn_index;
                         match self.phase {
@@ -1662,6 +1984,11 @@ impl Game {
                         if let Some((angle_rad, power, weapon)) = parse_fire_input(&input_str) {
                             self.do_fire(ball_idx, angle_rad, power, weapon);
                             self.has_fired = true;
+                            // Reset budget on the firing ball so remote players also get
+                            // a fresh dodge window once their shot is in the air.
+                            if self.phase == Phase::ProjectileFlying && ball_idx < self.balls.len() {
+                                self.balls[ball_idx].reset_movement_budget();
+                            }
                         } else if let Some(dir) = parse_walk_input(&input_str) {
                             if ball_idx < self.balls.len() {
                                 physics::walk(&mut self.balls[ball_idx], &self.terrain, dir);
@@ -1675,6 +2002,121 @@ impl Game {
                             if ball_idx < self.balls.len() {
                                 physics::backflip(&mut self.balls[ball_idx]);
                                 self.balls[ball_idx].movement_used += 30.0;
+                            }
+                        } else if input_str.contains("AirstrikeTarget") {
+                            // Spawn airstrike/napalm droplets for the remote player's click
+                            if let Some(target_x) = parse_json_number(&input_str, "x").map(|v| v as f32) {
+                                let weapon_name = parse_json_string(&input_str, "weapon").unwrap_or("Airstrike");
+                                self.airstrike_droplets.clear();
+                                if weapon_name.contains("Napalm") {
+                                    let spacing = 60.0;
+                                    for i in 0..7 {
+                                        let x = target_x + (i as f32 - 3.0) * spacing;
+                                        self.airstrike_droplets.push(AirstrikeDroplet {
+                                            x, y: -50.0, vy: 0.0, alive: true,
+                                            weapon_type: AirstrikeType::Napalm,
+                                        });
+                                    }
+                                } else {
+                                    let spacing = 80.0;
+                                    for i in 0..5 {
+                                        let x = target_x + (i as f32 - 2.0) * spacing;
+                                        self.airstrike_droplets.push(AirstrikeDroplet {
+                                            x, y: -50.0, vy: 0.0, alive: true,
+                                            weapon_type: AirstrikeType::Explosive,
+                                        });
+                                    }
+                                }
+                                self.has_fired = true;
+                                self.phase = Phase::ProjectileFlying;
+                                if ball_idx < self.balls.len() {
+                                    self.balls[ball_idx].reset_movement_budget();
+                                }
+                            }
+                        } else if input_str.contains("BuildWallPlace") {
+                            // Stamp the wall onto terrain for the remote player's placement
+                            let ax = parse_json_number(&input_str, "ax").map(|v| v as f32);
+                            let ay = parse_json_number(&input_str, "ay").map(|v| v as f32);
+                            let angle = parse_json_number(&input_str, "angle").map(|v| v as f32);
+                            if let (Some(ax), Some(ay), Some(angle)) = (ax, ay, angle) {
+                                let cos_a = angle.cos();
+                                let sin_a = angle.sin();
+                                let half_len = 35i32;
+                                let half_thick = 4i32;
+                                for i in -half_len..=half_len {
+                                    for j in -half_thick..=half_thick {
+                                        let wx = (ax + i as f32 * cos_a - j as f32 * sin_a).round() as i32;
+                                        let wy = (ay + i as f32 * sin_a + j as f32 * cos_a).round() as i32;
+                                        if wx >= 0 && wx < self.terrain.width as i32
+                                            && wy >= 0 && wy < self.terrain.height as i32 {
+                                            self.terrain.set(wx, wy, terrain::WOOD);
+                                        }
+                                    }
+                                }
+                                self.terrain_dirty = true;
+                                self.has_fired = true;
+                                self.phase = Phase::Settling;
+                                self.settle_timer = 0.0;
+                                // Record for reconnect sync
+                                self.wall_log.push((ax as i32, ay as i32, (angle * 1000.0) as i32));
+                            }
+                        } else if input_str.contains("TeleportTo") {
+                            // Move the remote player's ball to target position
+                            let tx = parse_json_number(&input_str, "x").map(|v| v as f32);
+                            let ty = parse_json_number(&input_str, "y").map(|v| v as f32);
+                            if let (Some(tx), Some(ty)) = (tx, ty) {
+                                if ball_idx < self.balls.len() && self.balls[ball_idx].alive {
+                                    self.balls[ball_idx].x = tx.clamp(0.0, self.terrain.width as f32);
+                                    self.balls[ball_idx].y = ty.clamp(0.0, self.terrain.height as f32);
+                                    self.balls[ball_idx].vx = 0.0;
+                                    self.balls[ball_idx].vy = 0.0;
+                                }
+                                self.has_fired = true;
+                                self.phase = Phase::Settling;
+                                self.settle_timer = 0.0;
+                            }
+                        } else if input_str.contains("BatSwing") {
+                            // Apply baseball bat knockback for the remote player's swing
+                            if let Some(angle) = parse_json_number(&input_str, "angle").map(|v| v as f32) {
+                                if ball_idx < self.balls.len() && self.balls[ball_idx].alive {
+                                    let ball_x = self.balls[ball_idx].x;
+                                    let ball_y = self.balls[ball_idx].y;
+                                    let bat_range = 100.0;
+                                    let knock_x = angle.cos() * 850.0;
+                                    let knock_y = angle.sin() * 850.0 - 300.0;
+                                    for i in 0..self.balls.len() {
+                                        if i == ball_idx || !self.balls[i].alive { continue; }
+                                        let dx = self.balls[i].x - ball_x;
+                                        let dy = self.balls[i].y - ball_y;
+                                        if (dx*dx + dy*dy).sqrt() < bat_range {
+                                            self.balls[i].apply_knockback(knock_x, knock_y);
+                                            self.balls[i].health = self.balls[i].health.saturating_sub(20);
+                                            if self.balls[i].health == 0 {
+                                                self.balls[i].alive = false;
+                                            }
+                                        }
+                                    }
+                                }
+                                self.has_fired = true;
+                                self.phase = Phase::Settling;
+                                self.settle_timer = 0.0;
+                            }
+                        } else if input_str.contains("DrillFire") {
+                            // Carve drill tunnel using the exact origin the active player sent
+                            let bx = parse_json_number(&input_str, "bx").map(|v| v as f32);
+                            let by = parse_json_number(&input_str, "by").map(|v| v as f32);
+                            let angle = parse_json_number(&input_str, "angle").map(|v| v as f32);
+                            if let (Some(bx), Some(by), Some(angle)) = (bx, by, angle) {
+                                self.apply_drill_at(bx, by, angle);
+                                // Track for reconnect sync (dedup)
+                                let bxi = bx as i32; let byi = by as i32;
+                                let amrad = (angle * 1000.0) as i32;
+                                if !self.drill_log.iter().any(|&(x,y,a)| x==bxi && y==byi && a==amrad) {
+                                    self.drill_log.push((bxi, byi, amrad));
+                                }
+                                self.has_fired = true;
+                                self.phase = Phase::Settling;
+                                self.settle_timer = 0.0;
                             }
                         }
                     }
@@ -1730,6 +2172,11 @@ impl Game {
     fn update(&mut self, dt: f32) {
         let dt = dt.min(1.0 / 30.0);
 
+        // Snapshot health/alive state before any updates so we can detect changes
+        let health_snapshot: Vec<(bool, i32)> = self.balls.iter()
+            .map(|b| (b.alive, b.health))
+            .collect();
+
         self.apply_network_messages();
 
         for p in &mut self.particles {
@@ -1743,6 +2190,18 @@ impl Game {
         // Apply camera inertia coast (runs every frame; bled away by auto_follow when active)
         self.cam.apply_momentum(dt);
 
+        // Smoothly return zoom toward the default level while the camera is gliding back
+        // to the active ball after a turn change. Not triggered by mid-turn panning.
+        if self.cam_return_timer > 0.0 {
+            let diff = self.cam_target_zoom - self.cam.zoom;
+            if diff.abs() > 0.005 {
+                let rate = (4.0 * dt).min(1.0);
+                self.cam.zoom += diff * rate;
+            } else {
+                self.cam.zoom = self.cam_target_zoom;
+            }
+        }
+
         // Tick napalm fire pools every frame (persist across turns)
         for fp in &mut self.fire_pools {
             fp.tick(&mut self.balls, dt);
@@ -1752,13 +2211,13 @@ impl Game {
         match self.phase {
             Phase::Aiming | Phase::Charging => {
                 self.turn_timer -= dt;
-                if self.turn_timer <= 0.0 && self.is_my_turn() {
+                let bot_team = self.current_turn_index;
+                let is_bot_turn = self.net.player_is_bot.get(bot_team).copied().unwrap_or(false);
+                if self.turn_timer <= 0.0 && (self.is_my_turn() || is_bot_turn) {
                     self.end_turn();
                 }
 
                 // ── Bot AI ──────────────────────────────────────────────────────
-                let bot_team = self.current_turn_index;
-                let is_bot_turn = self.net.player_is_bot.get(bot_team).copied().unwrap_or(false);
                 if is_bot_turn && !self.has_fired {
                     self.bot_think_timer -= dt;
                     if self.bot_think_timer <= 0.0 {
@@ -1998,6 +2457,22 @@ impl Game {
                 if proj_died || explosion_opt.is_some() {
                     self.proj = None;
                 }
+
+                // Stuck-phase watchdog: if projectile flying goes on too long, force-end
+                self.stuck_phase_timer += dt;
+                if self.stuck_phase_timer > 30.0 {
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let s = "[WATCHDOG] ProjectileFlying stuck >30s, force-ending turn\0";
+                        unsafe { console_log(s.as_ptr()); }
+                    }
+                    self.proj = None;
+                    self.shotgun_pellets.clear();
+                    self.uzi_bullets.clear();
+                    self.airstrike_droplets.clear();
+                    self.cluster_bomblets.clear();
+                    self.end_turn();
+                }
                 
                 if all_done {
                     self.phase = Phase::Settling;
@@ -2036,9 +2511,11 @@ impl Game {
                     if let Some(player_idx) = self.pending_turn_sync.take() {
                         self.sync_to_player_turn(player_idx);
                     } else if self.has_fired && self.is_my_turn() {
-                        // Send fresh ball state after settling
+                        // Send fresh ball state and full terrain ops after settling
                         if self.net.connected {
                             self.send_ball_state();
+                            // Upload terrain ops so server has drill/wall changes for reconnect sync
+                            self.send_terrain_damages();
                         }
                         // Active player: enter retreat phase - 5 seconds to move
                         self.phase = Phase::Retreat;
@@ -2076,19 +2553,82 @@ impl Game {
                     }
                     w.tick(&self.terrain, dt);
                 }
+
+                // Tick in-flight projectile (Mortar fires then enters Retreat so player
+                // can move while the shell is travelling)
+                let mut retreat_proj_follow: Option<(f32, f32)> = None;
+                let mut retreat_proj_died = false;
+                let mut retreat_proj_explosion = None;
+                if let Some(ref mut proj) = self.proj {
+                    let (explosion, bomblets) = proj.tick(&mut self.terrain, &mut self.balls, self.wind, dt);
+                    retreat_proj_follow = Some((proj.x, proj.y));
+                    retreat_proj_explosion = explosion;
+                    retreat_proj_died = !proj.alive;
+                    if !bomblets.is_empty() {
+                        self.cluster_bomblets.extend(bomblets);
+                    }
+                }
+                if retreat_proj_died { self.proj = None; }
+                if let Some(ref exp) = retreat_proj_explosion {
+                    self.spawn_explosion_particles(exp);
+                    self.terrain_dirty = true;
+                }
+
+                // Tick cluster bomblets spawned by Mortar during Retreat
+                if !self.cluster_bomblets.is_empty() {
+                    let mut explosions = Vec::new();
+                    for bomblet in &mut self.cluster_bomblets {
+                        if bomblet.alive {
+                            if let Some(exp) = bomblet.tick(&mut self.terrain, &mut self.balls, dt) {
+                                explosions.push(exp);
+                                self.terrain_dirty = true;
+                            }
+                        }
+                    }
+                    self.cluster_bomblets.retain(|b| b.alive);
+                    for exp in &explosions {
+                        self.spawn_explosion_particles(exp);
+                    }
+                }
+
+                // Tick fused placed explosives (Dynamite / Mine countdown)
+                if !self.placed_explosives.is_empty() {
+                    let mut explosions = Vec::new();
+                    for explosive in &mut self.placed_explosives {
+                        if explosive.tick(dt) {
+                            let exp = explosive.explode(&mut self.terrain, &mut self.balls);
+                            explosions.push(exp);
+                            self.terrain_dirty = true;
+                        }
+                    }
+                    self.placed_explosives.retain(|e| e.alive);
+                    for exp in &explosions {
+                        self.spawn_explosion_particles(exp);
+                    }
+                }
+
                 // If current ball died during retreat (fell in water/lava), end turn now
                 if self.current_ball < self.balls.len() && !self.balls[self.current_ball].alive {
                     self.retreat_timer = 0.0; // Force turn end
                 }
-                // Follow current ball with camera
-                if self.current_ball < self.balls.len() {
-                    let w = &self.balls[self.current_ball];
-                    if w.alive {
-                        self.cam.follow(w.x, w.y - 30.0, 4.0, dt);
+                // Follow projectile while in flight, otherwise follow current ball
+                if let Some((px, py)) = retreat_proj_follow {
+                    let rpx = px; let rpy = py;
+                    self.auto_follow(rpx, rpy, 7.0, dt);
+                } else if self.current_ball < self.balls.len() {
+                    let (wx, wy) = {
+                        let w = &self.balls[self.current_ball];
+                        (w.x, w.y)
+                    };
+                    if self.balls[self.current_ball].alive {
+                        self.cam.follow(wx, wy - 30.0, 4.0, dt);
                     }
                 }
-                // When retreat time expires, end the turn
-                if self.retreat_timer <= 0.0 {
+                // When retreat time expires AND all in-flight effects are resolved, end turn
+                let retreat_all_done = self.proj.is_none()
+                    && self.cluster_bomblets.is_empty()
+                    && self.placed_explosives.is_empty();
+                if self.retreat_timer <= 0.0 && retreat_all_done {
                     if let Some(player_idx) = self.pending_turn_sync.take() {
                         self.sync_to_player_turn(player_idx);
                     } else {
@@ -2205,6 +2745,38 @@ impl Game {
             self.terrain_texture = Texture2D::from_image(&self.terrain_image);
             self.terrain_texture.set_filter(FilterMode::Nearest);
             self.terrain_dirty = false;
+        }
+
+        // Detect damage/death and emit game events for UI toasts.
+        // Resize cooldown vec in case balls were re-created (new game).
+        if self.ball_event_cooldown.len() < self.balls.len() {
+            self.ball_event_cooldown.resize(self.balls.len(), 0.0);
+        }
+        for cd in &mut self.ball_event_cooldown {
+            if *cd > 0.0 { *cd -= dt; }
+        }
+        for (i, (&(was_alive, prev_hp), ball)) in health_snapshot.iter().zip(self.balls.iter()).enumerate() {
+            if !was_alive { continue; }
+            let cooldown = self.ball_event_cooldown.get(i).copied().unwrap_or(0.0);
+            if !ball.alive && cooldown <= 0.0 {
+                // Ball died this frame
+                let name = sanitize_event_name(&ball.name);
+                let event = format!("{{\"type\":\"died\",\"name\":\"{}\"}}", name);
+                self.net.send_game_event(&event);
+                if i < self.ball_event_cooldown.len() {
+                    self.ball_event_cooldown[i] = 5.0;
+                }
+            } else if ball.alive && ball.health < prev_hp && cooldown <= 0.0 {
+                let damage = prev_hp - ball.health;
+                if damage >= 5 {
+                    let name = sanitize_event_name(&ball.name);
+                    let event = format!("{{\"type\":\"hit\",\"name\":\"{}\",\"damage\":{},\"hp\":{}}}", name, damage, ball.health);
+                    self.net.send_game_event(&event);
+                    if i < self.ball_event_cooldown.len() {
+                        self.ball_event_cooldown[i] = 0.8;
+                    }
+                }
+            }
         }
     }
 
@@ -2896,6 +3468,19 @@ impl Game {
 
 fn lcg(s: u32) -> u32 {
     s.wrapping_mul(1103515245).wrapping_add(12345)
+}
+
+/// Escape a player/ball name for safe embedding in a JSON string value.
+fn sanitize_event_name(name: &str) -> String {
+    name.chars()
+        .flat_map(|c| match c {
+            '"'  => vec!['\\', '"'],
+            '\\' => vec!['\\', '\\'],
+            '\n' => vec!['\\', 'n'],
+            '\r' => vec!['\\', 'r'],
+            _    => vec![c],
+        })
+        .collect()
 }
 
 fn parse_state_turn_index(msg: &str) -> Option<usize> {

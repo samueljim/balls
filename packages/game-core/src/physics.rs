@@ -304,11 +304,18 @@ pub fn walk(ball: &mut Ball, terrain: &Terrain, dir: f32) {
     let nx = new_x as i32;
     let foot_y = (ball.y + r) as i32;
 
-    if terrain.is_solid((new_x + dir * r) as i32, ball.y as i32) {
+    // Check for any obstacle at center height OR at foot/lower-body level
+    let blocked_center = terrain.is_solid((new_x + dir * r) as i32, ball.y as i32);
+    let blocked_lower = terrain.is_solid((new_x + dir * r) as i32, (ball.y + r * 0.5) as i32);
+
+    if blocked_center || blocked_lower {
+        // Try to step up over small terrain bumps
         for climb in 1..=MAX_CLIMB {
             let test_y = ball.y as i32 - climb;
+            // Only require the forward path at the new height to be clear;
+            // avoid checking old-x overhead which incorrectly blocks step-overs
             if !terrain.is_solid((new_x + dir * r) as i32, test_y)
-                && !terrain.is_solid(nx, test_y - r as i32)
+                && !terrain.is_solid(nx, test_y - r as i32 + climb)
             {
                 ball.x = new_x;
                 ball.y = test_y as f32;

@@ -26,7 +26,7 @@ impl GameCamera {
         GameCamera {
             x,
             y,
-            zoom: 1.2,
+            zoom: 2.0,
             target_x: x,
             target_y: y,
             vel_x: 0.0,
@@ -88,7 +88,28 @@ impl GameCamera {
     }
 
     pub fn zoom_by(&mut self, factor: f32) {
-        self.zoom = (self.zoom * factor).clamp(0.4, 3.0);
+        self.zoom = (self.zoom * factor).clamp(0.3, 4.0);
+    }
+
+    /// Zoom by `factor` while keeping the world point currently under screen pixel
+    /// `(sx, sy)` stationary — Google-Maps-style zoom-toward-cursor.
+    pub fn zoom_toward_screen_point(&mut self, sx: f32, sy: f32, factor: f32) {
+        let sw = screen_width();
+        let sh = screen_height();
+        // World coords under the cursor *before* zoom
+        let fx = sx / sw - 0.5;
+        let fy = sy / sh - 0.5;
+        let world_x_before = self.x + self.visible_width() * fx;
+        let world_y_before = self.y + self.visible_height() * fy;
+        // Apply zoom
+        self.zoom = (self.zoom * factor).clamp(0.3, 4.0);
+        // Shift camera so the same world point remains under the cursor
+        let world_x_after = self.x + self.visible_width() * fx;
+        let world_y_after = self.y + self.visible_height() * fy;
+        self.x += world_x_before - world_x_after;
+        self.y += world_y_before - world_y_after;
+        self.target_x = self.x;
+        self.target_y = self.y;
     }
 
     /// World units visible horizontally.

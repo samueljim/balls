@@ -258,10 +258,12 @@ impl Projectile {
             }
 
             // Check if sheep touched any player ball → explode immediately
+            // Skip the shooter's own ball so the sheep doesn't blow up in their hands
             {
                 let hit_radius_sq = 18.0f32 * 18.0f32;
                 let sheep_hit = balls.iter().any(|w| {
                     if !w.alive { return false; }
+                    if w.team == self.shooter_team { return false; }
                     let dx = w.x - self.x;
                     let dy = w.y - self.y;
                     dx * dx + dy * dy < hit_radius_sq

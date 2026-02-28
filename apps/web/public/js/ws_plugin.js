@@ -89,13 +89,25 @@
         console.warn("[ws_plugin] send failed", e);
       }
     };
+
+    // Receives game UI events from WASM (hit, died, turn_start, game_over)
+    // and dispatches them to the React layer via a custom DOM event.
+    importObject.env.js_game_event = function (ptr, len) {
+      if (typeof wasm_memory === "undefined") return;
+      try {
+        var heap = new Uint8Array(wasm_memory.buffer, ptr, len);
+        var str = UTF8ToString(heap, 0, len);
+        var detail = JSON.parse(str);
+        window.dispatchEvent(new CustomEvent("game_event", { detail: detail }));
+      } catch (e) {
+        console.warn("[ws_plugin] js_game_event parse error", e);
+      }
+    };
   }
 
   function on_init() {
     if (!gameId || !playerOrder.length) return;
     console.log("[ws_plugin] on_init called: gameId=" + gameId + ", playerOrder.length=" + playerOrder.length);
-    ws = new WebSocket(getWsUrl("/game/" + gameId + "?playerId=" + encodeURIComponent(playerId)));
-    console.log("[ws_plugin] WebSocket created: " + getWsUrl("/game/" + gameId + "?playerId=" + encodeURIComponent(playerId)));
 
     var names = [];
     var bots = [];
@@ -142,40 +154,68 @@
       }
     }
 
-    ws.onopen = function () {
-      console.log("[ws_plugin] WebSocket OPENED");
-      // Use seed from lobby (via sessionStorage from game_started), then server identity, then fallback
-      var seedToSend = lobbyRngSeed !== null ? lobbyRngSeed : (serverRngSeed !== null ? serverRngSeed : fallbackSeed);
-      console.log("[ws_plugin] POST /init with rngSeed=" + seedToSend);
-      fetch(getHttpBase() + "/game/" + gameId + "/init", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ playerOrder: playerOrder, rngSeed: seedToSend, terrainId: 0 }),
-      }).then(function(r) { 
-        console.log("[ws_plugin] /init response:", r.status);
-      }).catch(function (e) { 
-        console.warn("[ws_plugin] init POST failed", e); 
-      });
-    };
+    var reconnectDelay = 1000;
+    var reconnectTimer = null;
 
-    ws.onmessage = function (event) {
+    function scheduleReconnect() {
+      if (reconnectTimer) return; // already scheduled
+      console.log("[ws_plugin] Reconnecting in " + reconnectDelay + "ms");
+      reconnectTimer = setTimeout(function () {
+        reconnectTimer = null;
+        connect();
+      }, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 16000); // cap at 16 s
+    }
+
+    function connect() {
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+      ws = new WebSocket(getWsUrl("/game/" + gameId + "?playerId=" + encodeURIComponent(playerId)));
+      console.log("[ws_plugin] WebSocket connecting: " + ws.url);
+
+      ws.onopen = function () {
+        console.log("[ws_plugin] WebSocket OPENED");
+        reconnectDelay = 1000; // reset backoff on successful connect
+        var seedToSend = lobbyRngSeed !== null ? lobbyRngSeed : (serverRngSeed !== null ? serverRngSeed : fallbackSeed);
+        console.log("[ws_plugin] POST /init with rngSeed=" + seedToSend);
+        fetch(getHttpBase() + "/game/" + gameId + "/init", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ playerOrder: playerOrder, rngSeed: seedToSend, terrainId: 0 }),
+        }).then(function(r) {
+          console.log("[ws_plugin] /init response:", r.status);
+        }).catch(function (e) {
+          console.warn("[ws_plugin] init POST failed", e);
+        });
+      };
+
+      ws.onmessage = evtHandler;
+
+      ws.onclose = function (event) {
+        console.warn("[ws_plugin] WebSocket CLOSED: code=" + event.code + ", reason=" + event.reason);
+        scheduleReconnect();
+      };
+      ws.onerror = function (err) {
+        console.error("[ws_plugin] WebSocket ERROR:", err);
+        // onclose fires after onerror; reconnect logic lives there
+      };
+    }
+
+    // Lift the message handler out so it can be reused after reconnects
+    function evtHandler(event) {
       var data = typeof event.data === "string" ? event.data : new TextDecoder().decode(event.data);
-      
+
       // Handle identity message from server
       try {
         var parsed = JSON.parse(data);
         if (parsed.type === "identity" && typeof parsed.myPlayerIndex === "number") {
           console.log("[ws_plugin] Received identity: myPlayerIndex=" + parsed.myPlayerIndex + ", rngSeed=" + parsed.rngSeed);
           serverMyPlayerIndex = parsed.myPlayerIndex;
-          // Extract authoritative seed from server
-          if (typeof parsed.rngSeed === "number") {
-            serverRngSeed = parsed.rngSeed;
-          }
+          if (typeof parsed.rngSeed === "number") serverRngSeed = parsed.rngSeed;
           sendGameInit();
           return;
         }
       } catch (e) {}
-      
+
       // Forward all messages to WASM
       if (typeof wasm_exports === "undefined" || !wasm_exports.on_ws_message) return;
       var buf = new TextEncoder().encode(data);
@@ -183,14 +223,9 @@
       if (!ptr) return;
       new Uint8Array(wasm_memory.buffer, ptr, buf.length).set(buf);
       wasm_exports.on_ws_message(ptr, buf.length);
-    };
+    }
 
-    ws.onclose = function (event) {
-      console.warn("[ws_plugin] WebSocket CLOSED: code=" + event.code + ", reason=" + event.reason);
-    };
-    ws.onerror = function (err) {
-      console.error("[ws_plugin] WebSocket ERROR:", err);
-    };
+    connect();
   }
 
   if (typeof miniquad_add_plugin !== "undefined") {

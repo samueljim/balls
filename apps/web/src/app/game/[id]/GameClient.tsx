@@ -3,6 +3,7 @@
 import { useParams } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { useToast } from "@/components/Toast";
 
 const API_BASE =
   typeof window !== "undefined"
@@ -15,6 +16,50 @@ export default function GameView({ overrideId }: { overrideId?: string } = {}) {
   const mounted = useRef(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const { addToast } = useToast();
+
+  // Listen for game events emitted by the WASM engine via js_game_event → CustomEvent
+  useEffect(() => {
+    function handleGameEvent(e: Event) {
+      const ev = (e as CustomEvent<{ type: string; name?: string; damage?: number; hp?: number; winner?: string; ball?: string }>).detail;
+      switch (ev.type) {
+        case "hit":
+          if (ev.name && ev.damage != null && ev.hp != null) {
+            addToast(`${ev.name} took ${ev.damage} damage (${ev.hp} HP left)`, "info");
+          }
+          break;
+        case "died":
+          if (ev.name) {
+            addToast(`${ev.name} has been eliminated!`, "error");
+          }
+          break;
+        case "turn_start":
+          if (ev.name) {
+            const label = ev.ball && ev.ball !== ev.name ? `${ev.name} (${ev.ball})` : ev.name;
+            addToast(`${label}'s turn`, "info");
+          }
+          break;
+        case "game_over":
+          if (ev.winner) {
+            addToast(`${ev.winner} wins!`, "success");
+          }
+          break;
+      }
+    }
+    window.addEventListener("game_event", handleGameEvent);
+    return () => window.removeEventListener("game_event", handleGameEvent);
+  }, [addToast]);
+
+  // Lock body scroll for the duration of the game page
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    document.documentElement.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prev;
+      document.documentElement.style.overflow = "";
+    };
+  }, []);
 
   useEffect(() => {
     if (!gameId || mounted.current) return;
@@ -109,15 +154,21 @@ export default function GameView({ overrideId }: { overrideId?: string } = {}) {
   }
 
   return (
-    <main className="min-h-screen flex flex-col bg-[#0d1f0d]">
+    <>
       <canvas
         ref={canvasRef}
         id="glcanvas"
         tabIndex={1}
-        className="w-full h-full min-h-screen outline-none"
-        style={{ display: "block" }}
+        style={{
+          display: "block",
+          position: "fixed",
+          top: 0,
+          left: 0,
+          width: "100%",
+          height: "100%",
+          outline: "none",
+        }}
       />
-      <div className="fixed bottom-4 left-4 text-stone-500 text-sm"></div>
-    </main>
+    </>
   );
 }

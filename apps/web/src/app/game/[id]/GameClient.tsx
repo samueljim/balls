@@ -21,7 +21,7 @@ export default function GameView({ overrideId }: { overrideId?: string } = {}) {
   // Listen for game events emitted by the WASM engine via js_game_event → CustomEvent
   useEffect(() => {
     function handleGameEvent(e: Event) {
-      const ev = (e as CustomEvent<{ type: string; name?: string; damage?: number; hp?: number; winner?: string; ball?: string; playerIndex?: number }>).detail;
+      const ev = (e as CustomEvent<{ type: string; name?: string; damage?: number; hp?: number; winner?: string; ball?: string }>).detail;
       switch (ev.type) {
         case "hit":
           if (ev.name && ev.damage != null && ev.hp != null) {
@@ -42,16 +42,6 @@ export default function GameView({ overrideId }: { overrideId?: string } = {}) {
         case "game_over":
           if (ev.winner) {
             addToast(`${ev.winner} wins!`, "success");
-          }
-          break;
-        case "player_disconnected":
-          if (ev.name) {
-            addToast(`${ev.name} disconnected`, "error");
-          }
-          break;
-        case "player_connected":
-          if (ev.name) {
-            addToast(`${ev.name} reconnected`, "info");
           }
           break;
       }

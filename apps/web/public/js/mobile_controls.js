@@ -1,24 +1,19 @@
 /**
- * Mobile touch controls overlay for Balls game.
- * Registers as a miniquad plugin; runs only on touch devices.
+ * Controls overlay for Balls game.
+ * Registers as a miniquad plugin. The FIRE button is shown on all devices;
+ * joystick, weapon selector and zoom buttons are mobile-only.
  *
  * Controls added:
- *   - Virtual joystick (bottom-left)  → set_analog_walk(nx) for proportional speed
- *                                       Push UP on joystick → Space (jump, one-shot)
- *   - JUMP button (right of joystick) → Space key_down/up (reliable tap)
- *   - Weapon button (bottom-right)    → Tab key_down  (toggles weapon menu)
- *   - FIRE button (bottom-right)      → mouse_down / mouse_up at last aim pos
- *   - Single-finger drag on canvas    → mouse_move (aim ONLY — never fires)
- *                                       mouse_wheel (scroll) when weapon menu open
- *   - Tap on canvas when menu open    → mouse_down/up (select weapon or close menu)
- *   - Two-finger drag on canvas       → right-click drag (camera pan)
- *   - Pinch on canvas                 → mouse_wheel (zoom)
- *   - Zoom + / − buttons              → mouse_wheel
- *
- * Key design principle: canvas single-finger touch ONLY aims (mouse_move).
- * The FIRE button is the ONLY path that sends mouse_down(left) for weapon charging.
- * While FIRE is held (fireButtonDown), canvas mouse_move is suppressed to prevent
- * the drag-to-pan guard (left_drag_panning) in Rust from cancelling the charge.
+ *   - FIRE button (bottom-right, all devices) → F key_down/up (hold = charge, release = fire)
+ *   - Virtual joystick (bottom-left, mobile)  → Left / Right arrow key_down/up
+ *                                               Push UP on joystick → Space (jump, one-shot)
+ *   - Weapon button (bottom-right, mobile)    → Tab key_down  (toggles weapon menu)
+ *   - Single-finger drag on canvas (mobile)   → mouse_move (aim) when menu closed
+ *                                               mouse_wheel (scroll) when weapon menu open
+ *   - Tap on canvas when menu open (mobile)   → mouse_down/up (select weapon or close menu)
+ *   - Two-finger drag on canvas (mobile)      → right-click drag (camera pan)
+ *   - Pinch on canvas (mobile)                → mouse_wheel (zoom)
+ *   - Zoom + / − buttons (mobile)             → mouse_wheel
  */
 (function () {
   "use strict";
@@ -26,16 +21,10 @@
   /* ── sapp key codes ── */
   var KEY_SPACE = 32;
   var KEY_TAB = 258;
-  var KEY_LEFT = 263;  /* kept for fallback */
-  var KEY_RIGHT = 262; /* kept for fallback */
-
-  /* Duration of a key-pulse in ms (key_down → key_up for one-shot actions like jump) */
-  var KEY_PULSE_MS = 80;
-
-  /* Joystick analog remapping constants */
-  var JOY_DEAD_ZONE = 0.25;       /* below this |nx|, no movement */
-  var JOY_MIN_WALK = 0.5;         /* minimum output speed factor past the dead zone */
-  var JOY_WALK_RANGE = 0.5;       /* range from MIN to 1.0 over the rest of the stick travel */
+  var KEY_LEFT = 263;
+  var KEY_RIGHT = 262;
+  var KEY_UP = 265;
+  var KEY_F = 70; // F key — used by the FIRE button to start/release a charge
 
   /* Last canvas position the user aimed at (used by the FIRE button) */
   var lastAimX = 0;
@@ -43,15 +32,6 @@
 
   /* Track whether weapon menu is open so canvas drags scroll instead of aim */
   var menuOpen = false;
-
-  /**
-   * True while the FIRE button is physically held down.
-   * When set:
-   *  - canvas mouse_move events are NOT forwarded to WASM (prevents mouse_position()
-   *    from drifting and triggering left_drag_panning which would cancel the charge)
-   *  - canvas menu-tap mouse_down(0) is suppressed (avoid simultaneous accidental click)
-   */
-  var fireButtonDown = false;
 
   function isTouchDevice() {
     return "ontouchstart" in window || navigator.maxTouchPoints > 0;
@@ -61,7 +41,8 @@
   function register_plugin() { /* Nothing to add to the WASM import object */ }
 
   function on_init() {
-    if (!isTouchDevice()) return;
+    // Show the fire button on all devices (desktop + mobile).
+    // Touch-specific controls (joystick, weapon selector, zoom) are added only on touch devices.
     if (typeof wasm_exports === "undefined" || !wasm_exports.key_down) {
       var poll = setInterval(function () {
         if (typeof wasm_exports !== "undefined" && wasm_exports.key_down) {
@@ -82,38 +63,18 @@
     lastAimX = Math.floor(canvas.clientWidth / 2);
     lastAimY = Math.floor(canvas.clientHeight / 2);
 
-    buildOverlay(canvas);
-    /* Register two-zone intercept FIRST so its stopImmediatePropagation
-     * prevents the aim handler below from firing for far-zone single touches */
-    setupCanvasTwoZone(canvas);
-    setupCanvasTouches(canvas);
-  }
-
-  /* ── Pulse a key (for one-shot actions like jump) ── */
-  function pulseKey(code) {
-    wasm_exports.key_down(code, 0, false);
-    setTimeout(function () { wasm_exports.key_up(code, 0); }, KEY_PULSE_MS);
-  }
-
-  /**
-   * Remap joystick x-deflection to a walk speed factor.
-   *
-   * Dead zone  : |nx| < JOY_DEAD_ZONE     → 0 (no movement)
-   * Active zone: JOY_DEAD_ZONE ≤ |nx| ≤ 1 → JOY_MIN_WALK … 1.0
-   *
-   * The minimum non-zero output (JOY_MIN_WALK) ensures the ball visibly moves
-   * even at the lowest joystick deflection so the control feels responsive.
-   */
-  function analogFromNx(nx) {
-    var abs = Math.abs(nx);
-    if (abs < JOY_DEAD_ZONE) return 0.0;
-    var sign = nx > 0 ? 1 : -1;
-    var t = (abs - JOY_DEAD_ZONE) / (1.0 - JOY_DEAD_ZONE); /* 0…1 past the dead zone */
-    return sign * (JOY_MIN_WALK + t * JOY_WALK_RANGE);
+    var touch = isTouchDevice();
+    buildOverlay(canvas, touch);
+    if (touch) {
+      /* Register two-zone intercept FIRST so its stopImmediatePropagation
+       * prevents the aim handler below from firing for far-zone single touches */
+      setupCanvasTwoZone(canvas);
+      setupCanvasTouches(canvas);
+    }
   }
 
   /* ── Build the DOM overlay ── */
-  function buildOverlay(canvas) {
+  function buildOverlay(canvas, touch) {
     var ov = document.createElement("div");
     ov.id = "mobile-controls-overlay";
     ov.style.cssText =
@@ -122,58 +83,48 @@
       "user-select:none;-webkit-user-select:none;touch-action:none;";
     document.body.appendChild(ov);
 
-    /* ── Virtual joystick (bottom-left) ── */
-    var js = buildJoystick();
-    ov.appendChild(js.container);
-    setupJoystick(js);
+    if (touch) {
+      /* ── Virtual joystick (bottom-left) ── */
+      var js = buildJoystick();
+      ov.appendChild(js.container);
+      setupJoystick(js);
 
-    /* ── JUMP button (to the right of the joystick) ── */
-    var jumpBtn = mkBtn("⬆\nJUMP", {
-      bottom: "80px", left: "155px", w: "75px", h: "75px",
-      bg: "rgba(15,65,25,0.90)", border: "rgba(55,190,80,0.95)",
-      fontSize: "14px",
-    });
-    ov.appendChild(jumpBtn);
-    jumpBtn.addEventListener("touchstart", function (e) {
-      e.preventDefault(); e.stopPropagation();
-      pulseKey(KEY_SPACE);
-    }, false);
+      /* ── Zoom +/− buttons (top-right, below the HUD) ── */
+      var zoomInBtn = mkBtn("+", { top: "54px", right: "10px", w: "44px", h: "44px" });
+      var zoomOutBtn = mkBtn("−", { top: "104px", right: "10px", w: "44px", h: "44px" });
+      ov.appendChild(zoomInBtn);
+      ov.appendChild(zoomOutBtn);
 
-    /* ── Weapon menu button (bottom-right) ── */
-    var weaponBtn = mkBtn("🔫\nWEAPON", {
-      bottom: "150px", right: "100px", w: "80px", h: "60px",
-    });
+      zoomInBtn.addEventListener("touchstart", function (e) {
+        e.preventDefault(); e.stopPropagation();
+        wasm_exports.mouse_wheel(0, 60);
+      }, false);
+      zoomOutBtn.addEventListener("touchstart", function (e) {
+        e.preventDefault(); e.stopPropagation();
+        wasm_exports.mouse_wheel(0, -60);
+      }, false);
+    }
+
+    /* ── WEAPON button – shown on ALL devices ── */
+    var weaponBtnPos = touch
+      ? { bottom: "150px", right: "100px", w: "80px", h: "60px" }
+      : { bottom: "110px", right: "20px",  w: "80px", h: "60px" };
+    var weaponBtn = mkBtn("🔫\nWEAPON", weaponBtnPos);
     ov.appendChild(weaponBtn);
-    tapKey(weaponBtn, KEY_TAB);
-    /* Also keep our JS-side menuOpen flag in sync */
-    weaponBtn.addEventListener("touchstart", function (e) {
-      e.stopPropagation();
-      menuOpen = !menuOpen;
-    }, false);
+    tapKeyAll(weaponBtn, KEY_TAB);
+    /* Keep JS-side menuOpen flag in sync for both touch and mouse */
+    weaponBtn.addEventListener("touchstart", function (e) { e.stopPropagation(); menuOpen = !menuOpen; }, false);
+    weaponBtn.addEventListener("mousedown",  function (e) { e.stopPropagation(); menuOpen = !menuOpen; }, false);
 
-    /* ── FIRE button (big, bottom-right) ── */
-    var fireBtn = mkBtn("🔥\nFIRE", {
-      bottom: "80px", right: "10px", w: "80px", h: "130px",
+    /* ── FIRE button – shown on ALL devices (mobile + desktop) ── */
+    var fireBtnPos = touch
+      ? { bottom: "80px", right: "10px", w: "80px", h: "130px", fontSize: "16px" }
+      : { bottom: "20px", right: "20px", w: "80px", h: "80px", fontSize: "14px" };
+    var fireBtn = mkBtn("🔥\nFIRE", Object.assign({
       bg: "rgba(120,25,15,0.90)", border: "rgba(230,80,60,0.95)",
-      fontSize: "16px",
-    });
+    }, fireBtnPos));
     ov.appendChild(fireBtn);
     setupFireButton(fireBtn);
-
-    /* ── Zoom +/− buttons (top-right, below the HUD) ── */
-    var zoomInBtn = mkBtn("+", { top: "54px", right: "10px", w: "44px", h: "44px" });
-    var zoomOutBtn = mkBtn("−", { top: "104px", right: "10px", w: "44px", h: "44px" });
-    ov.appendChild(zoomInBtn);
-    ov.appendChild(zoomOutBtn);
-
-    zoomInBtn.addEventListener("touchstart", function (e) {
-      e.preventDefault(); e.stopPropagation();
-      wasm_exports.mouse_wheel(0, 60);
-    }, false);
-    zoomOutBtn.addEventListener("touchstart", function (e) {
-      e.preventDefault(); e.stopPropagation();
-      wasm_exports.mouse_wheel(0, -60);
-    }, false);
   }
 
   /* ── Virtual joystick DOM ── */
@@ -206,16 +157,16 @@
     var touchId = null;
     var center = { x: 0, y: 0 };
     var MAX_R = 42;
-    /* held.up tracks whether the up-jump gesture has already fired this stroke */
-    var held = { up: false };
+    /* held tracks which virtual keys are currently pressed */
+    var held = { left: false, right: false, up: false };
 
-    /* Stop analog walk and release any held digital fallback keys */
-    function stopWalk() {
-      if (typeof wasm_exports.set_analog_walk === "function") {
-        wasm_exports.set_analog_walk(0.0);
+    function setKey(side, code, on) {
+      if (on === held[side]) return;
+      held[side] = on;
+      if (on) {
+        wasm_exports.key_down(code, 0, false);
       } else {
-        wasm_exports.key_up(KEY_LEFT, 0);
-        wasm_exports.key_up(KEY_RIGHT, 0);
+        wasm_exports.key_up(code, 0);
       }
     }
 
@@ -223,7 +174,8 @@
       active = false;
       touchId = null;
       js.thumb.style.transform = "translate(-50%,-50%)";
-      stopWalk();
+      setKey("left", KEY_LEFT, false);
+      setKey("right", KEY_RIGHT, false);
       held.up = false;
     }
 
@@ -257,29 +209,18 @@
         var nx = dist > 8 ? dx / dist : 0;
         var ny = dist > 8 ? dy / dist : 0;
 
-        /* ── Horizontal movement: analog proportional speed ── */
-        if (typeof wasm_exports.set_analog_walk === "function") {
-          wasm_exports.set_analog_walk(analogFromNx(nx));
-        } else {
-          /* Fallback: binary keys for older WASM builds */
-          if (nx < -0.25) {
-            wasm_exports.key_down(KEY_LEFT, 0, false);
-            wasm_exports.key_up(KEY_RIGHT, 0);
-          } else if (nx > 0.25) {
-            wasm_exports.key_down(KEY_RIGHT, 0, false);
-            wasm_exports.key_up(KEY_LEFT, 0);
-          } else {
-            wasm_exports.key_up(KEY_LEFT, 0);
-            wasm_exports.key_up(KEY_RIGHT, 0);
-          }
-        }
+        /* Left / right movement */
+        setKey("left",  KEY_LEFT,  nx < -0.25);
+        setKey("right", KEY_RIGHT, nx > 0.25);
 
-        /* ── Up gesture → jump (one-shot per stroke) ── */
+        /* Up direction → jump (one-shot per gesture; resets when stick returns to neutral) */
         if (ny < -0.5 && !held.up) {
           held.up = true;
-          pulseKey(KEY_SPACE);
+          wasm_exports.key_down(KEY_SPACE, 0, false);
+          /* Brief press — macroquad only needs key_down → key_up transition to register is_key_pressed */
+          setTimeout(function () { wasm_exports.key_up(KEY_SPACE, 0); }, 80);
         }
-        /* Reset so next upward push can jump again */
+        /* Reset up-held when stick returns to roughly neutral/down so next push can re-jump */
         if (ny >= -0.25) {
           held.up = false;
         }
@@ -299,28 +240,31 @@
     });
   }
 
-  /* ── FIRE button ───────────────────────────────────────────────────────────
-   *
-   * hold = charge (mouse_down held), release = fire (mouse_up).
-   *
-   * While the button is held, `fireButtonDown = true` which suppresses canvas
-   * mouse_move events.  This keeps mouse_position() stable in Rust and prevents
-   * the left_drag_panning guard from cancelling the charge mid-flight.
-   */
+  /* ── FIRE button: hold = charge, release = fire.
+   * Uses the F key so it never alters the WASM mouse position (no aim snap).
+   * Works on both touch (touchstart/end) and desktop (mousedown/up/leave). ── */
   function setupFireButton(btn) {
-    btn.addEventListener("touchstart", function (e) {
+    var held = false;
+    function pressDown(e) {
       e.preventDefault(); e.stopPropagation();
-      fireButtonDown = true;
-      wasm_exports.mouse_down(lastAimX, lastAimY, 0);
-    }, false);
-
-    function fireRelease(e) {
-      e.preventDefault(); e.stopPropagation();
-      fireButtonDown = false;
-      wasm_exports.mouse_up(lastAimX, lastAimY, 0);
+      if (!held) {
+        held = true;
+        wasm_exports.key_down(KEY_F, 0, false);
+      }
     }
-    btn.addEventListener("touchend",    fireRelease, false);
-    btn.addEventListener("touchcancel", fireRelease, false);
+    function pressUp(e) {
+      e.preventDefault(); e.stopPropagation();
+      if (held) {
+        held = false;
+        wasm_exports.key_up(KEY_F, 0);
+      }
+    }
+    btn.addEventListener("touchstart",  pressDown, false);
+    btn.addEventListener("touchend",    pressUp,   false);
+    btn.addEventListener("touchcancel", pressUp,   false);
+    btn.addEventListener("mousedown",   pressDown, false);
+    btn.addEventListener("mouseup",     pressUp,   false);
+    btn.addEventListener("mouseleave",  pressUp,   false);
   }
 
   /* ── Hold a key while the button is pressed ── */
@@ -337,6 +281,17 @@
       e.preventDefault(); e.stopPropagation();
       wasm_exports.key_up(code, 0);
     }, false);
+  }
+
+  /* ── Tap a key once on press – touch + mouse (for toggle actions) ── */
+  function tapKeyAll(btn, code) {
+    function down(e) { e.preventDefault(); e.stopPropagation(); wasm_exports.key_down(code, 0, false); }
+    function up(e)   { e.preventDefault(); e.stopPropagation(); wasm_exports.key_up(code, 0); }
+    btn.addEventListener("touchstart",  down, false);
+    btn.addEventListener("touchend",    up,   false);
+    btn.addEventListener("touchcancel", up,   false);
+    btn.addEventListener("mousedown",   down, false);
+    btn.addEventListener("mouseup",     up,   false);
   }
 
   /* ── Tap a key once on press (for toggle actions) ── */
@@ -372,13 +327,10 @@
    * from mapping touches to mouse_down/mouse_up (which would fire the weapon).
    *
    * Single-finger behaviour depends on whether the weapon menu is open:
-   *   • Menu CLOSED  → mouse_move (aim) ONLY — NEVER mouse_down/up
-   *                    (mouse_move is suppressed while fireButtonDown is true
-   *                     to prevent left_drag_panning from cancelling an active charge)
+   *   • Menu CLOSED  → mouse_move (aim) only — no mouse_down/up
    *   • Menu OPEN    → drag scrolls the list via mouse_wheel
    *                    tap (< TAP_MOVE_THRESHOLD px movement) sends mouse_down+up
    *                    to select a weapon or close the menu
-   *                    (suppressed if fireButtonDown to prevent accidental double-fire)
    *
    * Two-finger: camera pan (right-button drag) + pinch zoom
    */
@@ -405,6 +357,11 @@
         x: Math.floor((clientX - r.left) * dpr),
         y: Math.floor((clientY - r.top) * dpr),
       };
+    }
+
+    /* Convert a CSS-pixel distance to canvas-pixel distance */
+    function cssToCvsPx(cssPx) {
+      return cssPx * (window.devicePixelRatio || 1);
     }
 
     function stopPan(pos) {
@@ -446,11 +403,7 @@
          * which fires first and calls stopImmediatePropagation so we never reach here
          * for far-zone touches). */
         gestureMode = 'aim';
-        /* Only send mouse_move when FIRE is not held — prevents mouse_position()
-         * from drifting away from the charge origin (would trigger left_drag_panning). */
-        if (!fireButtonDown) {
-          wasm_exports.mouse_move(p.x, p.y);
-        }
+        wasm_exports.mouse_move(p.x, p.y);
       } else if (ts.length >= 2) {
         if (singleFingerPanning) {
           stopPan(lastPanCvs || cvsPos(ts[0].clientX, ts[0].clientY));
@@ -496,15 +449,14 @@
             break;
           }
 
+          /* Two-zone: check distance from where aim was when this touch started */
           if (gestureMode === 'aim') {
-            /* Always update lastAimX/Y so the FIRE button fires at the latest aim position. */
+            /* If finger has wandered far enough from start to be considered a pan,
+             * promote to pan mode. Use the touchstart position stored in lastAimX/Y
+             * at gesture start — however since we use a simple heuristic here we
+             * check accumulated travel distance from first touchstart position. */
             lastAimX = p.x; lastAimY = p.y;
-            /* Only forward mouse_move to WASM when FIRE is not held.
-             * Suppressing during charge prevents mouse_position() from drifting,
-             * which would otherwise trigger left_drag_panning and cancel the charge. */
-            if (!fireButtonDown) {
-              wasm_exports.mouse_move(p.x, p.y);
-            }
+            wasm_exports.mouse_move(p.x, p.y);
           } else if (gestureMode === 'pan') {
             wasm_exports.mouse_move(p.x, p.y);
             lastPanCvs = p;
@@ -541,9 +493,7 @@
         if (singleFingerPanning) {
           stopPan(lastPanCvs || { x: lastAimX, y: lastAimY });
         }
-        /* Weapon selection tap: send a single left-click at the tap position.
-         * Guarded by !fireButtonDown to prevent accidental clicks while charging. */
-        if (menuOpen && !isDragging && !fireButtonDown) {
+        if (menuOpen && !isDragging) {
           var tapX = lastAimX, tapY = lastAimY;
           wasm_exports.mouse_down(tapX, tapY, 0);
           requestAnimationFrame(function () { wasm_exports.mouse_up(tapX, tapY, 0); });
@@ -562,15 +512,27 @@
       gestureMode = null;
       menuScrollLastCvsY = null;
     }, { capture: true, passive: false });
+
+    /* ── Second pass: implement true two-zone detection ────────────────────────
+     * The handlers above default everything to 'aim'. To make single-finger
+     * dragging from a far position pan the camera, we override the touchstart
+     * logic using a pre-capture listener that fires BEFORE the main one and
+     * decides the mode. We do this inline below by replacing the touchstart
+     * handler with a version that captures the PREVIOUS aim position before
+     * overwriting lastAimX/Y.
+     */
   }
 
   /* ── Real two-zone single-finger handler ─────────────────────────────────────
-   * A pre-capture listener fires before setupCanvasTouches and decides the mode.
-   * If the touch starts far from the current aim point it starts a right-button pan;
-   * otherwise it falls through to the aim handler above.
+   * We replace setupCanvasTouches with a version that properly captures the
+   * pre-gesture aim position to decide zone. The function above ran but we
+   * need to redo the logic — so we override by wrapping the canvas touchstart
+   * immediately after.
    */
   function setupCanvasTwoZone(canvas) {
     /* Aim position as of the START of each gesture (not updated during gesture) */
+    var gestureStartAimX = 0;
+    var gestureStartAimY = 0;
     var singlePanning = false;
     var singlePanLastPos = null;
 
@@ -685,4 +647,3 @@
     });
   }
 })();
-

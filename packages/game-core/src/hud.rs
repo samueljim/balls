@@ -40,9 +40,16 @@ impl WeaponMenuLayout {
 
         // All sizes below are in CSS pixels — no * dpi.
         let menu_w = if is_mobile { sw * 0.97 } else { 520.0_f32.min(sw * 0.85) };
-        let menu_h = if is_mobile { sh * 0.92 } else { 620.0_f32.min(sh * 0.85) };
+        // On mobile the controls overlay (joystick + buttons) occupies ~225 px at the bottom.
+        // Anchor the menu just below the top HUD bar (50 px) so it never extends under them.
+        let controls_reserved = if is_mobile { 225.0_f32 } else { 0.0_f32 };
+        let menu_h = if is_mobile {
+            (sh - 50.0 - controls_reserved).max(200.0)
+        } else {
+            620.0_f32.min(sh * 0.85)
+        };
         let menu_x = sw / 2.0 - menu_w / 2.0;
-        let menu_y = sh / 2.0 - menu_h / 2.0;
+        let menu_y = if is_mobile { 50.0 } else { sh / 2.0 - menu_h / 2.0 };
         let header_h = if is_mobile { 44.0 } else { 52.0 };
         let footer_h = if is_mobile { 36.0 } else { 44.0 };
         let content_y = menu_y + header_h + 6.0;

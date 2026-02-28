@@ -5,7 +5,7 @@ const GRAVITY: f32 = 480.0;
 const WALK_SPEED: f32 = 115.0;         // Slightly snappier
 const JUMP_VEL: f32 = -320.0;          // More air — bigger, floatier jump
 const JUMP_HORIZONTAL_BOOST: f32 = 75.0; // Extra run on jump
-const MAX_CLIMB: i32 = 8;              // Can hop up one extra pixel
+const MAX_CLIMB: i32 = 12;             // Can hop up over small terrain bumps
 const GROUND_FRICTION: f32 = 0.80;
 const AIR_FRICTION: f32 = 0.985;       // Slightly less air drag
 const AIR_CONTROL_ACCEL: f32 = 420.0; // Horizontal acceleration applied per-frame while airborne
@@ -330,7 +330,8 @@ pub fn walk(ball: &mut Ball, terrain: &Terrain, dir: f32) {
     for drop in 0..=10 {
         if terrain.is_solid(nx, foot_y + drop) {
             ball.x = new_x;
-            ball.y = (foot_y + drop - 1) as f32 - r;
+            // Place foot ON the solid cell (consistent with tick()'s snap logic)
+            ball.y = (foot_y + drop) as f32 - r;
             // Track the actual distance moved
             ball.movement_used += (ball.x - old_x).abs();
             return;

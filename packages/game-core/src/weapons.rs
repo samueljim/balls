@@ -291,10 +291,9 @@ impl Weapon {
             | Weapon::HolyHandGrenade | Weapon::Dynamite | Weapon::Mine | Weapon::BananaBonanza
             | Weapon::Mortar | Weapon::Airstrike | Weapon::NapalmStrike => WeaponCategory::Explosives,
             
-            Weapon::Shotgun | Weapon::HomingMissile | Weapon::SniperRifle | Weapon::Uzi
-            | Weapon::Drill => WeaponCategory::Ballistics,
+            Weapon::Shotgun | Weapon::HomingMissile | Weapon::SniperRifle | Weapon::Uzi => WeaponCategory::Ballistics,
             
-            Weapon::Teleport | Weapon::Jetpack | Weapon::Parachute | Weapon::Rope | Weapon::BuildWall => WeaponCategory::Utilities,
+            Weapon::Teleport | Weapon::Jetpack | Weapon::Parachute | Weapon::Rope | Weapon::BuildWall | Weapon::Drill => WeaponCategory::Utilities,
             
             Weapon::Sheep | Weapon::SuperSheep | Weapon::BaseballBat => WeaponCategory::Special,
         }

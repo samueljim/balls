@@ -82,21 +82,13 @@ impl Terrain {
         self.regrow_grass_near(cx, cy, radius);
     }
 
-    /// Replay a damage log on this terrain (e.g. after regenerating from seed on reconnect).
-    /// Only applies entries beyond what the local log already contains, so calling this on a
-    /// live client (turn-boundary sync) is idempotent and never duplicates entries.
+    /// Replay a damage log on this terrain (e.g. after regenerating from seed on reconnect)
     pub fn replay_damage(&mut self, log: &[(i32, i32, i32)]) {
-        let local_len = self.damage_log.len();
-        for (i, &(cx, cy, r)) in log.iter().enumerate() {
-            if i >= local_len {
-                self.apply_damage_no_log(cx, cy, r);
-            }
+        for &(cx, cy, r) in log {
+            self.apply_damage_no_log(cx, cy, r);
         }
-        // Replace the local log with the authoritative received log when it is longer.
-        // This ensures future sends reflect the canonical server state exactly.
-        if log.len() > local_len {
-            self.damage_log = log.to_vec();
-        }
+        // Store the replayed events so future sends include them
+        self.damage_log.extend_from_slice(log);
     }
 
     /// Regrow grass over any rectangular area (used after drill carvings).
@@ -352,14 +344,14 @@ pub fn generate(seed: u32) -> Terrain {
     // This runs before the chamber+worm pass to produce interconnected voids.
     {
         let mut s_cave = lcg(seed.wrapping_add(2500));
-        let cave_scale = 0.05; // coarser noise for big caverns
-        let cave_threshold = 0.26; // lower -> more air; slightly stricter to protect surface
+        let cave_scale = 0.035; // coarser noise for big caverns
+        let cave_threshold = 0.42; // lower -> more air; slightly stricter to protect surface
         for x in LAND_START_X as i32..=LAND_END_X as i32 {
             if x < 0 || x >= w as i32 { continue; }
             let ground = heights[x as usize] as i32;
             // create caves starting a bit below surface and extending downward
-            let y0 = (ground + 14).max(10);
-            let y1 = (ground + 160).min(h as i32 - 10);
+            let y0 = (ground + 10).max(10);
+            let y1 = (ground + 220).min(h as i32 - 10);
             for y in y0..=y1 {
                 let nx = x as f32 * cave_scale;
                 let ny = y as f32 * cave_scale;
@@ -424,7 +416,7 @@ pub fn generate(seed: u32) -> Terrain {
 
     // Generate improved caves with more variety
     s = lcg(s.wrapping_add(2000));
-    let num_caves = 6 + (s >> 16) as u32 % 4; // Many caves (6-9)
+    let num_caves = 12 + (s >> 16) as u32 % 6; // Many caves (12-17)
     let mut cave_positions = Vec::new();
     
     for i in 0..num_caves {
@@ -433,9 +425,9 @@ pub fn generate(seed: u32) -> Terrain {
         s = lcg(s);
         let cy = 100 + (s >> 16) as i32 % ((heights[cx as usize] as i32) - 120);
         s = lcg(s);
-        let cave_w = 60 + (s >> 16) as i32 % 100; // Generous width (60-160)
+        let cave_w = 110 + (s >> 16) as i32 % 160; // Generous width (110-270)
         s = lcg(s);
-        let cave_h = 40 + (s >> 16) as i32 % 60; // Generous height (40-100)
+        let cave_h = 70 + (s >> 16) as i32 % 110; // Generous height (70-180)
         
         cave_positions.push((cx, cy));
         
@@ -480,7 +472,7 @@ pub fn generate(seed: u32) -> Terrain {
         }
         
         // Connect most caves with tunnels
-        if i > 0 && (s >> 16) % 2 == 0 && cave_positions.len() >= 2 {
+        if i > 0 && (s >> 16) % 4 != 0 && cave_positions.len() >= 2 {
             let prev_idx = cave_positions.len() - 2;
             let (prev_cx, prev_cy) = cave_positions[prev_idx];
             
@@ -509,7 +501,7 @@ pub fn generate(seed: u32) -> Terrain {
 
                     // varying radius for organic tunnels
                     s = lcg(s);
-                    let base_r = 4.0 + ((s >> 16) as f32 / 65535.0) * 5.0; // 4-9
+                    let base_r = 7.0 + ((s >> 16) as f32 / 65535.0) * 8.0; // 7-15
                     let wobble = ((px * 0.12).sin() + (py * 0.15).cos()) * 1.5;
                     let radius_f = (base_r + wobble).max(3.0);
                     let radius = radius_f as i32;
@@ -678,12 +670,8 @@ pub fn generate(seed: u32) -> Terrain {
         s = lcg(s);
         let tree_h = 12 + (s >> 16) as i32 % 15;
         
-        // Draw trunk
-        for dy in 0..tree_h {
-            if surface_y - dy > 0 {
-                t.set(tx, surface_y - dy, WOOD);
-            }
-        }
+        // Draw trunk (non-solid — left as AIR so balls don't snag on the
+        // 1-pixel-wide column; the crown foliage still provides a surface to stand on)
         
         // Draw foliage (grass colored blocks forming crown)
         let crown_y = surface_y - tree_h;

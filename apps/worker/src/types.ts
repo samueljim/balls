@@ -34,7 +34,7 @@ export interface GameState {
   inputLog: string[];
   currentTurnIndex: number;
   turnEndTime: number;
-  phase: string;
+  phase: "aiming" | "projectile" | "retreat";
   rngSeed: number;
   terrainId: number;
 }
@@ -44,9 +44,12 @@ export type GameMessage =
   | { type: "input"; input: string; turnIndex: number }
   | { type: "aim"; aim: number; turnIndex: number }
   | { type: "turn_advanced"; turnIndex: number }
+  | { type: "player_connected"; playerIndex: number }
+  | { type: "player_disconnected"; playerIndex: number }
   | { type: "error"; message: string };
 
 export type GameClientMessage =
   | { type: "input"; input: string }
   | { type: "aim"; aim: number }
-  | { type: "end_turn" };
+  | { type: "end_turn" }
+  | { type: "retreat_start" };

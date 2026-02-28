@@ -16,6 +16,23 @@ use special_weapons::{AirstrikeDroplet, FirePool, UziBullet, PlacedExplosive, Ai
 use state::Phase;
 use terrain::Terrain;
 use weapons::Weapon;
+use std::cell::Cell;
+
+thread_local! {
+    /// Analog walk direction set each frame by the mobile joystick via `set_analog_walk`.
+    /// Range: -1.0 (full left) to 1.0 (full right); 0.0 means no joystick input.
+    /// Used in preference to the binary LEFT/RIGHT key state so speed is proportional
+    /// to how far the player pushes the virtual joystick.
+    static ANALOG_WALK_DIR: Cell<f32> = const { Cell::new(0.0) };
+}
+
+/// Called from JavaScript by the mobile joystick each touchmove frame.
+/// `dir` = -1.0…1.0 where magnitude encodes the desired walk speed.
+/// Passing 0.0 stops analog-walk so keyboard fallback resumes.
+#[no_mangle]
+pub extern "C" fn set_analog_walk(dir: f32) {
+    ANALOG_WALK_DIR.with(|d| d.set(dir.clamp(-1.0, 1.0)));
+}
 
 const TURN_TIME: f32 = 45.0;
 const TURN_END_DELAY: f32 = 1.5;
@@ -23,6 +40,10 @@ const SETTLE_TIMEOUT: f32 = 5.0;
 const CHARGE_SPEED: f32 = 55.0;
 /// Default camera zoom level. Values > 1 mean “more zoomed in” relative to BASE_SHORT_AXIS.
 const DEFAULT_ZOOM: f32 = 2.0;
+/// Minimum analog joystick signal to prefer over keyboard (below = treated as zero)
+const ANALOG_DEADZONE: f32 = 0.05;
+/// Minimum walk-direction magnitude before calling physics::walk (avoids noise)
+const WALK_THRESHOLD: f32 = 0.01;
 
 #[cfg(target_arch = "wasm32")]
 extern "C" {
@@ -380,6 +401,22 @@ impl Game {
             .map(|(idx, _)| idx)
     }
 
+    /// Returns the walk direction (-1.0…1.0) for the current frame.
+    /// Prefers the analog joystick signal (proportional speed) when non-zero;
+    /// falls back to binary LEFT/RIGHT keyboard keys at full speed.
+    fn current_walk_dir() -> f32 {
+        let analog = ANALOG_WALK_DIR.with(|d| d.get());
+        if analog.abs() > ANALOG_DEADZONE {
+            analog
+        } else if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) {
+            -1.0
+        } else if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
     fn handle_input(&mut self) {
         if let Some(seed) = self.restart_seed.take() {
             // Restart with same team count
@@ -536,11 +573,9 @@ impl Game {
                     let ball = &mut self.balls[wi];
                     let can_move = ball.can_move();
 
-                    if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) {
-                        physics::walk(ball, &self.terrain, -1.0);
-                    }
-                    if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) {
-                        physics::walk(ball, &self.terrain, 1.0);
+                    let walk_dir = Self::current_walk_dir();
+                    if walk_dir.abs() > WALK_THRESHOLD {
+                        physics::walk(ball, &self.terrain, walk_dir);
                     }
 
                     if can_move {
@@ -720,12 +755,10 @@ impl Game {
         if self.is_my_turn() && self.phase.allows_movement() && self.current_ball < self.balls.len() && self.balls[self.current_ball].alive && !self.weapon_menu_open {
             let ball = &mut self.balls[self.current_ball];
             let can_move = ball.can_move();
-            
-            if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) {
-                physics::walk(ball, &self.terrain, -1.0);
-            }
-            if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) {
-                physics::walk(ball, &self.terrain, 1.0);
+
+            let walk_dir = Self::current_walk_dir();
+            if walk_dir.abs() > WALK_THRESHOLD {
+                physics::walk(ball, &self.terrain, walk_dir);
             }
             
             // Only allow jumping if there's movement budget
@@ -1032,11 +1065,16 @@ impl Game {
                     bx, by, angle
                 )
             } else {
+                // Include the ball's world position so remote clients fire from the
+                // identical origin and produce the same projectile path/terrain damage.
+                // idx is always valid here: the caller already returned if idx >= balls.len().
+                let bx = self.balls[idx].x;
+                let by = self.balls[idx].y;
                 let angle_deg = angle.to_degrees();
                 let weapon_name = weapon.name();
                 format!(
-                    r#"{{"Fire":{{"weapon":"{}","angle_deg":{},"power_percent":{}}}}}"#,
-                    weapon_name, angle_deg, power
+                    r#"{{"Fire":{{"weapon":"{}","angle_deg":{},"power_percent":{},"bx":{},"by":{}}}}}"#,
+                    weapon_name, angle_deg, power, bx, by
                 )
             };
             let mut escaped = String::new();
@@ -1049,6 +1087,11 @@ impl Game {
             }
             let msg = format!(r#"{{"type":"input","input":"{}"}}"#, escaped);
             self.net.send_message(&msg);
+            // Dynamite enters Retreat directly (not via Settling), so notify the server
+            // here so the retreat-phase watchdog fires correctly.
+            if self.phase == Phase::Retreat {
+                self.net.send_message(r#"{"type":"retreat_start"}"#);
+            }
         }
     }
 
@@ -1094,10 +1137,12 @@ impl Game {
                 let spread = 0.15;
                 let base_speed = power * 15.0;
                 
-                for i in 0..bullet_count {
-                    let offset_angle = (rand::gen_range(0.0, 1.0) - 0.5) * spread;
+                for _ in 0..bullet_count {
+                    self.rng_state = lcg(self.rng_state);
+                    let offset_angle = ((self.rng_state >> 16) as f32 / 65536.0 - 0.5) * spread;
                     let bullet_angle = angle + offset_angle;
-                    let speed = base_speed * (0.95 + rand::gen_range(0.0, 0.1));
+                    self.rng_state = lcg(self.rng_state);
+                    let speed = base_speed * (0.95 + (self.rng_state >> 16) as f32 / 65536.0 * 0.1);
                     
                     self.uzi_bullets.push(UziBullet {
                         x: sx,
@@ -1440,10 +1485,17 @@ impl Game {
     /// Apply terrain ops log received from server on reconnect.
     /// Handles [0,cx,cy,r] explosions, [1,bx,by,amrad] drills, [2,ax,ay,amrad] walls.
     /// Also handles legacy 3-element [cx,cy,r] entries (old format = explosion).
+    /// Accepts both the standard "log" key (terrain_sync messages) and
+    /// the "terrainLog" key embedded in turn_advanced messages.
     fn apply_terrain_sync(&mut self, msg: &str) {
-        let key = "\"log\":[";
+        // Try "terrainLog" first (turn_advanced), then fall back to "log" (terrain_sync).
+        let (key, key_len) = if msg.contains("\"terrainLog\":[") {
+            ("\"terrainLog\":[", "\"terrainLog\":[".len())
+        } else {
+            ("\"log\":[", "\"log\":[".len())
+        };
         let start = match msg.find(key) {
-            Some(i) => i + key.len(),
+            Some(i) => i + key_len,
             None => return,
         };
         let mut depth = 1i32;
@@ -1846,9 +1898,18 @@ impl Game {
                         self.phase = Phase::TurnEnd;
                         self.turn_end_timer = 0.1;
                     }
-                    _ => {
-                        // During projectile/settling, just note that a sync is coming
+                    Phase::ProjectileFlying | Phase::Settling => {
+                        // Abort all in-flight projectiles so settling completes immediately
+                        // and the pending turn_advanced can be applied without further delay.
+                        self.proj = None;
+                        self.shotgun_pellets.clear();
+                        self.uzi_bullets.clear();
+                        self.airstrike_droplets.clear();
+                        self.cluster_bomblets.clear();
+                        self.phase = Phase::TurnEnd;
+                        self.turn_end_timer = 0.1;
                     }
+                    Phase::GameOver => {}
                 }
                 continue;
             }
@@ -1856,6 +1917,21 @@ impl Game {
                 if let Some(player_index) = parse_turn_index_from_message(&msg) {
                     // Always update our stored turn index
                     self.current_turn_index = player_index;
+                    // Apply authoritative ball positions embedded in the message (if any).
+                    // These snapshots are the server's last-known state before the new
+                    // turn, so they're the reference point for the incoming player.
+                    if msg.contains("\"balls\":") {
+                        // Clear stale lerp targets before snapping to authoritative positions
+                        for t in &mut self.ball_lerp_targets {
+                            *t = None;
+                        }
+                        self.apply_ball_state(&msg);
+                    }
+                    // Apply authoritative terrain log if the server included it.
+                    // apply_terrain_sync handles the "terrainLog" key from turn_advanced.
+                    if msg.contains("\"terrainLog\":") {
+                        self.apply_terrain_sync(&msg);
+                    }
                     match self.phase {
                         Phase::Aiming | Phase::Charging | Phase::TurnEnd => {
                             self.sync_to_player_turn(player_index);
@@ -1981,7 +2057,22 @@ impl Game {
                     };
                     if let Some(ball_idx) = ball_idx_opt {
                         // Parse and apply different input types
-                        if let Some((angle_rad, power, weapon)) = parse_fire_input(&input_str) {
+                        if let Some((angle_rad, power, weapon, ball_pos)) = parse_fire_input(&input_str) {
+                            // Snap the ball to the authoritative position sent by the active client
+                            // so the projectile starts from the exact same world coordinate on all
+                            // clients, preventing divergent projectile paths and terrain damage.
+                            if let Some((bx, by)) = ball_pos {
+                                if ball_idx < self.balls.len() {
+                                    self.balls[ball_idx].x = bx;
+                                    self.balls[ball_idx].y = by;
+                                } else {
+                                    #[cfg(target_arch = "wasm32")]
+                                    {
+                                        let dbg = format!("[FIRE] ball_pos snap skipped: ball_idx={} out of range ({})\0", ball_idx, self.balls.len());
+                                        unsafe { console_log(dbg.as_ptr()); }
+                                    }
+                                }
+                            }
                             self.do_fire(ball_idx, angle_rad, power, weapon);
                             self.has_fired = true;
                             // Reset budget on the firing ball so remote players also get
@@ -2523,6 +2614,11 @@ impl Game {
                         // Reset movement budget for retreat
                         if self.current_ball < self.balls.len() {
                             self.balls[self.current_ball].reset_movement_budget();
+                        }
+                        // Notify server we've entered the retreat window so the
+                        // watchdog uses the retreat timeout instead of projectile.
+                        if self.net.connected {
+                            self.net.send_message(r#"{"type":"retreat_start"}"#);
                         }
                     } else if !self.net.connected {
                         self.end_turn();
@@ -3534,7 +3630,7 @@ fn parse_input_message(msg: &str) -> Option<(usize, String)> {
     Some((turn_index, unescaped))
 }
 
-fn parse_fire_input(input: &str) -> Option<(f32, f32, Weapon)> {
+fn parse_fire_input(input: &str) -> Option<(f32, f32, Weapon, Option<(f32, f32)>)> {
     if !input.contains("Fire") {
         return None;
     }
@@ -3542,7 +3638,11 @@ fn parse_fire_input(input: &str) -> Option<(f32, f32, Weapon)> {
     let power_percent = parse_json_number(input, "power_percent")? as f32;
     let weapon_name = parse_json_string(input, "weapon")?;
     let weapon = Weapon::from_name(weapon_name)?;
-    Some((angle_deg.to_radians(), power_percent, weapon))
+    // Optional ball origin transmitted so all clients start the projectile from the same position
+    let ball_pos = parse_json_number(input, "bx")
+        .zip(parse_json_number(input, "by"))
+        .map(|(bx, by)| (bx as f32, by as f32));
+    Some((angle_deg.to_radians(), power_percent, weapon, ball_pos))
 }
 
 fn parse_walk_input(input: &str) -> Option<f32> {

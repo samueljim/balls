@@ -214,6 +214,27 @@
           sendGameInit();
           return;
         }
+
+        // Surface connection events as game_event CustomEvents so the React UI can
+        // show toasts without requiring any WASM changes.
+        if (parsed.type === "player_disconnected" && typeof parsed.playerIndex === "number") {
+          var name = (playerOrder[parsed.playerIndex] && playerOrder[parsed.playerIndex].name)
+            ? playerOrder[parsed.playerIndex].name
+            : ("Player " + (parsed.playerIndex + 1));
+          window.dispatchEvent(new CustomEvent("game_event", {
+            detail: { type: "player_disconnected", name: name, playerIndex: parsed.playerIndex },
+          }));
+          // Still forward to WASM so it can react (phase resync etc.) if needed
+        }
+        if (parsed.type === "player_connected" && typeof parsed.playerIndex === "number") {
+          var name = (playerOrder[parsed.playerIndex] && playerOrder[parsed.playerIndex].name)
+            ? playerOrder[parsed.playerIndex].name
+            : ("Player " + (parsed.playerIndex + 1));
+          window.dispatchEvent(new CustomEvent("game_event", {
+            detail: { type: "player_connected", name: name, playerIndex: parsed.playerIndex },
+          }));
+          // Still forward to WASM
+        }
       } catch (e) {}
 
       // Forward all messages to WASM

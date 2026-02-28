@@ -16,6 +16,23 @@ use special_weapons::{AirstrikeDroplet, FirePool, UziBullet, PlacedExplosive, Ai
 use state::Phase;
 use terrain::Terrain;
 use weapons::Weapon;
+use std::cell::Cell;
+
+thread_local! {
+    /// Analog walk direction set each frame by the mobile joystick via `set_analog_walk`.
+    /// Range: -1.0 (full left) to 1.0 (full right); 0.0 means no joystick input.
+    /// Used in preference to the binary LEFT/RIGHT key state so speed is proportional
+    /// to how far the player pushes the virtual joystick.
+    static ANALOG_WALK_DIR: Cell<f32> = const { Cell::new(0.0) };
+}
+
+/// Called from JavaScript by the mobile joystick each touchmove frame.
+/// `dir` = -1.0…1.0 where magnitude encodes the desired walk speed.
+/// Passing 0.0 stops analog-walk so keyboard fallback resumes.
+#[no_mangle]
+pub extern "C" fn set_analog_walk(dir: f32) {
+    ANALOG_WALK_DIR.with(|d| d.set(dir.clamp(-1.0, 1.0)));
+}
 
 const TURN_TIME: f32 = 45.0;
 const TURN_END_DELAY: f32 = 1.5;
@@ -23,6 +40,10 @@ const SETTLE_TIMEOUT: f32 = 5.0;
 const CHARGE_SPEED: f32 = 55.0;
 /// Default camera zoom level. Values > 1 mean “more zoomed in” relative to BASE_SHORT_AXIS.
 const DEFAULT_ZOOM: f32 = 2.0;
+/// Minimum analog joystick signal to prefer over keyboard (below = treated as zero)
+const ANALOG_DEADZONE: f32 = 0.05;
+/// Minimum walk-direction magnitude before calling physics::walk (avoids noise)
+const WALK_THRESHOLD: f32 = 0.01;
 
 #[cfg(target_arch = "wasm32")]
 extern "C" {
@@ -380,6 +401,22 @@ impl Game {
             .map(|(idx, _)| idx)
     }
 
+    /// Returns the walk direction (-1.0…1.0) for the current frame.
+    /// Prefers the analog joystick signal (proportional speed) when non-zero;
+    /// falls back to binary LEFT/RIGHT keyboard keys at full speed.
+    fn current_walk_dir() -> f32 {
+        let analog = ANALOG_WALK_DIR.with(|d| d.get());
+        if analog.abs() > ANALOG_DEADZONE {
+            analog
+        } else if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) {
+            -1.0
+        } else if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
     fn handle_input(&mut self) {
         if let Some(seed) = self.restart_seed.take() {
             // Restart with same team count
@@ -536,11 +573,9 @@ impl Game {
                     let ball = &mut self.balls[wi];
                     let can_move = ball.can_move();
 
-                    if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) {
-                        physics::walk(ball, &self.terrain, -1.0);
-                    }
-                    if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) {
-                        physics::walk(ball, &self.terrain, 1.0);
+                    let walk_dir = Self::current_walk_dir();
+                    if walk_dir.abs() > WALK_THRESHOLD {
+                        physics::walk(ball, &self.terrain, walk_dir);
                     }
 
                     if can_move {
@@ -720,12 +755,10 @@ impl Game {
         if self.is_my_turn() && self.phase.allows_movement() && self.current_ball < self.balls.len() && self.balls[self.current_ball].alive && !self.weapon_menu_open {
             let ball = &mut self.balls[self.current_ball];
             let can_move = ball.can_move();
-            
-            if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) {
-                physics::walk(ball, &self.terrain, -1.0);
-            }
-            if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) {
-                physics::walk(ball, &self.terrain, 1.0);
+
+            let walk_dir = Self::current_walk_dir();
+            if walk_dir.abs() > WALK_THRESHOLD {
+                physics::walk(ball, &self.terrain, walk_dir);
             }
             
             // Only allow jumping if there's movement budget

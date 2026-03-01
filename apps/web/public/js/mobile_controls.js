@@ -4,13 +4,19 @@
  * joystick, weapon selector and zoom buttons are mobile-only.
  *
  * Controls added:
- *   - FIRE button (bottom-right, all devices) → F key_down/up (hold = charge, release = fire)
+ *   - FIRE/USE button (bottom-right, all devices) → F key_down/up
+ *       • Projectile weapons: hold = charge, release = fire
+ *       • Airstrike / NapalmStrike: tap = TARGET at cursor position
+ *       • Teleport: tap = USE (teleport to cursor position)
+ *       • Build Wall: first tap = SET POS, second tap = SET ROT + place
+ *       • Baseball Bat: tap = SWING
+ *       • Placed weapons (Dynamite/Mine): tap = PLACE
+ *     Button label updates automatically via js_set_fire_label callback from WASM.
  *   - Virtual joystick (bottom-left, mobile)  → Left / Right arrow key_down/up
  *                                               Push UP on joystick → Space (jump, one-shot)
  *   - Weapon button (bottom-right, mobile)    → Tab key_down  (toggles weapon menu)
- *   - Single-finger drag on canvas (mobile)   → mouse_move (aim) when menu closed
- *                                               mouse_wheel (scroll) when weapon menu open
- *   - Tap on canvas when menu open (mobile)   → mouse_down/up (select weapon or close menu)
+ *   - Single-finger drag on canvas (mobile)   → mouse_move (aim) — always works anywhere
+ *   - Single-finger tap on canvas (mobile)    → toggle aim-lock (or select weapon if menu open)
  *   - Two-finger drag on canvas (mobile)      → right-click drag (camera pan)
  *   - Pinch on canvas (mobile)                → mouse_wheel (zoom)
  *   - Zoom + / − buttons (mobile)             → mouse_wheel
@@ -64,11 +70,15 @@
     lastAimY = Math.floor(canvas.clientHeight / 2);
 
     var touch = isTouchDevice();
-    buildOverlay(canvas, touch);
+    var fireBtn = buildOverlay(canvas, touch);
+
+    // Register the label-update callback so ws_plugin.js can update the button text
+    // whenever the Rust game state changes (weapon selected, mode entered, etc.).
+    window.__updateFireLabel = function (label) {
+      if (fireBtn) fireBtn.innerHTML = label.replace(/\n/g, "<br>");
+    };
+
     if (touch) {
-      /* Register two-zone intercept FIRST so its stopImmediatePropagation
-       * prevents the aim handler below from firing for far-zone single touches */
-      setupCanvasTwoZone(canvas);
       setupCanvasTouches(canvas);
     }
   }
@@ -125,6 +135,8 @@
     }, fireBtnPos));
     ov.appendChild(fireBtn);
     setupFireButton(fireBtn);
+
+    return fireBtn; // returned so initControls can register the label-update callback
   }
 
   /* ── Virtual joystick DOM ── */
@@ -314,11 +326,6 @@
   var PINCH_THRESHOLD = 3;
   /* Multiplier converting pinch-distance-delta to scroll-wheel units */
   var PINCH_ZOOM_SENSITIVITY = 2.5;
-  /* Radius (canvas css pixels) around last aim point within which a single-
-   * finger drag aims instead of panning. Outside this radius it pans.
-   * lastAimX/lastAimY tracks where the worm last was, acting as a proxy for
-   * the active worm's screen position. */
-  var AIM_ZONE_RADIUS = 160;
 
   /* ── Canvas touch handlers ──────────────────────────────────────────────────
    *
@@ -326,29 +333,36 @@
    * e.stopImmediatePropagation() to prevent gl.js's native canvas touch handlers
    * from mapping touches to mouse_down/mouse_up (which would fire the weapon).
    *
-   * Single-finger behaviour depends on whether the weapon menu is open:
-   *   • Menu CLOSED  → mouse_move (aim) only — no mouse_down/up
-   *   • Menu OPEN    → drag scrolls the list via mouse_wheel
-   *                    tap (< TAP_MOVE_THRESHOLD px movement) sends mouse_down+up
-   *                    to select a weapon or close the menu
+   * Single-finger short drag (< PAN_THRESHOLD CSS px): aims (mouse_move).
+   *   Clean tap (< TAP_MOVE_THRESHOLD px movement): toggles aim-lock or
+   *   selects a weapon when the menu is open (mouse_down + mouse_up).
+   *   Long drag (≥ PAN_THRESHOLD CSS px): promotes to right-click-drag camera pan.
    *
-   * Two-finger: camera pan (right-button drag) + pinch zoom
+   * Two-finger: camera pan (right-button drag) + pinch zoom.
    */
   function setupCanvasTouches(canvas) {
+    /* Single-finger aim state */
     var aimId = null;
-    var panning = false;          // true when right-button drag is active (two-finger OR single-finger far zone)
-    var singleFingerPanning = false; // true when panning was started by a single finger (far zone)
+    var aimStartX = 0, aimStartY = 0;
+    var aimMoved = false;
+    var TAP_MOVE_THRESHOLD = 15;
+    /* Set to true once a single-finger drag exceeds PAN_THRESHOLD and switches
+     * to right-click-drag camera pan. Reset on touchend/touchcancel. */
+    var aimPanActive = false;
+    /* Distance in CSS pixels before a single-finger drag promotes to a camera pan.
+     * Multiplied by devicePixelRatio when comparing against canvas-space coords. */
+    var PAN_THRESHOLD = 30;
+
+    /* Two-finger pan / pinch state */
+    var panning = false;
     var lastPanCvs = null;
     var lastPinchDist = null;
-    /* 'aim' | 'pan' | null — set on each single-finger touchstart */
-    var gestureMode = null;
 
     /* Menu-scroll state */
     var menuScrollLastCvsY = null;
-    var menuTouchStartCvsY = null;
     var menuTouchStartCvsX = null;
-    var isDragging = false;
-    var TAP_MOVE_THRESHOLD = 15;
+    var menuTouchStartCvsY = null;
+    var menuDragging = false;
 
     function cvsPos(clientX, clientY) {
       var r = canvas.getBoundingClientRect();
@@ -359,18 +373,19 @@
       };
     }
 
-    /* Convert a CSS-pixel distance to canvas-pixel distance */
-    function cssToCvsPx(cssPx) {
-      return cssPx * (window.devicePixelRatio || 1);
-    }
-
     function stopPan(pos) {
       if (panning) {
         wasm_exports.mouse_up(pos.x, pos.y, 2);
         panning = false;
-        singleFingerPanning = false;
         lastPanCvs = null;
         lastPinchDist = null;
+      }
+    }
+
+    function stopAimPan(pos) {
+      if (aimPanActive) {
+        wasm_exports.mouse_up(pos.x, pos.y, 2);
+        aimPanActive = false;
       }
     }
 
@@ -381,42 +396,37 @@
       var ts = e.touches;
 
       if (ts.length === 1) {
-        /* If two-finger pan was active, stop it cleanly */
-        if (panning && !singleFingerPanning) {
-          stopPan(cvsPos(ts[0].clientX, ts[0].clientY));
-        }
+        /* Transitioning from two-finger to one: stop pan cleanly */
+        if (panning) stopPan(cvsPos(ts[0].clientX, ts[0].clientY));
 
-        aimId = ts[0].identifier;
         var p = cvsPos(ts[0].clientX, ts[0].clientY);
+        aimId = ts[0].identifier;
+        aimStartX = p.x; aimStartY = p.y;
+        aimMoved = false;
+        aimPanActive = false;
         lastAimX = p.x; lastAimY = p.y;
 
         if (menuOpen) {
-          gestureMode = null;
-          menuScrollLastCvsY  = p.y;
-          menuTouchStartCvsY  = p.y;
-          menuTouchStartCvsX  = p.x;
-          isDragging = false;
+          menuScrollLastCvsY = p.y;
+          menuTouchStartCvsX = p.x;
+          menuTouchStartCvsY = p.y;
+          menuDragging = false;
           return;
         }
 
-        /* Near-zone single-finger aim (far-zone pan is handled by setupCanvasTwoZone
-         * which fires first and calls stopImmediatePropagation so we never reach here
-         * for far-zone touches). */
-        gestureMode = 'aim';
+        /* Snap aim to touch position immediately so the angle updates right away */
         wasm_exports.mouse_move(p.x, p.y);
+
       } else if (ts.length >= 2) {
-        if (singleFingerPanning) {
-          stopPan(lastPanCvs || cvsPos(ts[0].clientX, ts[0].clientY));
-        }
+        /* Two or more fingers: cancel single-finger tracking and start pan */
+        if (aimPanActive) stopAimPan(cvsPos(ts[0].clientX, ts[0].clientY));
         aimId = null;
-        gestureMode = null;
         menuScrollLastCvsY = null;
         var mid = midpoint(ts[0], ts[1]);
         var cMid = cvsPos(mid.x, mid.y);
         lastPinchDist = pinchDist(ts[0], ts[1]);
         if (!panning) {
           panning = true;
-          singleFingerPanning = false;
           wasm_exports.mouse_down(cMid.x, cMid.y, 2);
           lastPanCvs = cMid;
         }
@@ -434,10 +444,14 @@
         for (var i = 0; i < ct.length; i++) {
           if (ct[i].identifier !== aimId) continue;
           var p = cvsPos(ct[i].clientX, ct[i].clientY);
+          var dpr = window.devicePixelRatio || 1;
+          var totalMove = Math.abs(p.x - aimStartX) + Math.abs(p.y - aimStartY);
+          if (totalMove > TAP_MOVE_THRESHOLD) aimMoved = true;
+          lastAimX = p.x; lastAimY = p.y;
 
           if (menuOpen) {
-            var totalMove = Math.abs(p.x - menuTouchStartCvsX) + Math.abs(p.y - menuTouchStartCvsY);
-            if (totalMove > TAP_MOVE_THRESHOLD) isDragging = true;
+            var menuTotalMove = Math.abs(p.x - menuTouchStartCvsX) + Math.abs(p.y - menuTouchStartCvsY);
+            if (menuTotalMove > TAP_MOVE_THRESHOLD) menuDragging = true;
             if (menuScrollLastCvsY !== null) {
               var scrollDelta = menuScrollLastCvsY - p.y;
               if (Math.abs(scrollDelta) > 0.5) {
@@ -445,26 +459,28 @@
               }
             }
             menuScrollLastCvsY = p.y;
-            lastAimX = p.x; lastAimY = p.y;
             break;
           }
 
-          /* Two-zone: check distance from where aim was when this touch started */
-          if (gestureMode === 'aim') {
-            /* If finger has wandered far enough from start to be considered a pan,
-             * promote to pan mode. Use the touchstart position stored in lastAimX/Y
-             * at gesture start — however since we use a simple heuristic here we
-             * check accumulated travel distance from first touchstart position. */
-            lastAimX = p.x; lastAimY = p.y;
-            wasm_exports.mouse_move(p.x, p.y);
-          } else if (gestureMode === 'pan') {
-            wasm_exports.mouse_move(p.x, p.y);
-            lastPanCvs = p;
-            lastAimX = p.x; lastAimY = p.y;
+          /* Once the finger has moved far enough, promote to right-click-drag
+           * camera pan instead of aiming. Short drags (< PAN_THRESHOLD CSS px)
+           * still update the aim angle so fine adjustments remain possible. */
+          if (!aimPanActive) {
+            var ddx = p.x - aimStartX;
+            var ddy = p.y - aimStartY;
+            var panDist = Math.sqrt(ddx * ddx + ddy * ddy);
+            if (panDist > PAN_THRESHOLD * dpr) {
+              aimPanActive = true;
+              wasm_exports.mouse_down(p.x, p.y, 2);
+            }
           }
+
+          /* Always send mouse_move so aim tracks short drags and pan delta
+           * is computed correctly once pan mode is active. */
+          wasm_exports.mouse_move(p.x, p.y);
           break;
         }
-      } else if (ts.length >= 2 && panning && !singleFingerPanning) {
+      } else if (ts.length >= 2 && panning) {
         var mid = midpoint(ts[0], ts[1]);
         var cMid = cvsPos(mid.x, mid.y);
         wasm_exports.mouse_move(cMid.x, cMid.y);
@@ -484,23 +500,34 @@
       e.preventDefault();
 
       var remaining = e.touches.length;
+      /* Stop two-finger pan when fewer than 2 fingers remain */
       if (remaining < 2) {
-        var pos = lastPanCvs || { x: lastAimX, y: lastAimY };
-        if (!singleFingerPanning) stopPan(pos); // only stop two-finger pan here
+        stopPan(lastPanCvs || { x: lastAimX, y: lastAimY });
       }
       if (remaining === 0) {
-        /* End single-finger pan if it was active */
-        if (singleFingerPanning) {
-          stopPan(lastPanCvs || { x: lastAimX, y: lastAimY });
-        }
-        if (menuOpen && !isDragging) {
-          var tapX = lastAimX, tapY = lastAimY;
-          wasm_exports.mouse_down(tapX, tapY, 0);
-          requestAnimationFrame(function () { wasm_exports.mouse_up(tapX, tapY, 0); });
-          menuOpen = false;
+        if (aimId !== null) {
+          if (aimPanActive) {
+            /* End single-finger camera pan */
+            stopAimPan({ x: lastAimX, y: lastAimY });
+          } else if (!aimMoved) {
+            /* A tap (no significant movement) triggers mouse_down+up.
+             * • When menu is open: selects a weapon or closes the menu.
+             * • Otherwise: toggles aim-lock (mirrors desktop clean-left-click). */
+            var tapX = lastAimX, tapY = lastAimY;
+            if (menuOpen && !menuDragging) {
+              wasm_exports.mouse_down(tapX, tapY, 0);
+              requestAnimationFrame(function () { wasm_exports.mouse_up(tapX, tapY, 0); });
+              menuOpen = false;
+            } else if (!menuOpen) {
+              wasm_exports.mouse_down(tapX, tapY, 0);
+              requestAnimationFrame(function () { wasm_exports.mouse_up(tapX, tapY, 0); });
+            }
+          }
+          /* Short drag that didn't reach pan threshold: no extra mouse event needed */
         }
         aimId = null;
-        gestureMode = null;
+        aimMoved = false;
+        aimPanActive = false;
         menuScrollLastCvsY = null;
       }
     }, { capture: true, passive: false });
@@ -508,90 +535,11 @@
     canvas.addEventListener("touchcancel", function (e) {
       e.stopImmediatePropagation();
       stopPan({ x: lastAimX, y: lastAimY });
+      stopAimPan({ x: lastAimX, y: lastAimY });
       aimId = null;
-      gestureMode = null;
+      aimMoved = false;
+      aimPanActive = false;
       menuScrollLastCvsY = null;
-    }, { capture: true, passive: false });
-
-    /* ── Second pass: implement true two-zone detection ────────────────────────
-     * The handlers above default everything to 'aim'. To make single-finger
-     * dragging from a far position pan the camera, we override the touchstart
-     * logic using a pre-capture listener that fires BEFORE the main one and
-     * decides the mode. We do this inline below by replacing the touchstart
-     * handler with a version that captures the PREVIOUS aim position before
-     * overwriting lastAimX/Y.
-     */
-  }
-
-  /* ── Real two-zone single-finger handler ─────────────────────────────────────
-   * We replace setupCanvasTouches with a version that properly captures the
-   * pre-gesture aim position to decide zone. The function above ran but we
-   * need to redo the logic — so we override by wrapping the canvas touchstart
-   * immediately after.
-   */
-  function setupCanvasTwoZone(canvas) {
-    /* Aim position as of the START of each gesture (not updated during gesture) */
-    var gestureStartAimX = 0;
-    var gestureStartAimY = 0;
-    var singlePanning = false;
-    var singlePanLastPos = null;
-
-    /* Pre-capture intercept to record aim position BEFORE it changes */
-    canvas.addEventListener("touchstart", function (e) {
-      var ts = e.touches;
-      if (ts.length !== 1) return; /* two-finger handled by the main handler above */
-
-      var r = canvas.getBoundingClientRect();
-      var dpr = window.devicePixelRatio || 1;
-      var px = Math.floor((ts[0].clientX - r.left) * dpr);
-      var py = Math.floor((ts[0].clientY - r.top) * dpr);
-
-      /* Distance from the current aim point (proxy for worm position) */
-      var ddx = px - lastAimX;
-      var ddy = py - lastAimY;
-      var dist = Math.sqrt(ddx * ddx + ddy * ddy);
-      var aimZonePx = AIM_ZONE_RADIUS * dpr;
-
-      if (dist >= aimZonePx && !menuOpen) {
-        /* Far zone: start a right-button pan drag */
-        e.stopImmediatePropagation(); /* prevent the main handler firing */
-        e.preventDefault();
-        singlePanning = true;
-        singlePanLastPos = { x: px, y: py };
-        wasm_exports.mouse_down(px, py, 2);
-      }
-      /* Near zone: fall through to main handler (aim) */
-    }, { capture: true, passive: false });
-
-    canvas.addEventListener("touchmove", function (e) {
-      if (!singlePanning || e.touches.length !== 1) return;
-      e.stopImmediatePropagation();
-      e.preventDefault();
-      var r = canvas.getBoundingClientRect();
-      var dpr = window.devicePixelRatio || 1;
-      var px = Math.floor((e.touches[0].clientX - r.left) * dpr);
-      var py = Math.floor((e.touches[0].clientY - r.top) * dpr);
-      wasm_exports.mouse_move(px, py);
-      singlePanLastPos = { x: px, y: py };
-    }, { capture: true, passive: false });
-
-    canvas.addEventListener("touchend", function (e) {
-      if (!singlePanning) return;
-      e.stopImmediatePropagation();
-      e.preventDefault();
-      var pos = singlePanLastPos || { x: lastAimX, y: lastAimY };
-      wasm_exports.mouse_up(pos.x, pos.y, 2);
-      singlePanning = false;
-      singlePanLastPos = null;
-    }, { capture: true, passive: false });
-
-    canvas.addEventListener("touchcancel", function (e) {
-      if (!singlePanning) return;
-      e.stopImmediatePropagation();
-      var pos = singlePanLastPos || { x: lastAimX, y: lastAimY };
-      wasm_exports.mouse_up(pos.x, pos.y, 2);
-      singlePanning = false;
-      singlePanLastPos = null;
     }, { capture: true, passive: false });
   }
 

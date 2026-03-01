@@ -72,6 +72,15 @@ struct Game {
     airstrike_droplets: Vec<AirstrikeDroplet>,
     fire_pools: Vec<FirePool>,
     uzi_bullets: Vec<UziBullet>,
+    /// Bullets remaining in the current burst (0 = not firing)
+    uzi_burst_remaining: u32,
+    /// Countdown in seconds until the next burst bullet is spawned
+    uzi_burst_timer: f32,
+    uzi_burst_angle: f32,
+    uzi_burst_speed: f32,
+    uzi_burst_ox: f32,
+    uzi_burst_oy: f32,
+    uzi_burst_shooter: usize,
     placed_explosives: Vec<PlacedExplosive>,
     teleport_mode: bool,
     baseball_bat_mode: bool,
@@ -80,6 +89,12 @@ struct Game {
     build_wall_anchor: Option<(f32, f32)>,
     /// Airstrike or NapalmStrike waiting for a click-target. Stores which weapon.
     airstrike_mode: Option<Weapon>,
+    /// Locked X coordinate for airstrike/napalm target; set by tapping the map, consumed by FIRE.
+    /// None means the player hasn't picked a target yet — FIRE will not launch until this is set.
+    airstrike_locked_x: Option<f32>,
+    /// Locked world position for Teleport; set by tapping the map, consumed by FIRE.
+    /// None means the player hasn't picked a destination yet — FIRE will not teleport until this is set.
+    teleport_locked_pos: Option<(f32, f32)>,
     /// Cumulative log of wall placements for reconnect sync: (ax, ay, angle_mrad)
     wall_log: Vec<(i32, i32, i32)>,
     /// Cumulative log of drill tunnels for reconnect sync: (bx, by, angle_mrad)
@@ -112,6 +127,8 @@ struct Game {
     
     weapon_menu_open: bool,
     weapon_menu_scroll: f32,
+    /// Current text in the weapon menu search box.
+    weapon_search: String,
 
     net: network::NetworkState,
     /// Current turn index from server (which player's turn it is: 0, 1, etc.)
@@ -143,6 +160,8 @@ struct Game {
     stuck_phase_timer: f32,
     /// Per-ball cooldown (seconds) for game-event toasts — prevents spam from fires/DoT
     ball_event_cooldown: Vec<f32>,
+    /// Last label sent to the JS FIRE button — used to detect changes and avoid re-sending
+    last_fire_label: &'static str,
 }
 
 impl Game {
@@ -283,12 +302,21 @@ impl Game {
             airstrike_droplets: Vec::new(),
             fire_pools: Vec::new(),
             uzi_bullets: Vec::new(),
+            uzi_burst_remaining: 0,
+            uzi_burst_timer: 0.0,
+            uzi_burst_angle: 0.0,
+            uzi_burst_speed: 0.0,
+            uzi_burst_ox: 0.0,
+            uzi_burst_oy: 0.0,
+            uzi_burst_shooter: 0,
             placed_explosives: Vec::new(),
             teleport_mode: false,
             baseball_bat_mode: false,
             build_wall_mode: false,
             build_wall_anchor: None,
             airstrike_mode: None,
+            airstrike_locked_x: None,
+            teleport_locked_pos: None,
             wall_log: Vec::new(),
             drill_log: Vec::new(),
             bot_think_timer: 3.0,
@@ -306,6 +334,7 @@ impl Game {
             winning_team: None,
             weapon_menu_open: false,
             weapon_menu_scroll: 0.0,
+            weapon_search: String::new(),
             net: network::NetworkState::new(),
             current_turn_index: 0,
             num_teams,
@@ -323,6 +352,7 @@ impl Game {
             retreat_timer: 0.0,
             stuck_phase_timer: 0.0,
             ball_event_cooldown: vec![0.0; num_teams * 3],
+            last_fire_label: "",
             last_ball_per_team: {
                 // Pre-record that ball 0 (team 0's first ball) is the initial
                 // current_ball, so the next sync_to_player_turn(0) knows to
@@ -427,8 +457,10 @@ impl Game {
             self.last_mouse = (mx, my);
         }
         if is_mouse_button_released(MouseButton::Left) {
-            // A tap (release with no preceding drag) toggles aim lock so the game is
-            // playable with mouse-only: move to aim → click to lock → FIRE to shoot.
+            // A tap (release with no preceding drag) does one of:
+            //   • locks the airstrike/napalm target X at the tapped world position
+            //   • locks the teleport destination at the tapped world position
+            //   • toggles aim lock for all other weapons
             let was_tap = self.left_drag_start.is_some(); // Some = drag never started
             self.left_drag_panning = false;
             self.left_drag_start = None;
@@ -438,11 +470,20 @@ impl Game {
                 && self.phase.allows_input()
                 && !self.weapon_menu_open
                 && !self.build_wall_mode
-                && !self.teleport_mode
                 && !self.baseball_bat_mode
-                && self.airstrike_mode.is_none()
             {
-                self.aim_locked = !self.aim_locked;
+                if self.airstrike_mode.is_some() {
+                    // Lock the airstrike at the current camera centre so the player
+                    // positions the target by panning, then taps to confirm.
+                    self.airstrike_locked_x = Some(self.cam.x);
+                } else if self.teleport_mode {
+                    // Lock the teleport destination at the current camera centre.
+                    let tx = self.cam.x.clamp(0.0, self.terrain.width as f32);
+                    let ty = self.cam.y.clamp(0.0, self.terrain.height as f32);
+                    self.teleport_locked_pos = Some((tx, ty));
+                } else {
+                    self.aim_locked = !self.aim_locked;
+                }
             }
         }
         if !self.left_drag_panning {
@@ -498,7 +539,7 @@ impl Game {
                     wheel * (item_step / 3.0)    // smooth trackpad / touch swipe
                 };
                 self.weapon_menu_scroll = (self.weapon_menu_scroll - delta)
-                    .clamp(0.0, layout.max_scroll());
+                    .clamp(0.0, layout.max_scroll(&self.weapon_search));
             } else {
                 // Smooth trackpad pinch / fine scroll wheel use a proportional factor;
                 // discrete mouse clicks (large delta) snap by a fixed step.
@@ -569,7 +610,6 @@ impl Game {
                     if can_move {
                         if is_key_pressed(KeyCode::W) || is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::Space) {
                             physics::jump(ball);
-                            ball.movement_used += 20.0;
                             if self.net.connected {
                                 let msg = r#"{"type":"input","input":"{\"Jump\":{}}"}"#;
                                 self.net.send_message(msg);
@@ -577,7 +617,6 @@ impl Game {
                         }
                         if is_key_pressed(KeyCode::S) || is_key_pressed(KeyCode::Down) {
                             physics::backflip(ball);
-                            ball.movement_used += 30.0;
                             if self.net.connected {
                                 let msg = r#"{"type":"input","input":"{\"Backflip\":{}}"}"#;
                                 self.net.send_message(msg);
@@ -612,8 +651,12 @@ impl Game {
                 self.phase = Phase::Aiming;
             }
             self.weapon_menu_open = !self.weapon_menu_open;
-            if !self.weapon_menu_open {
-                self.weapon_menu_scroll = 0.0;
+            self.weapon_menu_scroll = 0.0;
+            self.weapon_search.clear();
+            // Drain the char queue so the key that opened the menu (Q) isn't
+            // immediately captured into the search string on the same frame.
+            if self.weapon_menu_open {
+                while get_char_pressed().is_some() {}
             }
         }
 
@@ -627,6 +670,8 @@ impl Game {
                 self.firing_by_key = false;
             }
             self.baseball_bat_mode = false;
+            self.airstrike_locked_x = None;
+            self.teleport_locked_pos = None;
         }
         
         // Toggle weapon menu with mouse click on button (only on your turn)
@@ -643,18 +688,41 @@ impl Game {
         if self.weapon_menu_open && is_key_pressed(KeyCode::Escape) {
             self.weapon_menu_open = false;
             self.weapon_menu_scroll = 0.0;
+            self.weapon_search.clear();
+        }
+
+        // Always drain the char queue every frame so buffered keypresses from when
+        // the menu was closed (e.g. WASD movement) don't flood the search on open.
+        // Only write to weapon_search when the menu is actually visible.
+        if self.is_my_turn() && self.weapon_menu_open && is_key_pressed(KeyCode::Backspace) {
+            if self.weapon_search.pop().is_some() {
+                // Clamp scroll in case filtered list is now shorter
+                let layout = hud::WeaponMenuLayout::new();
+                self.weapon_menu_scroll = self.weapon_menu_scroll
+                    .min(layout.max_scroll(&self.weapon_search));
+            }
+        }
+        while let Some(c) = get_char_pressed() {
+            if self.is_my_turn() && self.weapon_menu_open && (c.is_ascii_graphic() || c == ' ') {
+                self.weapon_search.push(c);
+                self.weapon_menu_scroll = 0.0; // scroll to top on new search char
+            }
+            // chars are discarded when menu is closed — prevents buffer contamination
         }
         
         // Handle weapon menu clicks (only on your turn)
         if self.is_my_turn() && self.weapon_menu_open && is_mouse_button_pressed(MouseButton::Left) {
             let layout = hud::WeaponMenuLayout::new();
             
-            // Organize weapons by category (same as hud.rs)
+            // Organize weapons by category (same as hud.rs), filtered by search
             use weapons::WeaponCategory;
+            let sq = self.weapon_search.to_lowercase();
             let all_weapons = Weapon::all();
             let mut by_category: std::collections::HashMap<WeaponCategory, Vec<&Weapon>> = std::collections::HashMap::new();
             for w in all_weapons {
-                by_category.entry(w.category()).or_insert_with(Vec::new).push(w);
+                if sq.is_empty() || w.name().to_lowercase().contains(&sq) || w.description().to_lowercase().contains(&sq) {
+                    by_category.entry(w.category()).or_insert_with(Vec::new).push(w);
+                }
             }
             
             let categories = [
@@ -664,7 +732,7 @@ impl Game {
                 WeaponCategory::Utilities,
             ];
             
-            let mut current_y = layout.content_y - self.weapon_menu_scroll;
+            let mut current_y = layout.content_y + 4.0 - self.weapon_menu_scroll; // 4px initial padding
             
             // Only accept clicks within the content viewport
             let content_top = layout.content_y;
@@ -687,7 +755,14 @@ impl Game {
                                 self.selected_weapon = **w;
                                 self.weapon_menu_open = false;
                                 self.weapon_menu_scroll = 0.0;
-                // Auto-enter click modes immediately — no charge/fire needed
+                                self.weapon_search.clear();
+                                // Clear all special modes before activating the new one
+                                self.airstrike_mode = None;
+                                self.airstrike_locked_x = None;
+                                self.teleport_mode = false;
+                                self.teleport_locked_pos = None;
+                                self.build_wall_mode = false;
+                                self.build_wall_anchor = None;
                                 match self.selected_weapon {
                                     Weapon::Teleport => { self.teleport_mode = true; }
                                     Weapon::BuildWall => { self.build_wall_mode = true; }
@@ -710,6 +785,7 @@ impl Game {
             if mx < layout.menu_x || mx > layout.menu_x + layout.menu_w || my < layout.menu_y || my > layout.menu_y + layout.menu_h {
                 self.weapon_menu_open = false;
                 self.weapon_menu_scroll = 0.0;
+                self.weapon_search.clear();
             }
             return;
         }
@@ -753,11 +829,11 @@ impl Game {
                 physics::walk(ball, &self.terrain, 1.0);
             }
             
-            // Only allow jumping if there's movement budget
+            // Jumping allowed while budget remains; cost is the horizontal distance
+            // traveled, charged on landing via jump_start_x (not a fixed fee).
             if can_move {
                 if is_key_pressed(KeyCode::W) || is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::Space) {
                     physics::jump(ball);
-                    ball.movement_used += 20.0; // Jumping costs movement
                     if self.net.connected {
                         let msg = r#"{"type":"input","input":"{\"Jump\":{}}"}"#;
                         self.net.send_message(msg);
@@ -765,7 +841,6 @@ impl Game {
                 }
                 if is_key_pressed(KeyCode::S) || is_key_pressed(KeyCode::Down) {
                     physics::backflip(ball);
-                    ball.movement_used += 30.0; // Backflip costs more
                     if self.net.connected {
                         let msg = r#"{"type":"input","input":"{\"Backflip\":{}}"}"#;
                         self.net.send_message(msg);
@@ -834,12 +909,77 @@ impl Game {
                     }
                 }
             }
-            // Handle Airstrike / NapalmStrike click-targeting
-            else if let Some(airstrike_weapon) = self.airstrike_mode {
+            // Left-click only handles Build Wall placement (needs two canvas clicks).
+            // Airstrike, Teleport, and all other weapons fire via the F key.
+        }
+        // F-key fire button: fires all weapons including airstrike, teleport, and build-wall.
+        // On mobile the FIRE button holds/releases F.  Build Wall uses the current aim position
+        // so mobile players can place walls without two separate canvas taps.
+        if is_key_pressed(KeyCode::F)
+            && !self.has_fired
+            && self.is_my_turn()
+            && self.phase.allows_input()
+            && !self.weapon_menu_open
+            && !self.charging
+        {
+            if self.build_wall_mode {
+                // F key drives build-wall: first press sets anchor, second press finalises.
                 let (mx, my) = mouse_position();
                 let world_pos = self.cam.to_macroquad().screen_to_world(vec2(mx, my));
-                let target_x = world_pos.x;
-
+                if self.build_wall_anchor.is_none() {
+                    self.build_wall_anchor = Some((world_pos.x, world_pos.y));
+                } else {
+                    let (ax, ay) = self.build_wall_anchor.unwrap();
+                    let dx = world_pos.x - ax;
+                    let dy = world_pos.y - ay;
+                    let angle = if dx.abs() < 0.5 && dy.abs() < 0.5 {
+                        self.aim_angle
+                    } else {
+                        dy.atan2(dx)
+                    };
+                    let cos_a = angle.cos();
+                    let sin_a = angle.sin();
+                    let half_len = 35i32;
+                    let half_thick = 4i32;
+                    for i in -half_len..=half_len {
+                        for j in -half_thick..=half_thick {
+                            let wx = (ax + i as f32 * cos_a - j as f32 * sin_a).round() as i32;
+                            let wy = (ay + i as f32 * sin_a + j as f32 * cos_a).round() as i32;
+                            if wx >= 0 && wx < self.terrain.width as i32
+                                && wy >= 0 && wy < self.terrain.height as i32 {
+                                self.terrain.set(wx, wy, terrain::WOOD);
+                            }
+                        }
+                    }
+                    self.terrain_dirty = true;
+                    self.build_wall_anchor = None;
+                    self.build_wall_mode = false;
+                    self.has_fired = true;
+                    self.phase = Phase::Settling;
+                    self.settle_timer = 0.0;
+                    self.wall_log.push((ax as i32, ay as i32, (angle * 1000.0) as i32));
+                    if self.net.connected {
+                        let input_json = format!(
+                            r#"{{"BuildWallPlace":{{"ax":{},"ay":{},"angle":{}}}}}"#,
+                            ax, ay, angle
+                        );
+                        let mut escaped = String::new();
+                        for c in input_json.chars() {
+                            match c {
+                                '"' => escaped.push_str("\\\""),
+                                '\\' => escaped.push_str("\\\\"),
+                                _ => escaped.push(c),
+                            }
+                        }
+                        self.net.send_message(&format!(r#"{{"type":"input","input":"{}"}}"#, escaped));
+                    }
+                }
+            } else if let Some(airstrike_weapon) = self.airstrike_mode {
+                // Use the locked target X (set by tapping). If player hasn't tapped yet, do nothing.
+                let target_x = match self.airstrike_locked_x.take() {
+                    Some(x) => x,
+                    None => return, // no target locked yet — wait for player to tap first
+                };
                 self.airstrike_droplets.clear();
                 match airstrike_weapon {
                     Weapon::Airstrike => {
@@ -847,10 +987,7 @@ impl Game {
                         for i in 0..5 {
                             let x = target_x + (i as f32 - 2.0) * spacing;
                             self.airstrike_droplets.push(AirstrikeDroplet {
-                                x,
-                                y: -50.0,
-                                vy: 0.0,
-                                alive: true,
+                                x, y: -50.0, vy: 0.0, alive: true,
                                 weapon_type: AirstrikeType::Explosive,
                             });
                         }
@@ -860,10 +997,7 @@ impl Game {
                         for i in 0..7 {
                             let x = target_x + (i as f32 - 3.0) * spacing;
                             self.airstrike_droplets.push(AirstrikeDroplet {
-                                x,
-                                y: -50.0,
-                                vy: 0.0,
-                                alive: true,
+                                x, y: -50.0, vy: 0.0, alive: true,
                                 weapon_type: AirstrikeType::Napalm,
                             });
                         }
@@ -873,11 +1007,9 @@ impl Game {
                 self.airstrike_mode = None;
                 self.has_fired = true;
                 self.phase = Phase::ProjectileFlying;
-                // Fresh budget so the active player can dodge during the airstrike
                 if self.current_ball < self.balls.len() {
                     self.balls[self.current_ball].reset_movement_budget();
                 }
-                // Sync airstrike target to other players
                 if self.net.connected {
                     let weapon_name = match airstrike_weapon {
                         Weapon::NapalmStrike => "NapalmStrike",
@@ -895,32 +1027,24 @@ impl Game {
                             _ => escaped.push(c),
                         }
                     }
-                    let msg = format!(r#"{{"type":"input","input":"{}"}}"#, escaped);
-                    self.net.send_message(&msg);
+                    self.net.send_message(&format!(r#"{{"type":"input","input":"{}"}}"#, escaped));
                 }
-            }
-            // Handle Teleport mode
-            else if self.teleport_mode {
-                let (mx, my) = mouse_position();
-                let world_pos = self.cam.to_macroquad().screen_to_world(vec2(mx, my));
-                
+            } else if self.teleport_mode {
+                // Use the locked destination (set by tapping). If player hasn't tapped yet, do nothing.
+                let (target_x, target_y) = match self.teleport_locked_pos.take() {
+                    Some(pos) => pos,
+                    None => return, // no destination locked yet — wait for player to tap first
+                };
                 let idx = self.current_ball;
                 if idx < self.balls.len() && self.balls[idx].alive {
-                    // Check if the destination is valid (not inside solid terrain)
-                    let target_x = world_pos.x.clamp(0.0, self.terrain.width as f32);
-                    let target_y = world_pos.y.clamp(0.0, self.terrain.height as f32);
-                    
-                    // Simple teleport - place ball at clicked location
                     self.balls[idx].x = target_x;
                     self.balls[idx].y = target_y;
                     self.balls[idx].vx = 0.0;
                     self.balls[idx].vy = 0.0;
-                    
                     self.teleport_mode = false;
                     self.has_fired = true;
                     self.phase = Phase::Settling;
                     self.settle_timer = 0.0;
-                    // Sync teleport destination to other players
                     if self.net.connected {
                         let input_json = format!(
                             r#"{{"TeleportTo":{{"x":{},"y":{}}}}}"#,
@@ -934,27 +1058,10 @@ impl Game {
                                 _ => escaped.push(c),
                             }
                         }
-                        let msg = format!(r#"{{"type":"input","input":"{}"}}"#, escaped);
-                        self.net.send_message(&msg);
+                        self.net.send_message(&format!(r#"{{"type":"input","input":"{}"}}"#, escaped));
                     }
                 }
-            }
-            // Left-click only handles placement weapons (teleport, airstrike, build wall).
-            // Normal charging and baseball bat are triggered exclusively by the F key.
-        }
-        // F-key fire button: the ONLY way to start a charge or swing the bat.
-        // Skips click-targeting weapons (airstrike, teleport, build wall) that need a canvas click.
-        if is_key_pressed(KeyCode::F)
-            && !self.has_fired
-            && self.is_my_turn()
-            && self.phase.allows_input()
-            && !self.weapon_menu_open
-            && !self.charging
-            && !self.build_wall_mode
-            && !self.teleport_mode
-            && self.airstrike_mode.is_none()
-        {
-            if self.baseball_bat_mode {
+            } else if self.baseball_bat_mode {
                 // Baseball bat fires instantly on F press (no charge needed).
                 let idx = self.current_ball;
                 if idx < self.balls.len() && self.balls[idx].alive {
@@ -1010,6 +1117,49 @@ impl Game {
                 self.firing_by_key = false;
                 self.fire();
             }
+        }
+
+        // Keep the FIRE button label in sync with the active weapon mode.
+        self.sync_fire_label();
+    }
+
+    /// Returns the label that the FIRE button should show for the current weapon/mode.
+    fn current_fire_label(&self) -> &'static str {
+        if self.airstrike_mode.is_some() {
+            if self.airstrike_locked_x.is_some() {
+                "\u{1F525}\nFIRE"      // 🔥 FIRE — target locked, ready to launch
+            } else {
+                "\u{1F3AF}\nTARGET"    // 🎯 TARGET — tap the map to lock a target first
+            }
+        } else if self.teleport_mode {
+            if self.teleport_locked_pos.is_some() {
+                "\u{1F4CD}\nUSE"       // 📍 USE — destination locked, ready to warp
+            } else {
+                "\u{1F4CD}\nTARGET"    // 📍 TARGET — tap the map to lock a destination first
+            }
+        } else if self.build_wall_mode {
+            if self.build_wall_anchor.is_none() {
+                "\u{1F9F1}\nSET POS"   // 🧱 SET POS
+            } else {
+                "\u{1F9F1}\nSET ROT"   // 🧱 SET ROT
+            }
+        } else if self.baseball_bat_mode {
+            "\u{1F4A5}\nSWING"     // 💥 SWING
+        } else {
+            use weapons::WeaponType;
+            match self.selected_weapon.weapon_type() {
+                WeaponType::Placed => "\u{1F9E8}\nPLACE",  // 🧨 PLACE
+                _ => "\u{1F525}\nFIRE",                     // 🔥 FIRE
+            }
+        }
+    }
+
+    /// Sends an updated FIRE button label to the JS layer whenever the label changes.
+    fn sync_fire_label(&mut self) {
+        let label = self.current_fire_label();
+        if label != self.last_fire_label {
+            self.last_fire_label = label;
+            self.net.send_fire_label(label);
         }
     }
 
@@ -1116,26 +1266,33 @@ impl Game {
                 self.phase = Phase::ProjectileFlying;
             },
             
-            // Uzi - rapid fire 10 bullets with spread
+            // Uzi - burst-fire 20 bullets in a straight line, one every 0.07 s
             Weapon::Uzi => {
                 self.uzi_bullets.clear();
-                let bullet_count = 10;
-                let spread = 0.15;
-                let base_speed = power * 15.0;
-                
-                for i in 0..bullet_count {
-                    let offset_angle = (rand::gen_range(0.0, 1.0) - 0.5) * spread;
-                    let bullet_angle = angle + offset_angle;
-                    let speed = base_speed * (0.95 + rand::gen_range(0.0, 0.1));
-                    
-                    self.uzi_bullets.push(UziBullet {
-                        x: sx,
-                        y: sy,
-                        vx: bullet_angle.cos() * speed,
-                        vy: bullet_angle.sin() * speed,
-                        alive: true,
-                    });
+                let base_speed = power * 18.0;
+
+                // Spawn the first bullet immediately
+                self.uzi_bullets.push(UziBullet {
+                    x: sx,
+                    y: sy,
+                    vx: angle.cos() * base_speed,
+                    vy: angle.sin() * base_speed,
+                    alive: true,
+                });
+                // Pushback on shooter for the first bullet
+                if idx < self.balls.len() {
+                    self.balls[idx].apply_knockback(-angle.cos() * 18.0, -angle.sin() * 18.0);
                 }
+
+                // Queue the remaining 19 bullets
+                self.uzi_burst_remaining = 19;
+                self.uzi_burst_timer = 0.07;
+                self.uzi_burst_angle = angle;
+                self.uzi_burst_speed = base_speed;
+                self.uzi_burst_ox = sx;
+                self.uzi_burst_oy = sy;
+                self.uzi_burst_shooter = idx;
+
                 self.phase = Phase::ProjectileFlying;
             },
             
@@ -1160,6 +1317,8 @@ impl Game {
                     alive: true,
                     radius: 45.0,
                     damage: 50,
+                    proximity_radius: 0.0,
+                    arming_timer: 0.0,
                 });
                 self.phase = Phase::Retreat;
                 self.retreat_timer = 5.0;
@@ -1302,10 +1461,12 @@ impl Game {
                 self.placed_explosives.push(PlacedExplosive {
                     x: ball.x,
                     y: ball.y + BALL_RADIUS - 2.0,
-                    fuse: 3.0,
+                    fuse: f32::MAX,
                     alive: true,
                     radius: 30.0,
                     damage: 45,
+                    proximity_radius: 40.0,
+                    arming_timer: 2.0,
                 });
                 self.phase = Phase::Retreat;
                 self.retreat_timer = 5.0;
@@ -1747,6 +1908,8 @@ impl Game {
         self.build_wall_mode = false;
         self.build_wall_anchor = None;
         self.airstrike_mode = None;
+        self.airstrike_locked_x = None;
+        self.teleport_locked_pos = None;
         self.bot_think_timer = 3.0;
         self.stuck_phase_timer = 0.0;
         
@@ -1991,9 +2154,17 @@ impl Game {
                 continue;
             }
             if msg.contains("\"type\":\"input\"") || msg.contains("\"type\": \"input\"") {
-                // If we have a pending turn sync, apply it first so we fire on the right ball
-                if let Some(player_idx) = self.pending_turn_sync.take() {
-                    self.sync_to_player_turn(player_idx);
+                // Bug 2 fix: only consume pending_turn_sync when we are actually in a
+                // state that expects a new turn to begin.  If an `input` echo arrives
+                // while we are still in Retreat or Settling (from the *previous* turn),
+                // consuming the pending sync here would call reset_turn_state() and
+                // teleport the phase back to Aiming mid-retreat, causing permanent
+                // desync.  The sync will be applied on the very next `input` message
+                // that arrives once we've reached an appropriate phase.
+                if matches!(self.phase, Phase::Aiming | Phase::Charging | Phase::TurnEnd) {
+                    if let Some(player_idx) = self.pending_turn_sync.take() {
+                        self.sync_to_player_turn(player_idx);
+                    }
                 }
 
                 if let Some((player_index, input_str)) = parse_input_message(&msg) {
@@ -2244,12 +2415,19 @@ impl Game {
                 self.turn_timer -= dt;
                 let bot_team = self.current_turn_index;
                 let is_bot_turn = self.net.player_is_bot.get(bot_team).copied().unwrap_or(false);
-                if self.turn_timer <= 0.0 && (self.is_my_turn() || is_bot_turn) {
+                // Bug 4 fix: when connected, the server manages bot turn pacing via
+                // maybeBotTurn() — don't let the human client call end_turn() on
+                // behalf of a bot, or the client enters TurnEnd with stale state.
+                if self.turn_timer <= 0.0 && (self.is_my_turn() || (is_bot_turn && !self.net.connected)) {
                     self.end_turn();
                 }
 
                 // ── Bot AI ──────────────────────────────────────────────────────
-                if is_bot_turn && !self.has_fired {
+                // Bug 1 fix: when connected the server's maybeBotTurn() sends an
+                // `input` message that every client replays via apply_network_messages.
+                // Running the inline bot AI here as well causes a double-fire and
+                // immediate state divergence between clients.
+                if is_bot_turn && !self.has_fired && !self.net.connected {
                     self.bot_think_timer -= dt;
                     if self.bot_think_timer <= 0.0 {
                         if let Some(bot_ball_idx) = self.find_ball_for_player(bot_team) {
@@ -2374,27 +2552,52 @@ impl Game {
                     }
                 }
 
-                // Handle Uzi bullets
-                if !self.uzi_bullets.is_empty() {
-                    let mut any_active = false;
-                    let mut bullet_follow: Option<(f32, f32)> = None;
-                    for bullet in &mut self.uzi_bullets {
-                        if bullet.alive {
-                            let hit = bullet.tick(&mut self.terrain, &mut self.balls, dt);
-                            if hit {
-                                self.terrain_dirty = true;
+                // Handle Uzi bullets — tick existing ones then spawn burst bullets
+                {
+                    // Tick burst timer and spawn next bullet if due
+                    if self.uzi_burst_remaining > 0 {
+                        self.uzi_burst_timer -= dt;
+                        while self.uzi_burst_timer <= 0.0 && self.uzi_burst_remaining > 0 {
+                            let a = self.uzi_burst_angle;
+                            let s = self.uzi_burst_speed;
+                            self.uzi_bullets.push(UziBullet {
+                                x: self.uzi_burst_ox,
+                                y: self.uzi_burst_oy,
+                                vx: a.cos() * s,
+                                vy: a.sin() * s,
+                                alive: true,
+                            });
+                            // Pushback on shooter per bullet
+                            let shooter = self.uzi_burst_shooter;
+                            if shooter < self.balls.len() && self.balls[shooter].alive {
+                                self.balls[shooter].apply_knockback(-a.cos() * 18.0, -a.sin() * 18.0);
                             }
-                            if bullet.alive {
-                                any_active = true;
-                                bullet_follow = Some((bullet.x, bullet.y));
-                            }
+                            self.uzi_burst_remaining -= 1;
+                            self.uzi_burst_timer += 0.07;
                         }
                     }
-                    if let Some((bx, by)) = bullet_follow {
-                        self.auto_follow(bx, by, 5.0, dt);
-                    }
-                    if !any_active {
-                        self.uzi_bullets.clear();
+
+                    if !self.uzi_bullets.is_empty() {
+                        let mut any_active = false;
+                        let mut bullet_follow: Option<(f32, f32)> = None;
+                        for bullet in &mut self.uzi_bullets {
+                            if bullet.alive {
+                                let hit = bullet.tick(&mut self.terrain, &mut self.balls, dt);
+                                if hit {
+                                    self.terrain_dirty = true;
+                                }
+                                if bullet.alive {
+                                    any_active = true;
+                                    bullet_follow = Some((bullet.x, bullet.y));
+                                }
+                            }
+                        }
+                        if let Some((bx, by)) = bullet_follow {
+                            self.auto_follow(bx, by, 5.0, dt);
+                        }
+                        if !any_active {
+                            self.uzi_bullets.clear();
+                        }
                     }
                 }
 
@@ -2481,6 +2684,7 @@ impl Game {
                 let all_done = self.proj.is_none() 
                     && self.shotgun_pellets.is_empty() 
                     && self.uzi_bullets.is_empty()
+                    && self.uzi_burst_remaining == 0
                     && self.airstrike_droplets.is_empty()
                     && self.placed_explosives.is_empty()
                     && self.cluster_bomblets.is_empty();
@@ -2500,6 +2704,7 @@ impl Game {
                     self.proj = None;
                     self.shotgun_pellets.clear();
                     self.uzi_bullets.clear();
+                    self.uzi_burst_remaining = 0;
                     self.airstrike_droplets.clear();
                     self.cluster_bomblets.clear();
                     self.end_turn();
@@ -3110,26 +3315,37 @@ impl Game {
             }
         }
 
-        // Airstrike / NapalmStrike preview: vertical drop lines at each target X
+        // Airstrike / NapalmStrike preview: vertical drop lines at each target X.
+        // When no target is locked yet, the preview tracks the camera centre so the
+        // player pans to position the strike and then taps to confirm.
         if let Some(airstrike_weapon) = self.airstrike_mode {
             if self.is_my_turn() {
-                let (mx, my) = mouse_position();
-                let world_pos = self.cam.to_macroquad().screen_to_world(vec2(mx, my));
+                let locked = self.airstrike_locked_x.is_some();
+                // Live preview uses cam centre; confirmed target uses the locked X.
+                let target_x = self.airstrike_locked_x.unwrap_or(self.cam.x);
                 let top_y = self.cam.y - self.cam.visible_height() / 2.0 - 50.0;
                 let bot_y = self.cam.y + self.cam.visible_height() / 2.0;
-                let (count, spacing, color) = match airstrike_weapon {
-                    Weapon::NapalmStrike => (7usize, 60.0f32, Color::new(1.0, 0.45, 0.1, 0.75)),
-                    _ =>                   (5usize, 80.0f32, Color::new(1.0, 0.15, 0.15, 0.75)),
+                let (count, spacing, base_color) = match airstrike_weapon {
+                    Weapon::NapalmStrike => (7usize, 60.0f32, Color::new(1.0, 0.45, 0.1, 1.0)),
+                    _ =>                   (5usize, 80.0f32, Color::new(1.0, 0.15, 0.15, 1.0)),
                 };
+                // Locked = solid bright lines; preview = translucent dashed lines.
+                let alpha = if locked { 1.0f32 } else { 0.55 };
+                let color = Color::new(base_color.r, base_color.g, base_color.b, alpha);
                 let half = count / 2;
                 for i in 0..count {
-                    let x = world_pos.x + (i as f32 - half as f32) * spacing;
-                    // Dashed line: alternate drawn/gap segments
-                    let segments = 20;
-                    let seg_h = (bot_y - top_y) / (segments as f32 * 2.0);
-                    for s in 0..segments {
-                        let y0 = top_y + s as f32 * seg_h * 2.0;
-                        draw_line(x, y0, x, y0 + seg_h, 2.0, color);
+                    let x = target_x + (i as f32 - half as f32) * spacing;
+                    if locked {
+                        // Solid line when target is confirmed
+                        draw_line(x, top_y, x, bot_y, 2.5, color);
+                    } else {
+                        // Dashed line for live preview
+                        let segments = 20;
+                        let seg_h = (bot_y - top_y) / (segments as f32 * 2.0);
+                        for s in 0..segments {
+                            let y0 = top_y + s as f32 * seg_h * 2.0;
+                            draw_line(x, y0, x, y0 + seg_h, 2.0, color);
+                        }
                     }
                     // Arrow head
                     draw_triangle(
@@ -3139,6 +3355,21 @@ impl Game {
                         color,
                     );
                 }
+
+                // Centre-drop reticle on the middle column — gives a clear screen-centre
+                // indicator while panning, and a bright "locked here" marker after tapping.
+                let mid_y = self.cam.y; // world-space screen centre
+                let r_inner = if locked { 18.0f32 } else { 14.0 };
+                let r_outer = r_inner + 8.0;
+                let reticle_col = Color::new(base_color.r, base_color.g, base_color.b, if locked { 1.0 } else { 0.75 });
+                draw_circle_lines(target_x, mid_y, r_inner, 2.0, reticle_col);
+                draw_circle_lines(target_x, mid_y, r_outer, 1.2, reticle_col);
+                // Cross-hair ticks
+                let tick = 10.0f32;
+                draw_line(target_x - r_outer - tick, mid_y, target_x - r_outer, mid_y, 2.0, reticle_col);
+                draw_line(target_x + r_outer, mid_y, target_x + r_outer + tick, mid_y, 2.0, reticle_col);
+                draw_line(target_x, mid_y - r_outer - tick, target_x, mid_y - r_outer, 2.0, reticle_col);
+                draw_line(target_x, mid_y + r_outer, target_x, mid_y + r_outer + tick, 2.0, reticle_col);
             }
         }
 
@@ -3147,6 +3378,30 @@ impl Game {
             let c = Color::new(p.color.r, p.color.g, p.color.b, p.color.a * alpha);
             draw_circle(p.x, p.y, p.size, c);
         }
+
+        // Teleport crosshair drawn in WORLD space (camera still active here).
+        let teleport_locked_for_hint = if self.teleport_mode && self.is_my_turn() {
+            let (wx, wy, locked) = if let Some((lx, ly)) = self.teleport_locked_pos {
+                (lx, ly, true)
+            } else {
+                (self.cam.x, self.cam.y, false)
+            };
+            let alpha = if locked { 1.0f32 } else { 0.65 };
+            let col = Color::new(0.35, 0.95, 1.0, alpha);
+            let r = 20.0f32;
+            let thick = if locked { 2.5 } else { 1.8 };
+            // Outer ring + ticks
+            draw_circle_lines(wx, wy, r, thick, col);
+            draw_circle_lines(wx, wy, r * 0.35, thick, col);
+            let tick = 10.0f32;
+            draw_line(wx - r - tick, wy, wx - r, wy, thick, col);
+            draw_line(wx + r, wy, wx + r + tick, wy, thick, col);
+            draw_line(wx, wy - r - tick, wx, wy - r, thick, col);
+            draw_line(wx, wy + r, wx, wy + r + tick, thick, col);
+            Some(locked)
+        } else {
+            None
+        };
 
         set_default_camera();
 
@@ -3162,12 +3417,21 @@ impl Game {
             draw_text(hint, sw / 2.0 - tw / 2.0, 58.0, 22.0, Color::new(0.9, 0.75, 0.3, 1.0));
         }
 
-        // Teleport hint
-        if self.teleport_mode && self.is_my_turn() {
-            let hint = "[ TELEPORT ]  Click destination";
+        // Teleport hint text (screen space, drawn after set_default_camera).
+        if let Some(locked) = teleport_locked_for_hint {
+            let hint = if locked {
+                "DESTINATION LOCKED \u{2014} Press FIRE to warp"
+            } else {
+                "[ TELEPORT ]  Pan to destination \u{2192} Tap to lock"
+            };
             let sw = screen_width();
             let tw = measure_text(hint, None, 22, 1.0).width;
-            draw_text(hint, sw / 2.0 - tw / 2.0, 58.0, 22.0, Color::new(0.4, 0.9, 1.0, 1.0));
+            let hint_col = if locked {
+                Color::new(0.85, 1.0, 0.35, 1.0)
+            } else {
+                Color::new(0.4, 0.9, 1.0, 1.0)
+            };
+            draw_text(hint, sw / 2.0 - tw / 2.0, 58.0, 22.0, hint_col);
         }
 
         // Baseball Bat hint
@@ -3181,16 +3445,39 @@ impl Game {
             draw_text(hint, sw / 2.0 - tw / 2.0, 58.0, 22.0, Color::new(1.0, 0.75, 0.3, 1.0));
         }
 
+        // Nuke hint
+        if self.selected_weapon == Weapon::Nuke
+            && (self.phase == Phase::Aiming || self.phase == Phase::Charging)
+            && !self.has_fired && self.is_my_turn()
+        {
+            let hint = "[ NUKE ]  Charge and fire - explosion destroys the entire map";
+            let sw = screen_width();
+            let tw = measure_text(hint, None, 22, 1.0).width;
+            draw_text(hint, sw / 2.0 - tw / 2.0, 58.0, 22.0, Color::new(1.0, 0.3, 0.3, 1.0));
+        }
+
         // Airstrike / NapalmStrike targeting hint
         if let Some(airstrike_weapon) = self.airstrike_mode {
             if self.is_my_turn() {
-                let hint = match airstrike_weapon {
-                    Weapon::NapalmStrike => "[ NAPALM STRIKE ]  Click to set target",
-                    _ =>                   "[ AIRSTRIKE ]  Click to set target",
+                let locked = self.airstrike_locked_x.is_some();
+                let name = if airstrike_weapon == Weapon::NapalmStrike { "NAPALM STRIKE" } else { "AIRSTRIKE" };
+                let hint = if locked {
+                    "TARGET LOCKED \u{2014} Press FIRE to launch"
+                } else {
+                    match airstrike_weapon {
+                        Weapon::NapalmStrike => "[ NAPALM STRIKE ]  Pan to position \u{2192} Tap to lock target",
+                        _ =>                   "[ AIRSTRIKE ]  Pan to position \u{2192} Tap to lock target",
+                    }
                 };
+                let _ = name; // suppress unused warning
                 let sw = screen_width();
                 let tw = measure_text(hint, None, 22, 1.0).width;
-                draw_text(hint, sw / 2.0 - tw / 2.0, 58.0, 22.0, Color::new(1.0, 0.5, 0.2, 1.0));
+                let col = if locked {
+                    Color::new(1.0, 0.85, 0.2, 1.0) // gold when locked
+                } else {
+                    Color::new(1.0, 0.5, 0.2, 1.0)
+                };
+                draw_text(hint, sw / 2.0 - tw / 2.0, 58.0, 22.0, col);
             }
         }
 
@@ -3209,6 +3496,7 @@ impl Game {
             &turn_owner,
             self.weapon_menu_open,
             self.weapon_menu_scroll,
+            &self.weapon_search,
         );
     }
 
@@ -3331,32 +3619,24 @@ impl Game {
 
             // ── Uzi ───────────────────────────────────────────────────────────
             Weapon::Uzi => {
-                let range = 300.0f32;
-                let spread = 0.10f32;
-                let rays = 7usize;
-                for i in 0..rays {
-                    let t_param = i as f32 / (rays - 1) as f32;
-                    let ray_angle = angle - spread + t_param * spread * 2.0;
-                    let ca = ray_angle.cos();
-                    let sa = ray_angle.sin();
-                    let mut ex = bx + ca * range;
-                    let mut ey = by + sa * range;
-                    let mut tr = BALL_RADIUS + 4.0;
-                    while tr < range {
-                        let rx = bx + ca * tr;
-                        let ry = by + sa * tr;
-                        if self.terrain.is_solid(rx as i32, ry as i32) {
-                            ex = rx; ey = ry; break;
-                        }
-                        ex = rx; ey = ry;
-                        tr += 3.0;
+                // Single tight beam — no spread fan
+                let range = 320.0f32;
+                let ca = angle.cos();
+                let sa = angle.sin();
+                let mut ex = bx + ca * range;
+                let mut ey = by + sa * range;
+                let mut tr = BALL_RADIUS + 4.0;
+                while tr < range {
+                    let rx = bx + ca * tr;
+                    let ry = by + sa * tr;
+                    if self.terrain.is_solid(rx as i32, ry as i32) {
+                        ex = rx; ey = ry; break;
                     }
-                    let is_center = i == rays / 2;
-                    let alpha = if is_center { 0.75 } else { 0.30 };
-                    let w = if is_center { 2.0 } else { 1.0 };
-                    draw_line(bx, by, ex, ey, w, Color::new(0.95, 0.9, 0.25, alpha));
-                    draw_circle(ex, ey, 2.5, Color::new(1.0, 0.95, 0.4, alpha + 0.1));
+                    ex = rx; ey = ry;
+                    tr += 3.0;
                 }
+                draw_line(bx, by, ex, ey, 2.0, Color::new(0.95, 0.9, 0.25, 0.80));
+                draw_circle(ex, ey, 3.0, Color::new(1.0, 0.95, 0.4, 0.90));
             }
 
             // ── Shotgun ───────────────────────────────────────────────────────

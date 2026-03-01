@@ -39,6 +39,7 @@ pub enum Weapon {
     Drill,
     SuperSheep,
     BuildWall,
+    Nuke,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -86,6 +87,7 @@ impl Weapon {
             Weapon::Drill => "Drill",
             Weapon::SuperSheep => "Super Sheep",
             Weapon::BuildWall => "Build Wall",
+            Weapon::Nuke => "Nuke",
         }
     }
 
@@ -94,7 +96,7 @@ impl Weapon {
             Weapon::Bazooka | Weapon::Grenade | Weapon::Shotgun | Weapon::ClusterBomb 
             | Weapon::BananaBomb | Weapon::HolyHandGrenade | Weapon::HomingMissile 
             | Weapon::Mortar | Weapon::Sheep | Weapon::BananaBonanza
-            | Weapon::SuperSheep => WeaponType::Projectile,
+            | Weapon::SuperSheep | Weapon::Nuke => WeaponType::Projectile,
             
             Weapon::Dynamite | Weapon::Mine => WeaponType::Placed,
             
@@ -127,6 +129,7 @@ impl Weapon {
             Weapon::Drill => 0.0,
             Weapon::SuperSheep => 55.0,
             Weapon::BuildWall => 0.0,
+            Weapon::Nuke => 800.0,
             _ => 0.0,
         }
     }
@@ -153,6 +156,7 @@ impl Weapon {
             Weapon::Drill => 0,
             Weapon::SuperSheep => 70,
             Weapon::BuildWall => 0,
+            Weapon::Nuke => 1000,
             _ => 0,
         }
     }
@@ -255,6 +259,7 @@ impl Weapon {
             "Concrete Shell" => Some(Weapon::Drill),
             "Super Sheep" => Some(Weapon::SuperSheep),
             "Build Wall" => Some(Weapon::BuildWall),
+            "Nuke" => Some(Weapon::Nuke),
             _ => None,
         }
     }
@@ -282,6 +287,7 @@ impl Weapon {
             Weapon::Drill,
             Weapon::SuperSheep,
             Weapon::BuildWall,
+            Weapon::Nuke,
         ]
     }
     
@@ -295,7 +301,7 @@ impl Weapon {
             
             Weapon::Teleport | Weapon::Jetpack | Weapon::Parachute | Weapon::Rope | Weapon::BuildWall | Weapon::Drill => WeaponCategory::Utilities,
             
-            Weapon::Sheep | Weapon::SuperSheep | Weapon::BaseballBat => WeaponCategory::Special,
+            Weapon::Sheep | Weapon::SuperSheep | Weapon::BaseballBat | Weapon::Nuke => WeaponCategory::Special,
         }
     }
     
@@ -325,6 +331,7 @@ impl Weapon {
             Weapon::Drill => "[]",
             Weapon::SuperSheep => "@!",
             Weapon::BuildWall => "###",
+            Weapon::Nuke => "(X)",
         }
     }
     
@@ -354,6 +361,7 @@ impl Weapon {
             Weapon::Drill => "Drills a walkable tunnel through terrain. No damage.",
             Weapon::SuperSheep => "Flying explosive sheep!",
             Weapon::BuildWall => "Place a short wooden wall at target location",
+            Weapon::Nuke => "Charge and fire. Explosion radius covers the entire map. No survivors.",
         }
     }
 }

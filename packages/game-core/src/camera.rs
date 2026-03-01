@@ -87,8 +87,25 @@ impl GameCamera {
         self.vel_y *= friction;
     }
 
+    /// Minimum zoom level that prevents the viewport from showing below the terrain.
+    /// Computed dynamically from the current screen aspect ratio so it works correctly
+    /// in both landscape and portrait orientations.
+    pub fn min_zoom() -> f32 {
+        // In landscape the short axis is the height → visible_height = BASE_SHORT_AXIS / zoom.
+        // In portrait the height is the long axis → visible_height = BASE_SHORT_AXIS / zoom * (h/w).
+        // We need visible_height ≤ terrain HEIGHT so cameras can always keep the view
+        // inside the world without revealing the void below the terrain.
+        let aspect = if screen_height() > screen_width() {
+            screen_height() / screen_width()
+        } else {
+            1.0
+        };
+        // 5 % headroom so the terrain edge is never flush against the viewport boundary.
+        (BASE_SHORT_AXIS * aspect / crate::terrain::HEIGHT as f32 * 1.05).max(0.3)
+    }
+
     pub fn zoom_by(&mut self, factor: f32) {
-        self.zoom = (self.zoom * factor).clamp(0.3, 4.0);
+        self.zoom = (self.zoom * factor).clamp(Self::min_zoom(), 4.0);
     }
 
     /// Zoom by `factor` while keeping the world point currently under screen pixel
@@ -102,7 +119,7 @@ impl GameCamera {
         let world_x_before = self.x + self.visible_width() * fx;
         let world_y_before = self.y + self.visible_height() * fy;
         // Apply zoom
-        self.zoom = (self.zoom * factor).clamp(0.3, 4.0);
+        self.zoom = (self.zoom * factor).clamp(Self::min_zoom(), 4.0);
         // Shift camera so the same world point remains under the cursor
         let world_x_after = self.x + self.visible_width() * fx;
         let world_y_after = self.y + self.visible_height() * fy;

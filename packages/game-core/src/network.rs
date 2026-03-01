@@ -55,6 +55,22 @@ impl NetworkState {
         }
     }
 
+    /// Update the FIRE button label in the JS UI layer.
+    /// Called whenever the active weapon mode changes (airstrike, teleport, normal fire, etc.).
+    pub fn send_fire_label(&self, label: &str) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let bytes = label.as_bytes();
+            unsafe {
+                js_set_fire_label(bytes.as_ptr(), bytes.len() as u32);
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = label;
+        }
+    }
+
     /// Dispatch a UI event (hit, died, turn_start, game_over) to the JS layer.
     /// The JS side listens and converts this into React toast notifications.
     pub fn send_game_event(&self, event_json: &str) {
@@ -76,6 +92,8 @@ impl NetworkState {
 extern "C" {
     fn js_send_ws(ptr: *const u8, len: u32);
     fn js_game_event(ptr: *const u8, len: u32);
+    /// Updates the mobile/desktop FIRE button label to reflect the current weapon mode.
+    fn js_set_fire_label(ptr: *const u8, len: u32);
 }
 
 #[no_mangle]

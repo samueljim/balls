@@ -103,6 +103,21 @@
         console.warn("[ws_plugin] js_game_event parse error", e);
       }
     };
+
+    // Updates the FIRE button label whenever the active weapon mode changes.
+    // Dispatches a custom DOM event so mobile_controls.js can update the button text.
+    importObject.env.js_set_fire_label = function (ptr, len) {
+      if (typeof wasm_memory === "undefined") return;
+      try {
+        var heap = new Uint8Array(wasm_memory.buffer, ptr, len);
+        var label = UTF8ToString(heap, 0, len);
+        if (typeof window.__updateFireLabel === "function") {
+          window.__updateFireLabel(label);
+        }
+      } catch (e) {
+        console.warn("[ws_plugin] js_set_fire_label error", e);
+      }
+    };
   }
 
   function on_init() {

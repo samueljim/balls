@@ -159,9 +159,9 @@ impl UziBullet {
             return false;
         }
 
-        const GRAVITY: f32 = 300.0; // Less gravity than shotgun pellets
+        const GRAVITY: f32 = 60.0; // Very low — bullets fly nearly straight
         self.vy += GRAVITY * dt;
-        self.vx *= 0.995; // Very little air resistance
+        self.vx *= 0.998; // Negligible air resistance
         
         self.x += self.vx * dt;
         self.y += self.vy * dt;
@@ -201,8 +201,8 @@ impl UziBullet {
             if dist_sq < 80.0 { // ~9 pixel radius
                 w.take_damage(5);
                 let dist = dist_sq.sqrt().max(1.0);
-                let knock = 40.0;
-                w.apply_knockback((dx / dist) * knock, (dy / dist) * knock - 30.0);
+                let knock = 60.0;
+                w.apply_knockback((dx / dist) * knock, (dy / dist) * knock - 40.0);
                 self.alive = false;
                 return true;
             }
@@ -215,15 +215,33 @@ impl UziBullet {
 pub struct PlacedExplosive {
     pub x: f32,
     pub y: f32,
+    /// Countdown fuse in seconds. For proximity mines this is set to f32::MAX
+    /// (never expires via timer; proximity_radius drives detonation instead).
     pub fuse: f32,
     pub alive: bool,
     pub radius: f32,
     pub damage: i32,
+    /// > 0 means proximity-triggered (mine). 0 means timer-triggered (dynamite).
+    pub proximity_radius: f32,
+    /// Arming delay for proximity mines. Mine won't trigger until this reaches 0.
+    pub arming_timer: f32,
 }
 
 impl PlacedExplosive {
+    /// Tick timer-fused explosives (dynamite). Returns true when they should explode.
+    /// Also counts down the arming timer for proximity mines.
     pub fn tick(&mut self, dt: f32) -> bool {
         if !self.alive {
+            return false;
+        }
+
+        // Always count down the arming timer (safe to do for dynamite too — it's 0.0)
+        if self.arming_timer > 0.0 {
+            self.arming_timer -= dt;
+        }
+
+        // Proximity mines never expire via fuse
+        if self.proximity_radius > 0.0 {
             return false;
         }
 
@@ -233,6 +251,26 @@ impl PlacedExplosive {
             return true; // Explode!
         }
 
+        false
+    }
+
+    /// Returns true if any alive ball is within the proximity trigger radius AND
+    /// the arming delay has expired. Only meaningful for proximity mines.
+    pub fn check_proximity(&self, balls: &[Ball]) -> bool {
+        if self.proximity_radius <= 0.0 || self.arming_timer > 0.0 || !self.alive {
+            return false;
+        }
+        let r2 = self.proximity_radius * self.proximity_radius;
+        for ball in balls {
+            if !ball.alive {
+                continue;
+            }
+            let dx = ball.x - self.x;
+            let dy = ball.y - self.y;
+            if dx * dx + dy * dy < r2 {
+                return true;
+            }
+        }
         false
     }
 

@@ -23,6 +23,12 @@ pub struct WeaponMenuLayout {
     /// Device pixel ratio (1.0 on desktop, 2-3 on HiDPI mobile).
     /// Used ONLY to convert CSS px → physical pixels for the GL scissor rect.
     pub dpi: f32,
+    /// Height of the title-only strip at the top of the header (above search bar).
+    pub title_h: f32,
+    /// Y position (CSS px) of the search input bar within the header.
+    pub search_bar_y: f32,
+    /// Height (CSS px) of the search input bar.
+    pub search_bar_h: f32,
 }
 
 impl WeaponMenuLayout {
@@ -50,7 +56,10 @@ impl WeaponMenuLayout {
         };
         let menu_x = sw / 2.0 - menu_w / 2.0;
         let menu_y = if is_mobile { 50.0 } else { sh / 2.0 - menu_h / 2.0 };
-        let header_h = if is_mobile { 44.0 } else { 52.0 };
+        let title_h = if is_mobile { 36.0 } else { 52.0 };
+        let search_bar_h = if is_mobile { 26.0 } else { 32.0 };
+        let search_bar_y = menu_y + title_h + 4.0;
+        let header_h = title_h + search_bar_h + 10.0; // 4px above + 6px below search bar
         let footer_h = if is_mobile { 36.0 } else { 44.0 };
         let content_y = menu_y + header_h + 6.0;
         let content_h = menu_h - header_h - 6.0 - footer_h;
@@ -59,12 +68,15 @@ impl WeaponMenuLayout {
         let cat_header_h = if is_mobile { 24.0 } else { 30.0 };
         let item_padding = 2.0;
         let cat_spacing = 6.0;
-        Self { menu_x, menu_y, menu_w, menu_h, header_h, footer_h, content_y, content_h,
+        Self { menu_x, menu_y, menu_w, menu_h, header_h, title_h, search_bar_y, search_bar_h,
+               footer_h, content_y, content_h,
                padding, item_h, cat_header_h, item_padding, cat_spacing, is_mobile, dpi }
     }
 
     /// Total height of all content (categories + weapons) to determine max scroll.
-    pub fn total_content_height(&self) -> f32 {
+    /// Pass `search` to account for filtered weapon lists.
+    pub fn total_content_height(&self, search: &str) -> f32 {
+        let sq = search.to_lowercase();
         let categories = [
             WeaponCategory::Explosives,
             WeaponCategory::Ballistics,
@@ -74,14 +86,19 @@ impl WeaponMenuLayout {
         let all_weapons = Weapon::all();
         let mut by_category: std::collections::HashMap<WeaponCategory, Vec<&Weapon>> = std::collections::HashMap::new();
         for w in all_weapons {
-            by_category.entry(w.category()).or_insert_with(Vec::new).push(w);
+            if sq.is_empty() || w.name().to_lowercase().contains(&sq) || w.description().to_lowercase().contains(&sq) {
+                by_category.entry(w.category()).or_insert_with(Vec::new).push(w);
+            }
         }
-        let mut h = 0.0_f32;
-        for (i, cat) in categories.iter().enumerate() {
-            if let Some(weapons) = by_category.get(cat) {
+        let mut h = 4.0_f32; // initial top padding
+        let cats_with_weapons: Vec<_> = categories.iter()
+            .filter(|cat| by_category.get(*cat).map_or(false, |v| !v.is_empty()))
+            .collect();
+        for (i, cat) in cats_with_weapons.iter().enumerate() {
+            if let Some(weapons) = by_category.get(*cat) {
                 h += self.cat_header_h + self.item_padding;
                 h += weapons.len() as f32 * (self.item_h + self.item_padding);
-                if i < categories.len() - 1 {
+                if i < cats_with_weapons.len() - 1 {
                     h += self.cat_spacing;
                 }
             }
@@ -89,8 +106,8 @@ impl WeaponMenuLayout {
         h
     }
 
-    pub fn max_scroll(&self) -> f32 {
-        (self.total_content_height() - self.content_h).max(0.0)
+    pub fn max_scroll(&self, search: &str) -> f32 {
+        (self.total_content_height(search) - self.content_h).max(0.0)
     }
 }
 
@@ -107,6 +124,7 @@ pub fn draw_hud(
     turn_owner_name: &str,
     weapon_menu_open: bool,
     weapon_menu_scroll: f32,
+    weapon_search: &str,
 ) {
     let sw = screen_width();
     let sh = screen_height();
@@ -269,11 +287,11 @@ pub fn draw_hud(
     
     // Draw weapon menu
     if weapon_menu_open {
-        draw_weapon_menu(selected_weapon, weapon_menu_scroll);
+        draw_weapon_menu(selected_weapon, weapon_menu_scroll, weapon_search);
     }
 }
 
-fn draw_weapon_menu(selected_weapon: Weapon, scroll_offset: f32) {
+fn draw_weapon_menu(selected_weapon: Weapon, scroll_offset: f32, search: &str) {
     let sw = screen_width();
     let sh = screen_height();
     let layout = WeaponMenuLayout::new();
@@ -309,17 +327,47 @@ fn draw_weapon_menu(selected_weapon: Weapon, scroll_offset: f32) {
     draw_rectangle(menu_x, menu_y, menu_w, header_h, Color::new(0.12, 0.15, 0.2, 1.0));
     draw_rectangle(menu_x, menu_y + header_h, menu_w, 1.0, Color::new(0.3, 0.5, 0.7, 0.5));
     
-    let title = "== WEAPON ARSENAL ==";
+    let title = "WEAPONS";
     let title_size = if is_mobile { 18.0 } else { 22.0 };
     let title_w = measure_text(title, None, title_size as u16, 1.0).width;
     draw_text(
         title,
         menu_x + menu_w / 2.0 - title_w / 2.0,
-        menu_y + header_h - 12.0,
+        menu_y + layout.title_h - 12.0,
         title_size,
         Color::new(0.9, 0.95, 1.0, 1.0),
     );
-    
+
+    // Search bar
+    let sb_x = menu_x + layout.padding;
+    let sb_w = menu_w - layout.padding * 2.0;
+    let sb_y = layout.search_bar_y;
+    let sb_h = layout.search_bar_h;
+    let is_searching = !search.is_empty();
+    draw_rectangle(sb_x, sb_y, sb_w, sb_h, Color::new(0.06, 0.08, 0.12, 0.95));
+    let border_color = if is_searching {
+        Color::new(0.4, 0.65, 1.0, 0.9)
+    } else {
+        Color::new(0.2, 0.3, 0.48, 0.7)
+    };
+    draw_rectangle_lines(sb_x, sb_y, sb_w, sb_h, 1.5, border_color);
+    let search_text_size = if is_mobile { 13.0 } else { 15.0 };
+    let cursor_on = (get_time() % 1.0) < 0.6;
+    let (display_text, text_color) = if !is_searching {
+        ("/  search weapons...".to_string(), Color::new(0.35, 0.4, 0.52, 0.65))
+    } else if cursor_on {
+        (format!("/  {}|", search), Color::new(0.9, 0.95, 1.0, 1.0))
+    } else {
+        (format!("/  {}", search), Color::new(0.9, 0.95, 1.0, 1.0))
+    };
+    draw_text(
+        &display_text,
+        sb_x + 8.0,
+        sb_y + sb_h * 0.5 + search_text_size * 0.38,
+        search_text_size,
+        text_color,
+    );
+
     // Content area dimensions
     let content_y = layout.content_y;
     let content_h = layout.content_h;
@@ -329,11 +377,14 @@ fn draw_weapon_menu(selected_weapon: Weapon, scroll_offset: f32) {
     let item_padding = layout.item_padding;
     let cat_spacing = layout.cat_spacing;
     
-    // Organize weapons by category
+    // Organize weapons by category (with optional search filter)
+    let sq = search.to_lowercase();
     let all_weapons = Weapon::all();
     let mut by_category: std::collections::HashMap<WeaponCategory, Vec<&Weapon>> = std::collections::HashMap::new();
     for w in all_weapons {
-        by_category.entry(w.category()).or_insert_with(Vec::new).push(w);
+        if sq.is_empty() || w.name().to_lowercase().contains(&sq) || w.description().to_lowercase().contains(&sq) {
+            by_category.entry(w.category()).or_insert_with(Vec::new).push(w);
+        }
     }
     
     let categories = [
@@ -344,19 +395,39 @@ fn draw_weapon_menu(selected_weapon: Weapon, scroll_offset: f32) {
     ];
     
     // Enable scissor clipping for the scrollable content area.
+    // IMPORTANT: flush the pending draw batch before changing scissor state, otherwise
+    // macroquad applies the new scissor retroactively to queued header/overlay draws.
     // Scissor coordinates must be in PHYSICAL pixels; drawing coords are CSS px.
     let phys_clip_x = (menu_x * dpi) as i32;
     let phys_clip_sy = ((sh - (content_y + content_h)) * dpi) as i32; // GL: bottom-left origin
     let phys_clip_w = (menu_w * dpi) as i32;
     let phys_clip_h = (content_h * dpi) as i32;
     unsafe {
-        get_internal_gl().quad_gl.scissor(Some((phys_clip_x, phys_clip_sy, phys_clip_w, phys_clip_h)));
+        let mut gl = get_internal_gl();
+        gl.flush();
+        gl.quad_gl.scissor(Some((phys_clip_x, phys_clip_sy, phys_clip_w, phys_clip_h)));
     }
-    
-    let mut current_y = content_y - scroll_offset;
+
+    // No-results message
+    let has_results = categories.iter().any(|cat| by_category.get(cat).map_or(false, |v| !v.is_empty()));
+    if !has_results && !sq.is_empty() {
+        let msg = "No weapons found";
+        let msg_size = if is_mobile { 14.0 } else { 16.0 };
+        let msg_w = measure_text(msg, None, msg_size as u16, 1.0).width;
+        draw_text(
+            msg,
+            menu_x + menu_w / 2.0 - msg_w / 2.0,
+            content_y + content_h / 2.0 + msg_size / 2.0,
+            msg_size,
+            Color::new(0.45, 0.5, 0.6, 0.8),
+        );
+    }
+
+    let mut current_y = content_y + 4.0 - scroll_offset; // 4px initial top padding
     
     for cat in &categories {
         if let Some(weapons) = by_category.get(cat) {
+            if weapons.is_empty() { continue; }
             // Category header
             let cat_y = current_y;
             
@@ -488,13 +559,15 @@ fn draw_weapon_menu(selected_weapon: Weapon, scroll_offset: f32) {
         }
     }
     
-    // Disable scissor clipping before drawing footer and scrollbar
+    // Flush scissored draws, then disable scissor before drawing scrollbar + footer.
     unsafe {
-        get_internal_gl().quad_gl.scissor(None);
+        let mut gl = get_internal_gl();
+        gl.flush();
+        gl.quad_gl.scissor(None);
     }
     
     // Scrollbar
-    let max_scroll = layout.max_scroll();
+    let max_scroll = layout.max_scroll(search);
     if max_scroll > 0.0 {
         let track_w = 6.0;
         let track_x = menu_x + menu_w - track_w - 4.0;
@@ -503,7 +576,7 @@ fn draw_weapon_menu(selected_weapon: Weapon, scroll_offset: f32) {
         
         draw_rectangle(track_x, track_y, track_w, track_h, Color::new(0.15, 0.18, 0.22, 0.6));
         
-        let visible_ratio = (content_h / layout.total_content_height()).min(1.0);
+        let visible_ratio = (content_h / layout.total_content_height(search)).min(1.0);
         let thumb_h = (track_h * visible_ratio).max(24.0);
         let scroll_ratio = scroll_offset / max_scroll;
         let thumb_y = track_y + scroll_ratio * (track_h - thumb_h);

@@ -19,7 +19,7 @@ use weapons::Weapon;
 
 const TURN_TIME: f32 = 55.0;
 const TURN_END_DELAY: f32 = 0.5;
-const SETTLE_TIMEOUT: f32 = 0.0;
+const SETTLE_TIMEOUT: f32 = 3.0;
 const CHARGE_SPEED: f32 = 55.0;
 /// Default camera zoom level. Values > 1 mean “more zoomed in” relative to BASE_SHORT_AXIS.
 const DEFAULT_ZOOM: f32 = 2.0;
@@ -2483,6 +2483,31 @@ impl Game {
                     }
                     w.tick(&self.terrain, dt);
                 }
+                // Proximity check for mines during aiming — balls may walk into them
+                if !self.placed_explosives.is_empty() {
+                    let mut explosions = Vec::new();
+                    let prox_trigger: Vec<bool> = self.placed_explosives.iter()
+                        .map(|e| e.check_proximity(&self.balls))
+                        .collect();
+                    let any_triggered = prox_trigger.iter().any(|&t| t);
+                    if any_triggered {
+                        for (i, explosive) in self.placed_explosives.iter_mut().enumerate() {
+                            if prox_trigger[i] {
+                                let exp = explosive.explode(&mut self.terrain, &mut self.balls);
+                                explosive.alive = false;
+                                explosions.push(exp);
+                                self.terrain_dirty = true;
+                            }
+                        }
+                        self.placed_explosives.retain(|e| e.alive);
+                        for exp in &explosions {
+                            self.spawn_explosion_particles(exp);
+                        }
+                        // Mine exploded — switch to settling so damage is resolved
+                        self.phase = Phase::Settling;
+                        self.settle_timer = 0.0;
+                    }
+                }
                 // If the current ball died (walked into water/lava), end turn immediately
                 if self.current_ball < self.balls.len() && !self.balls[self.current_ball].alive {
                     self.end_turn();
@@ -2635,18 +2660,24 @@ impl Game {
                     }
                 }
                 
-                // Handle placed explosives
+                // Handle placed explosives (timer-based detonation + proximity trigger for mines)
                 if !self.placed_explosives.is_empty() {
                     let mut explosions = Vec::new();
-                    for explosive in &mut self.placed_explosives {
-                        if explosive.tick(dt) {
+                    // First pass: check proximity with immutable balls borrow
+                    let prox_trigger: Vec<bool> = self.placed_explosives.iter()
+                        .map(|e| e.check_proximity(&self.balls))
+                        .collect();
+                    // Second pass: tick timers and explode triggered ones
+                    for (i, explosive) in self.placed_explosives.iter_mut().enumerate() {
+                        let timer_fired = explosive.tick(dt);
+                        if timer_fired || prox_trigger[i] {
                             let exp = explosive.explode(&mut self.terrain, &mut self.balls);
+                            if prox_trigger[i] { explosive.alive = false; }
                             explosions.push(exp);
                             self.terrain_dirty = true;
                         }
                     }
                     self.placed_explosives.retain(|e| e.alive);
-                    
                     for exp in &explosions {
                         self.spawn_explosion_particles(exp);
                     }
@@ -2680,13 +2711,14 @@ impl Game {
                     }
                 }
                 
-                // Check if all projectiles/effects are done
+                // Check if all projectiles/effects are done.
+                // NOTE: placed_explosives (mines/dynamite) are intentionally excluded —
+                // they are persistent hazards that must not block turn progression.
                 let all_done = self.proj.is_none() 
                     && self.shotgun_pellets.is_empty() 
                     && self.uzi_bullets.is_empty()
                     && self.uzi_burst_remaining == 0
                     && self.airstrike_droplets.is_empty()
-                    && self.placed_explosives.is_empty()
                     && self.cluster_bomblets.is_empty();
                 
                 if proj_died || explosion_opt.is_some() {
@@ -2695,10 +2727,10 @@ impl Game {
 
                 // Stuck-phase watchdog: if projectile flying goes on too long, force-end
                 self.stuck_phase_timer += dt;
-                if self.stuck_phase_timer > 30.0 {
+                if self.stuck_phase_timer > 12.0 {
                     #[cfg(target_arch = "wasm32")]
                     {
-                        let s = "[WATCHDOG] ProjectileFlying stuck >30s, force-ending turn\0";
+                        let s = "[WATCHDOG] ProjectileFlying stuck >12s, force-ending turn\0";
                         unsafe { console_log(s.as_ptr()); }
                     }
                     self.proj = None;
@@ -2735,6 +2767,26 @@ impl Game {
                 self.settle_timer += dt;
                 for w in &mut self.balls {
                     w.tick(&self.terrain, dt);
+                }
+                // Tick placed explosives during settling (proximity mines + dynamite fuse)
+                if !self.placed_explosives.is_empty() {
+                    let mut explosions = Vec::new();
+                    let prox_trigger: Vec<bool> = self.placed_explosives.iter()
+                        .map(|e| e.check_proximity(&self.balls))
+                        .collect();
+                    for (i, explosive) in self.placed_explosives.iter_mut().enumerate() {
+                        let timer_fired = explosive.tick(dt);
+                        if timer_fired || prox_trigger[i] {
+                            let exp = explosive.explode(&mut self.terrain, &mut self.balls);
+                            if prox_trigger[i] { explosive.alive = false; }
+                            explosions.push(exp);
+                            self.terrain_dirty = true;
+                        }
+                    }
+                    self.placed_explosives.retain(|e| e.alive);
+                    for exp in &explosions {
+                        self.spawn_explosion_particles(exp);
+                    }
                 }
                 let all_settled = self.balls.iter().all(|w| w.is_settled());
                 if all_settled || self.settle_timer > SETTLE_TIMEOUT {
@@ -2827,12 +2879,17 @@ impl Game {
                     }
                 }
 
-                // Tick fused placed explosives (Dynamite / Mine countdown)
+                // Tick placed explosives (timer-based + proximity trigger for mines)
                 if !self.placed_explosives.is_empty() {
                     let mut explosions = Vec::new();
-                    for explosive in &mut self.placed_explosives {
-                        if explosive.tick(dt) {
+                    let prox_trigger: Vec<bool> = self.placed_explosives.iter()
+                        .map(|e| e.check_proximity(&self.balls))
+                        .collect();
+                    for (i, explosive) in self.placed_explosives.iter_mut().enumerate() {
+                        let timer_fired = explosive.tick(dt);
+                        if timer_fired || prox_trigger[i] {
                             let exp = explosive.explode(&mut self.terrain, &mut self.balls);
+                            if prox_trigger[i] { explosive.alive = false; }
                             explosions.push(exp);
                             self.terrain_dirty = true;
                         }
@@ -2860,11 +2917,28 @@ impl Game {
                         self.cam.follow(wx, wy - 30.0, 4.0, dt);
                     }
                 }
-                // When retreat time expires AND all in-flight effects are resolved, end turn
+                // When retreat time expires AND all in-flight effects are resolved, end turn.
+                // NOTE: placed_explosives (mines) are excluded — they persist across turns
+                // and must not prevent retreat from ending.
                 let retreat_all_done = self.proj.is_none()
-                    && self.cluster_bomblets.is_empty()
-                    && self.placed_explosives.is_empty();
+                    && self.cluster_bomblets.is_empty();
                 if self.retreat_timer <= 0.0 && retreat_all_done {
+                    if let Some(player_idx) = self.pending_turn_sync.take() {
+                        self.sync_to_player_turn(player_idx);
+                    } else {
+                        self.end_turn();
+                    }
+                }
+                // Safety watchdog: if retreat timer has been negative for >12 extra seconds
+                // (e.g., cluster bomblets or mortar shell never resolved), force-end turn.
+                if self.retreat_timer < -12.0 {
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let s = "[WATCHDOG] Retreat stuck >12s extra, force-ending turn\0";
+                        unsafe { console_log(s.as_ptr()); }
+                    }
+                    self.proj = None;
+                    self.cluster_bomblets.clear();
                     if let Some(player_idx) = self.pending_turn_sync.take() {
                         self.sync_to_player_turn(player_idx);
                     } else {
@@ -2886,11 +2960,17 @@ impl Game {
                         // Still waiting for turn_advanced from server. Count down an extra
                         // safety window (turn_end_timer is already ≤0 and going further
                         // negative — we treat -8.0 as "server is silent, force locally").
-                        if self.turn_end_timer < -8.0 {
+                        if self.turn_end_timer < -4.0 {
                             #[cfg(target_arch = "wasm32")]
                             {
                                 let s = "[TURN] Safety timeout: force-advancing because server never sent turn_advanced\0";
                                 unsafe { console_log(s.as_ptr()); }
+                            }
+                            // Re-send end_turn in case our original message was dropped.
+                            // The server ignores it from non-active players, but if we
+                            // ARE the active player it will unstick the server too.
+                            if self.net.connected {
+                                self.net.send_message(r#"{"type":"end_turn"}"#);
                             }
                             self.advance_turn();
                         }

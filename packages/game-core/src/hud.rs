@@ -129,7 +129,11 @@ pub fn draw_hud(
     let sw = screen_width();
     let sh = screen_height();
 
-    draw_rectangle(0.0, 0.0, sw, 44.0, Color::new(0.0, 0.0, 0.0, 0.75));
+    // Responsive breakpoint — screen_width/height return CSS px in macroquad WASM.
+    let is_mobile_hud = sw < 600.0 || sh < 700.0;
+    let bar_h = if is_mobile_hud { 68.0 } else { 44.0 };
+
+    draw_rectangle(0.0, 0.0, sw, bar_h, Color::new(0.0, 0.0, 0.0, 0.80));
 
     if phase == Phase::GameOver {
         if let Some(team) = winning_team {
@@ -155,88 +159,168 @@ pub fn draw_hud(
         return;
     }
 
-    if current_ball < balls.len() {
-        let ball = &balls[current_ball];
-        let (r, g, b) = TEAM_COLORS[ball.team as usize % TEAM_COLORS.len()];
-        let team_color = Color::new(r, g, b, 1.0);
-        let label = format!("{}", ball.name);
-        draw_text(&label, 12.0, 30.0, 26.0, team_color);
+    if is_mobile_hud {
+        // ── MOBILE: two-row layout ──────────────────────────────────────────
+        // Row 1 (top): whose turn (left) | timer (right)
+        // Row 2 (bottom): HP + move bar (left) | phase (center) | wind (right)
 
-        let hp = format!("HP:{}", ball.health);
-        let hp_x = 12.0 + measure_text(&label, None, 26, 1.0).width + 14.0;
-        draw_text(&hp, hp_x, 30.0, 20.0, WHITE);
-        
-        // Draw movement bar
-        let move_remaining = ball.movement_remaining();
-        let move_percent = (move_remaining / ball.movement_budget * 100.0).min(100.0);
-        let move_x = hp_x + measure_text(&hp, None, 20, 1.0).width + 20.0;
-        
-        // Movement bar background
-        let bar_w = 60.0;
-        let bar_h = 8.0;
-        let bar_y = 20.0;
-        draw_rectangle(move_x - 1.0, bar_y - 1.0, bar_w + 2.0, bar_h + 2.0, Color::new(0.0, 0.0, 0.0, 0.6));
-        
-        // Movement bar foreground
-        let move_frac = move_remaining / ball.movement_budget;
-        let bar_color = if move_frac > 0.5 {
-            Color::new(0.2, 0.7, 1.0, 0.9)
-        } else if move_frac > 0.15 {
-            Color::new(0.9, 0.7, 0.2, 0.9)
+        let timer_text = format!("{:.0}", turn_timer.max(0.0));
+        let timer_font = 26u16;
+        let timer_color = if turn_timer < 10.0 {
+            Color::new(1.0, 0.3, 0.2, 1.0)
         } else {
-            Color::new(0.9, 0.3, 0.2, 0.9)
+            WHITE
         };
-        draw_rectangle(move_x, bar_y, bar_w * move_frac, bar_h, bar_color);
-        
-        // Movement label
-        draw_text("MOVE", move_x, 16.0, 11.0, Color::new(0.7, 0.7, 0.7, 0.8));
-        let move_text = format!("{:.0}%", move_percent);
-        draw_text(&move_text, move_x + bar_w + 4.0, 28.0, 14.0, 
-            if move_frac < 0.1 { Color::new(1.0, 0.3, 0.3, 1.0) } else { WHITE });
+        let tw = measure_text(&timer_text, None, timer_font, 1.0).width;
+        draw_text(&timer_text, sw - tw - 10.0, 24.0, timer_font as f32, timer_color);
+
+        // Whose turn label — use the player's actual name, not team number.
+        let (turn_label, turn_color) = if is_my_turn {
+            ("YOUR TURN".to_string(), Color::new(0.4, 1.0, 0.5, 1.0))
+        } else {
+            let name = if !turn_owner_name.is_empty() {
+                turn_owner_name.to_string()
+            } else if current_ball < balls.len() {
+                balls[current_ball].name.clone()
+            } else {
+                "Opponent".to_string()
+            };
+            (format!("{}'s Turn", name), Color::new(1.0, 0.85, 0.35, 1.0))
+        };
+        // Clamp label so it never overlaps the timer
+        let max_label_w = (sw - tw - 24.0).max(0.0);
+        let label_font = 18u16;
+        let raw_lw = measure_text(&turn_label, None, label_font, 1.0).width;
+        // Shrink font if the label is still too wide (very long names)
+        let actual_font = if raw_lw > max_label_w { 14u16 } else { label_font };
+        draw_text(&turn_label, 10.0, 23.0, actual_font as f32, turn_color);
+
+        // Row 2 — HP + mini move bar
+        if current_ball < balls.len() {
+            let ball = &balls[current_ball];
+            let hp_text = format!("HP:{}", ball.health);
+            let hp_font = 15u16;
+            draw_text(&hp_text, 10.0, 52.0, hp_font as f32, WHITE);
+            let hp_w = measure_text(&hp_text, None, hp_font, 1.0).width;
+
+            let move_remaining = ball.movement_remaining();
+            let move_frac = (move_remaining / ball.movement_budget).clamp(0.0, 1.0);
+            let bar_x = 10.0 + hp_w + 6.0;
+            let bar_w = 40.0;
+            let bar_h_px = 7.0;
+            let bar_y = 46.0;
+            draw_rectangle(bar_x - 1.0, bar_y - 1.0, bar_w + 2.0, bar_h_px + 2.0,
+                Color::new(0.0, 0.0, 0.0, 0.6));
+            let bar_color = if move_frac > 0.5 {
+                Color::new(0.2, 0.7, 1.0, 0.9)
+            } else if move_frac > 0.15 {
+                Color::new(0.9, 0.7, 0.2, 0.9)
+            } else {
+                Color::new(0.9, 0.3, 0.2, 0.9)
+            };
+            draw_rectangle(bar_x, bar_y, bar_w * move_frac, bar_h_px, bar_color);
+        }
+
+        // Row 2 center — phase label
+        let phase_text = phase.label();
+        let phase_color = if is_my_turn {
+            Color::new(0.5, 1.0, 0.5, 1.0)
+        } else {
+            Color::new(0.85, 0.75, 0.4, 1.0)
+        };
+        let ph_font = 13u16;
+        let ph_w = measure_text(phase_text, None, ph_font, 1.0).width;
+        draw_text(phase_text, sw / 2.0 - ph_w / 2.0, 52.0, ph_font as f32, phase_color);
+
+        // Row 2 right — wind (compact)
+        let wind_label = if wind.abs() < 0.5 {
+            "~calm".to_string()
+        } else {
+            let arrow = if wind > 0.0 { ">>" } else { "<<" };
+            format!("{} {:.0}", arrow, wind.abs())
+        };
+        let wf = 13u16;
+        let ww = measure_text(&wind_label, None, wf, 1.0).width;
+        draw_text(&wind_label, sw - ww - 10.0, 52.0, wf as f32,
+            Color::new(0.5, 0.8, 1.0, 0.9));
+    } else {
+        // ── DESKTOP: original single-row layout ────────────────────────────
+        if current_ball < balls.len() {
+            let ball = &balls[current_ball];
+            let (r, g, b) = TEAM_COLORS[ball.team as usize % TEAM_COLORS.len()];
+            let team_color = Color::new(r, g, b, 1.0);
+            let label = format!("{}", ball.name);
+            draw_text(&label, 12.0, 30.0, 26.0, team_color);
+
+            let hp = format!("HP:{}", ball.health);
+            let hp_x = 12.0 + measure_text(&label, None, 26, 1.0).width + 14.0;
+            draw_text(&hp, hp_x, 30.0, 20.0, WHITE);
+
+            // Draw movement bar
+            let move_remaining = ball.movement_remaining();
+            let move_percent = (move_remaining / ball.movement_budget * 100.0).min(100.0);
+            let move_x = hp_x + measure_text(&hp, None, 20, 1.0).width + 20.0;
+
+            let bar_w = 60.0;
+            let bar_h = 8.0;
+            let bar_y = 20.0;
+            draw_rectangle(move_x - 1.0, bar_y - 1.0, bar_w + 2.0, bar_h + 2.0,
+                Color::new(0.0, 0.0, 0.0, 0.6));
+
+            let move_frac = move_remaining / ball.movement_budget;
+            let bar_color = if move_frac > 0.5 {
+                Color::new(0.2, 0.7, 1.0, 0.9)
+            } else if move_frac > 0.15 {
+                Color::new(0.9, 0.7, 0.2, 0.9)
+            } else {
+                Color::new(0.9, 0.3, 0.2, 0.9)
+            };
+            draw_rectangle(move_x, bar_y, bar_w * move_frac, bar_h, bar_color);
+            draw_text("MOVE", move_x, 16.0, 11.0, Color::new(0.7, 0.7, 0.7, 0.8));
+            let move_text = format!("{:.0}%", move_percent);
+            draw_text(&move_text, move_x + bar_w + 4.0, 28.0, 14.0,
+                if move_frac < 0.1 { Color::new(1.0, 0.3, 0.3, 1.0) } else { WHITE });
+        }
+
+        // Phase label — use player name, not team number
+        let (phase_label, phase_color) = if is_my_turn {
+            let label = if turn_owner_name.is_empty() {
+                format!("YOUR TURN — {}", phase.label())
+            } else {
+                format!("YOUR TURN ({}) — {}", turn_owner_name, phase.label())
+            };
+            (label, Color::new(0.7, 1.0, 0.7, 1.0))
+        } else {
+            let owner = if turn_owner_name.is_empty() {
+                "Opponent".to_string()
+            } else {
+                turn_owner_name.to_string()
+            };
+            let label = format!("{} — {}", owner, phase.label());
+            (label, Color::new(0.85, 0.75, 0.4, 1.0))
+        };
+        let pw = measure_text(&phase_label, None, 20, 1.0).width;
+        draw_text(&phase_label, sw / 2.0 - pw / 2.0, 30.0, 20.0, phase_color);
+
+        let timer_text = format!("{:.0}", turn_timer.max(0.0));
+        let timer_color = if turn_timer < 10.0 {
+            Color::new(1.0, 0.3, 0.2, 1.0)
+        } else {
+            WHITE
+        };
+        draw_text(&timer_text, sw - 60.0, 30.0, 28.0, timer_color);
+
+        let wind_label = if wind.abs() < 0.5 {
+            "Wind: calm".to_string()
+        } else {
+            let arrow = if wind > 0.0 { ">>>" } else { "<<<" };
+            format!("Wind: {} {:.0}", arrow, wind.abs())
+        };
+        draw_text(&wind_label, sw - 200.0, 30.0, 16.0,
+            Color::new(0.5, 0.8, 1.0, 0.9));
     }
 
-    // Always display the current phase to all players. Highlight when it's your turn.
-    let (phase_label, phase_color) = if is_my_turn {
-        let label = if turn_owner_name.is_empty() {
-            format!("YOUR TURN — {}", phase.label())
-        } else {
-            format!("YOUR TURN ({}) — {}", turn_owner_name, phase.label())
-        };
-        (label, Color::new(0.7, 1.0, 0.7, 1.0))
-    } else {
-        let owner = if turn_owner_name.is_empty() { "Opponent".to_string() } else { turn_owner_name.to_string() };
-        let label = format!("{} — {}", owner, phase.label());
-        (label, Color::new(0.85, 0.75, 0.4, 1.0))
-    };
-    let pw = measure_text(&phase_label, None, 20, 1.0).width;
-    draw_text(&phase_label, sw / 2.0 - pw / 2.0, 30.0, 20.0, phase_color);
-
-    let timer_text = format!("{:.0}", turn_timer.max(0.0));
-    let timer_color = if turn_timer < 10.0 {
-        Color::new(1.0, 0.3, 0.2, 1.0)
-    } else {
-        WHITE
-    };
-    draw_text(&timer_text, sw - 60.0, 30.0, 28.0, timer_color);
-
-    let wind_label = if wind.abs() < 0.5 {
-        "Wind: calm".to_string()
-    } else {
-        let arrow = if wind > 0.0 { ">>>" } else { "<<<" };
-        format!("Wind: {} {:.0}", arrow, wind.abs())
-    };
-    draw_text(
-        &wind_label,
-        sw - 200.0,
-        30.0,
-        16.0,
-        Color::new(0.5, 0.8, 1.0, 0.9),
-    );
-
     // Draw weapon button — desktop only (mobile uses the JS overlay WEAPON button)
-    let dpi = screen_dpi_scale();
-    let css_sw = sw / dpi;
-    let is_mobile_hud = css_sw < 600.0 || (sh / dpi) < 700.0;
     if !is_mobile_hud {
         let weapon_button = get_weapon_button_bounds();
         let (mx, my) = mouse_position();

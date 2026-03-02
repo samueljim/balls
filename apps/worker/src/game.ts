@@ -212,7 +212,13 @@ export class Game implements DurableObject {
     this.gameState.phase = "aiming";
     this.gameState.turnEndTime = Date.now() + TURN_TIME_MS;
     this.phaseStartTime = Date.now();
-    this.broadcast({ type: "turn_advanced", turnIndex: this.gameState.currentTurnIndex });
+    // Include authoritative ball snapshots so all clients hard-sync positions/health
+    // before starting the new turn, correcting any physics divergence from the previous turn.
+    this.broadcast({
+      type: "turn_advanced",
+      turnIndex: this.gameState.currentTurnIndex,
+      balls: this.ballSnapshots.length > 0 ? this.ballSnapshots : undefined,
+    });
     this.broadcast({ type: "state", state: this.gameState });
     this.scheduleWatchdog();
     this.persistState();
@@ -597,6 +603,22 @@ export class Game implements DurableObject {
         this.broadcast(msg as { type: string; [k: string]: unknown });
         this.persistState();
       } else if (msg.type === "end_turn") {
+        // If the active player embedded a ball snapshot in end_turn, store it
+        // so we can forward it in turn_advanced for authoritative end-of-turn sync.
+        const etMsg = msg as any;
+        if (Array.isArray(etMsg.balls)) {
+          etMsg.balls.forEach((b: any, i: number) => {
+            if (i < this.ballSnapshots.length) {
+              const s = this.ballSnapshots[i];
+              if (typeof b.x === "number") s.x = b.x;
+              if (typeof b.y === "number") s.y = b.y;
+              if (typeof b.vx === "number") s.vx = b.vx;
+              if (typeof b.vy === "number") s.vy = b.vy;
+              if (typeof b.hp === "number") s.hp = b.hp;
+              if (typeof b.alive === "boolean") s.alive = b.alive;
+            }
+          });
+        }
         this.advanceTurn();
         this.maybeBotTurn();
       }

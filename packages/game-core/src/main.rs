@@ -904,7 +904,7 @@ impl Game {
                                 _ => escaped.push(c),
                             }
                         }
-                        let msg = format!(r#"{{"type":"input","input":"{}"}}"#, escaped);
+                        let msg = format!(r#"{{"type":"input","input":"{}","bi":{}}}"#, escaped, self.current_ball);
                         self.net.send_message(&msg);
                     }
                 }
@@ -971,7 +971,7 @@ impl Game {
                                 _ => escaped.push(c),
                             }
                         }
-                        self.net.send_message(&format!(r#"{{"type":"input","input":"{}"}}"#, escaped));
+                        self.net.send_message(&format!(r#"{{"type":"input","input":"{}","bi":{}}}"#, escaped, self.current_ball));
                     }
                 }
             } else if let Some(airstrike_weapon) = self.airstrike_mode {
@@ -1007,6 +1007,9 @@ impl Game {
                 self.airstrike_mode = None;
                 self.has_fired = true;
                 self.phase = Phase::ProjectileFlying;
+                // Restore zoom now that targeting is done.
+                self.cam_target_zoom = DEFAULT_ZOOM;
+                self.cam_return_timer = 2.0;
                 if self.current_ball < self.balls.len() {
                     self.balls[self.current_ball].reset_movement_budget();
                 }
@@ -1027,7 +1030,7 @@ impl Game {
                             _ => escaped.push(c),
                         }
                     }
-                    self.net.send_message(&format!(r#"{{"type":"input","input":"{}"}}"#, escaped));
+                    self.net.send_message(&format!(r#"{{"type":"input","input":"{}","bi":{}}}"#, escaped, self.current_ball));
                 }
             } else if self.teleport_mode {
                 // Use the locked destination (set by tapping). If player hasn't tapped yet, do nothing.
@@ -1058,7 +1061,7 @@ impl Game {
                                 _ => escaped.push(c),
                             }
                         }
-                        self.net.send_message(&format!(r#"{{"type":"input","input":"{}"}}"#, escaped));
+                        self.net.send_message(&format!(r#"{{"type":"input","input":"{}","bi":{}}}"#, escaped, self.current_ball));
                     }
                 }
             } else if self.baseball_bat_mode {
@@ -1095,7 +1098,7 @@ impl Game {
                                 _ => escaped.push(c),
                             }
                         }
-                        self.net.send_message(&format!(r#"{{"type":"input","input":"{}"}}"#, escaped));
+                        self.net.send_message(&format!(r#"{{"type":"input","input":"{}","bi":{}}}"#, escaped, self.current_ball));
                     }
                 }
             } else {
@@ -1200,6 +1203,19 @@ impl Game {
         }
 
         if self.net.connected {
+            // Two-click weapons handle their own network messages on the second click
+            // (BatSwing, AirstrikeTarget, TeleportTo, BuildWallPlace).  Sending an
+            // initial Fire message for these weapons would set baseball_bat_mode /
+            // has_fired incorrectly on remote clients, causing desync and freezes.
+            let is_two_click = matches!(
+                weapon,
+                Weapon::BaseballBat
+                    | Weapon::Airstrike
+                    | Weapon::NapalmStrike
+                    | Weapon::Teleport
+                    | Weapon::BuildWall
+            );
+            if !is_two_click {
             // Drill: send exact ball origin so all clients carve the identical tunnel.
             // Generic Fire message would make remotes use their own (potentially different)
             // ball position. DrillFire is broadcast just like any other input type.
@@ -1236,6 +1252,7 @@ impl Game {
                 escaped, idx, fire_bx, fire_by,
             );
             self.net.send_message(&msg);
+            } // end if !is_two_click
         }
     }
 
@@ -1307,12 +1324,18 @@ impl Game {
             // Airstrike - enter click-targeting mode
             Weapon::Airstrike => {
                 self.airstrike_mode = Some(Weapon::Airstrike);
+                // Zoom all the way out so the player can see the whole map to pick a target.
+                self.cam_target_zoom = GameCamera::min_zoom();
+                self.cam_return_timer = 1.5; // activate the zoom lerp
                 // Stay in Aiming phase; droplets spawn on click
             },
             
             // Napalm Strike - enter click-targeting mode
             Weapon::NapalmStrike => {
                 self.airstrike_mode = Some(Weapon::NapalmStrike);
+                // Zoom all the way out so the player can see the whole map to pick a target.
+                self.cam_target_zoom = GameCamera::min_zoom();
+                self.cam_return_timer = 1.5; // activate the zoom lerp
                 // Stay in Aiming phase; droplets spawn on click
             },
             
@@ -1516,11 +1539,26 @@ impl Game {
             unsafe { console_log(msg.as_ptr()); }
         }
         if self.net.connected {
-            // Always send—the worker ignores end_turn from non-active players,
+            // Always send — the worker ignores end_turn from non-active players,
             // so it is safe to call unconditionally and removes a class of race conditions.
-            self.send_ball_state();
             self.send_terrain_damages();
-            let et_msg = format!(r#"{{"type":"end_turn","bi":{}}}"#, self.current_ball);
+            // Embed an authoritative ball-state snapshot in the end_turn message.
+            // The server will forward it in turn_advanced so all clients apply the
+            // correct final positions/health before the next turn starts, correcting
+            // any physics divergence that accumulated during the turn.
+            let mut balls_json = String::from("[");
+            for (i, ball) in self.balls.iter().enumerate() {
+                if i > 0 { balls_json.push(','); }
+                balls_json.push_str(&format!(
+                    r#"{{"x":{:.1},"y":{:.1},"vx":{:.2},"vy":{:.2},"hp":{},"alive":{}}}"#,
+                    ball.x, ball.y, ball.vx, ball.vy, ball.health, ball.alive
+                ));
+            }
+            balls_json.push(']');
+            let et_msg = format!(
+                r#"{{"type":"end_turn","bi":{},"balls":{}}}"#,
+                self.current_ball, balls_json,
+            );
             self.net.send_message(&et_msg);
         }
         self.phase = Phase::TurnEnd;
@@ -2058,6 +2096,16 @@ impl Game {
             }
             if msg.contains("\"type\":\"turn_advanced\"") || msg.contains("\"type\": \"turn_advanced\"") {
                 if let Some(player_index) = parse_turn_index_from_message(&msg) {
+                    // Apply authoritative ball state (positions + health) embedded by the
+                    // active player in end_turn. This corrects any physics divergence that
+                    // accumulated during the turn (wind, hit detection, etc.) before the
+                    // next turn starts.
+                    if msg.contains("\"balls\":[") {
+                        for t in &mut self.ball_lerp_targets {
+                            *t = None;
+                        }
+                        self.apply_ball_state(&msg);
+                    }
                     // Always update our stored turn index
                     self.current_turn_index = player_index;
                     match self.phase {
@@ -2220,6 +2268,15 @@ impl Game {
                     if let Some(ball_idx) = ball_idx_opt {
                         // Parse and apply different input types
                         if let Some((angle_rad, power, weapon)) = parse_fire_input(&input_str) {
+                            // Two-click weapons (Bat, Airstrike, Teleport, BuildWall) no longer
+                            // send an initial Fire message, but guard here defensively in case an
+                            // older client does. Their real actions arrive as BatSwing / AirstrikeTarget etc.
+                            let is_two_click = matches!(
+                                weapon,
+                                Weapon::BaseballBat | Weapon::Airstrike | Weapon::NapalmStrike
+                                    | Weapon::Teleport | Weapon::BuildWall
+                            );
+                            if !is_two_click {
                             // Snap ball to sender's authoritative position so projectile
                             // starts at the correct spot on all clients.
                             if let (Some(bx_f), Some(by_f)) = (
@@ -2238,6 +2295,7 @@ impl Game {
                             if self.phase == Phase::ProjectileFlying && ball_idx < self.balls.len() {
                                 self.balls[ball_idx].reset_movement_budget();
                             }
+                            } // end !is_two_click
                         } else if let Some(dir) = parse_walk_input(&input_str) {
                             if ball_idx < self.balls.len() {
                                 physics::walk(&mut self.balls[ball_idx], &self.terrain, dir);
@@ -3041,7 +3099,19 @@ impl Game {
                             // The server ignores it from non-active players, but if we
                             // ARE the active player it will unstick the server too.
                             if self.net.connected {
-                                let et_msg = format!(r#"{{"type":"end_turn","bi":{}}}"#, self.current_ball);
+                                let mut balls_json = String::from("[");
+                                for (i, ball) in self.balls.iter().enumerate() {
+                                    if i > 0 { balls_json.push(','); }
+                                    balls_json.push_str(&format!(
+                                        r#"{{"x":{:.1},"y":{:.1},"vx":{:.2},"vy":{:.2},"hp":{},"alive":{}}}"#,
+                                        ball.x, ball.y, ball.vx, ball.vy, ball.health, ball.alive
+                                    ));
+                                }
+                                balls_json.push(']');
+                                let et_msg = format!(
+                                    r#"{{"type":"end_turn","bi":{},"balls":{}}}"#,
+                                    self.current_ball, balls_json,
+                                );
                                 self.net.send_message(&et_msg);
                             }
                             self.advance_turn();

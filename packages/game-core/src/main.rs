@@ -1324,18 +1324,18 @@ impl Game {
             // Airstrike - enter click-targeting mode
             Weapon::Airstrike => {
                 self.airstrike_mode = Some(Weapon::Airstrike);
-                // Zoom all the way out so the player can see the whole map to pick a target.
-                self.cam_target_zoom = GameCamera::min_zoom();
-                self.cam_return_timer = 1.5; // activate the zoom lerp
+                // Snap instantly to minimum zoom so the full map is visible for targeting.
+                self.cam.zoom = GameCamera::min_zoom();
+                self.cam_target_zoom = self.cam.zoom;
                 // Stay in Aiming phase; droplets spawn on click
             },
             
             // Napalm Strike - enter click-targeting mode
             Weapon::NapalmStrike => {
                 self.airstrike_mode = Some(Weapon::NapalmStrike);
-                // Zoom all the way out so the player can see the whole map to pick a target.
-                self.cam_target_zoom = GameCamera::min_zoom();
-                self.cam_return_timer = 1.5; // activate the zoom lerp
+                // Snap instantly to minimum zoom so the full map is visible for targeting.
+                self.cam.zoom = GameCamera::min_zoom();
+                self.cam_target_zoom = self.cam.zoom;
                 // Stay in Aiming phase; droplets spawn on click
             },
             
@@ -1387,10 +1387,25 @@ impl Game {
                 // Stay in aiming phase, will handle click for teleport
             },
             
-            // Sniper Rifle – instant raycast, no gravity, one-shot kill
+            // Sniper Rifle – instant raycast, no gravity, high damage but 30% miss chance
             Weapon::SniperRifle => {
-                let cos_a = angle.cos();
-                let sin_a = angle.sin();
+                // Deterministic miss roll — must use rng_state (not rand::) so all
+                // clients reach the same outcome on replay.
+                self.rng_state = lcg(self.rng_state);
+                let miss_roll = (self.rng_state >> 16) as f32 / 65536.0;
+                let missed = miss_roll < 0.30;
+                let shoot_angle = if missed {
+                    // Random deflection of 7–20° away from aim line
+                    self.rng_state = lcg(self.rng_state);
+                    let sign = if (self.rng_state & 0x8000) != 0 { 1.0_f32 } else { -1.0_f32 };
+                    self.rng_state = lcg(self.rng_state);
+                    let mag = 0.12 + (self.rng_state >> 16) as f32 / 65536.0 * 0.22;
+                    angle + sign * mag
+                } else {
+                    angle
+                };
+                let cos_a = shoot_angle.cos();
+                let sin_a = shoot_angle.sin();
                 let step = 3.0_f32;
                 let max_dist = (self.terrain.width.max(self.terrain.height) as f32) * 2.0;
 
@@ -1556,8 +1571,8 @@ impl Game {
             }
             balls_json.push(']');
             let et_msg = format!(
-                r#"{{"type":"end_turn","bi":{},"balls":{}}}"#,
-                self.current_ball, balls_json,
+                r#"{{"type":"end_turn","bi":{},"wind":{:.3},"balls":{}}}"#,
+                self.current_ball, self.wind, balls_json,
             );
             self.net.send_message(&et_msg);
         }
@@ -2105,6 +2120,20 @@ impl Game {
                             *t = None;
                         }
                         self.apply_ball_state(&msg);
+                    }
+                    // Apply the authoritative wind value from the active player so all
+                    // clients use the same wind next turn, eliminating trajectory divergence
+                    // caused by independently-computed rng_state values.
+                    if let Some(w) = parse_json_number(&msg, "wind") {
+                        self.wind = w as f32;
+                    }
+                    // Apply any terrain damage delta forwarded by the server.
+                    // This corrects any terrain divergence when wind caused projectiles
+                    // to land at different pixels on different clients.
+                    if msg.contains("\"terrain\":[") {
+                        // Reuse apply_terrain_sync by remapping "terrain" key to "log"
+                        let terrain_as_log = msg.replace("\"terrain\":[", "\"log\":[");
+                        self.apply_terrain_sync(&terrain_as_log);
                     }
                     // Always update our stored turn index
                     self.current_turn_index = player_index;

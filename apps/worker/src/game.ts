@@ -36,6 +36,8 @@ export class Game implements DurableObject {
   private terrainDamageLog: number[][] = [];
   /** Latest per-ball snapshot (positions + health) for reconnect sync */
   private ballSnapshots: BallSnapshot[] = [];
+  /** Wind value from the active player at end-of-turn, forwarded in turn_advanced */
+  private lastWindValue: number = 0;
   /** Timestamp (ms) when the current phase last changed – used by watchdog */
   private phaseStartTime: number = 0;
 
@@ -212,12 +214,14 @@ export class Game implements DurableObject {
     this.gameState.phase = "aiming";
     this.gameState.turnEndTime = Date.now() + TURN_TIME_MS;
     this.phaseStartTime = Date.now();
-    // Include authoritative ball snapshots so all clients hard-sync positions/health
+    // Include authoritative ball snapshots, wind, and terrain so all clients hard-sync
     // before starting the new turn, correcting any physics divergence from the previous turn.
     this.broadcast({
       type: "turn_advanced",
       turnIndex: this.gameState.currentTurnIndex,
       balls: this.ballSnapshots.length > 0 ? this.ballSnapshots : undefined,
+      wind: this.lastWindValue,
+      terrain: this.terrainDamageLog.length > 0 ? this.terrainDamageLog : undefined,
     });
     this.broadcast({ type: "state", state: this.gameState });
     this.scheduleWatchdog();
@@ -492,11 +496,20 @@ export class Game implements DurableObject {
 
       // terrain_damages: accept from ANY player (not just current turn)
       // so the worker always has the latest cumulative damage log.
+      // Also relay as terrain_sync to all other clients so their terrain stays in
+      // sync with the active player's authoritative state.
       if (parsed.type === "terrain_damages") {
         const dmgMsg = parsed as { type: string; log?: number[][] };
         if (Array.isArray(dmgMsg.log) && dmgMsg.log.length >= this.terrainDamageLog.length) {
           this.terrainDamageLog = dmgMsg.log;
           this.persistState();
+          // Forward to all OTHER clients as terrain_sync so they stay in sync
+          const syncMsg = JSON.stringify({ type: "terrain_sync", log: dmgMsg.log });
+          for (const [pid, sock] of this.sockets) {
+            if (pid !== playerId) {
+              try { sock.send(syncMsg); } catch (_) {}
+            }
+          }
         }
         return;
       }
@@ -618,6 +631,11 @@ export class Game implements DurableObject {
               if (typeof b.alive === "boolean") s.alive = b.alive;
             }
           });
+        }
+        // Capture the active player's wind value so all clients use the same wind
+        // next turn, eliminating trajectory divergence from independent RNG drift.
+        if (typeof etMsg.wind === "number") {
+          this.lastWindValue = etMsg.wind;
         }
         this.advanceTurn();
         this.maybeBotTurn();

@@ -45,7 +45,7 @@ export type GameMessage =
   | { type: "state"; state: Partial<GameState> }
   | { type: "input"; input: string; turnIndex: number; bi: number; bx?: number; by?: number }
   | { type: "aim"; aim: number; turnIndex: number }
-  | { type: "turn_advanced"; turnIndex: number; balls?: Array<{ x: number; y: number; vx: number; vy: number; hp: number; alive: boolean }> }
+  | { type: "turn_advanced"; turnIndex: number; balls?: Array<{ x: number; y: number; vx: number; vy: number; hp: number; alive: boolean }>; wind?: number; terrain?: number[][] }
   | { type: "error"; message: string };
 
 export type GameClientMessage =

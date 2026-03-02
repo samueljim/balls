@@ -3138,10 +3138,11 @@ impl Game {
 
         if self.terrain_dirty {
             self.terrain_image = self.terrain.bake_image();
-            // Recreate texture entirely instead of updating in-place to avoid WebGL state issues
-            // The old texture will be automatically dropped and cleaned up by Rust
-            self.terrain_texture = Texture2D::from_image(&self.terrain_image);
-            self.terrain_texture.set_filter(FilterMode::Nearest);
+            // Update texture data in-place to keep the same GL texture ID.
+            // Recreating with from_image() deletes the old ID, which causes
+            // "glBindTexture called with an already deleted texture" warnings
+            // in WebGL when macroquad still has the old ID in its state.
+            self.terrain_texture.update(&self.terrain_image);
             self.terrain_dirty = false;
         }
 

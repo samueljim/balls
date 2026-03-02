@@ -9,30 +9,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  deploy-worker:
-    name: Deploy Worker
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: pnpm/action-setup@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: pnpm
-
-      - run: pnpm install --frozen-lockfile
-
-      - name: Deploy Cloudflare Worker
-        working-directory: apps/worker
-        run: pnpm exec wrangler deploy
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-
-  deploy-web:
-    name: Deploy Web (Pages)
+  deploy:
+    name: Deploy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -73,6 +51,13 @@ jobs:
         env:
           NEXT_PUBLIC_API_BASE: https://api.balls.bne.sh
           NEXT_PUBLIC_WS_BASE: wss://api.balls.bne.sh
+
+      - name: Deploy Cloudflare Worker
+        working-directory: apps/worker
+        run: pnpm exec wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
       - name: Deploy to Cloudflare Pages
         run: pnpm --filter balls-worker exec wrangler pages deploy ../web/out --project-name=worms-web

@@ -158,6 +158,9 @@ struct Game {
     last_ball_per_team: Vec<Option<usize>>,
     /// Watchdog: seconds spent in ProjectileFlying/Retreat; force-ends turn if too long
     stuck_phase_timer: f32,
+    /// Watchdog: seconds we have been waiting for a non-active player's turn to progress
+    /// past the turn deadline. Used to send server ping nudges so the server force-advances.
+    non_active_stuck_timer: f32,
     /// Per-ball cooldown (seconds) for game-event toasts — prevents spam from fires/DoT
     ball_event_cooldown: Vec<f32>,
     /// Last label sent to the JS FIRE button — used to detect changes and avoid re-sending
@@ -351,6 +354,7 @@ impl Game {
             last_logged_turn_state: (0, None),
             retreat_timer: 0.0,
             stuck_phase_timer: 0.0,
+            non_active_stuck_timer: 0.0,
             ball_event_cooldown: vec![0.0; num_teams * 3],
             last_fire_label: "",
             last_ball_per_team: {
@@ -835,15 +839,21 @@ impl Game {
                 if is_key_pressed(KeyCode::W) || is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::Space) {
                     physics::jump(ball);
                     if self.net.connected {
-                        let msg = r#"{"type":"input","input":"{\"Jump\":{}}"}"#;
-                        self.net.send_message(msg);
+                        let msg = format!(
+                            r#"{{"type":"input","input":"{{\"Jump\":{{}}}}","bi":{}}}"#,
+                            self.current_ball,
+                        );
+                        self.net.send_message(&msg);
                     }
                 }
                 if is_key_pressed(KeyCode::S) || is_key_pressed(KeyCode::Down) {
                     physics::backflip(ball);
                     if self.net.connected {
-                        let msg = r#"{"type":"input","input":"{\"Backflip\":{}}"}"#;
-                        self.net.send_message(msg);
+                        let msg = format!(
+                            r#"{{"type":"input","input":"{{\"Backflip\":{{}}}}","bi":{}}}"#,
+                            self.current_ball,
+                        );
+                        self.net.send_message(&msg);
                     }
                 }
             }
@@ -1226,7 +1236,15 @@ impl Game {
                     _ => escaped.push(c),
                 }
             }
-            let msg = format!(r#"{{"type":"input","input":"{}"}}"#, escaped);
+            let (fire_bx, fire_by) = if idx < self.balls.len() {
+                (self.balls[idx].x, self.balls[idx].y)
+            } else {
+                (0.0, 0.0)
+            };
+            let msg = format!(
+                r#"{{"type":"input","input":"{}","bi":{},"bx":{:.1},"by":{:.1}}}"#,
+                escaped, idx, fire_bx, fire_by,
+            );
             self.net.send_message(&msg);
         }
     }
@@ -1269,7 +1287,7 @@ impl Game {
             // Uzi - burst-fire 20 bullets in a straight line, one every 0.07 s
             Weapon::Uzi => {
                 self.uzi_bullets.clear();
-                let base_speed = power * 18.0;
+                let base_speed = 18.0; // always full power
 
                 // Spawn the first bullet immediately
                 self.uzi_bullets.push(UziBullet {
@@ -1512,7 +1530,8 @@ impl Game {
             // so it is safe to call unconditionally and removes a class of race conditions.
             self.send_ball_state();
             self.send_terrain_damages();
-            self.net.send_message(r#"{"type":"end_turn"}"#);
+            let et_msg = format!(r#"{{"type":"end_turn","bi":{}}}"#, self.current_ball);
+            self.net.send_message(&et_msg);
         }
         self.phase = Phase::TurnEnd;
         self.turn_end_timer = TURN_END_DELAY;
@@ -1912,6 +1931,7 @@ impl Game {
         self.teleport_locked_pos = None;
         self.bot_think_timer = 3.0;
         self.stuck_phase_timer = 0.0;
+        self.non_active_stuck_timer = 0.0;
         
         // Reset movement budget for the current ball
         if self.current_ball < self.balls.len() {
@@ -2127,6 +2147,19 @@ impl Game {
                 // We will override both immediately after.
                 self.current_turn_index = turn_idx;
                 self.sync_to_player_turn(turn_idx);
+                // Override current_ball with the server's authoritative ball index.
+                // This corrects round-robin divergence after reconnect.
+                if let Some(cbi) = parse_json_number(&msg, "currentBallIndex").map(|v| v as usize) {
+                    if cbi < self.balls.len() {
+                        self.current_ball = cbi;
+                        if let Some(team) = self.balls.get(cbi).map(|b| b.team as usize) {
+                            while self.last_ball_per_team.len() <= team {
+                                self.last_ball_per_team.push(None);
+                            }
+                            self.last_ball_per_team[team] = Some(cbi);
+                        }
+                    }
+                }
                 // Restore phase from server
                 let restored_phase = if let Some(phase_str) = parse_json_string(&msg, "phase") {
                     match phase_str {
@@ -2173,10 +2206,23 @@ impl Game {
                         continue;
                     }
                     
-                    // Use current_ball for the active turn player (already set by
-                    // sync_to_player_turn with correct rotation). Only fall back to
-                    // find_ball_for_player for non-turn messages.
-                    let ball_idx_opt = if player_index == self.current_turn_index {
+                    // Use transmitted ball index (bi) if present — authoritative, avoids
+                    // round-robin divergence (e.g. after reconnect).
+                    let ball_idx_opt = if let Some(bi) = parse_bi_from_message(&msg) {
+                        if bi < self.balls.len() {
+                            // Keep local round-robin in sync for future turns
+                            if let Some(team) = self.balls.get(bi).map(|b| b.team as usize) {
+                                while self.last_ball_per_team.len() <= team {
+                                    self.last_ball_per_team.push(None);
+                                }
+                                self.last_ball_per_team[team] = Some(bi);
+                            }
+                            self.current_ball = bi;
+                            Some(bi)
+                        } else {
+                            self.find_ball_for_player(player_index)
+                        }
+                    } else if player_index == self.current_turn_index {
                         Some(self.current_ball)
                     } else {
                         self.find_ball_for_player(player_index)
@@ -2184,6 +2230,17 @@ impl Game {
                     if let Some(ball_idx) = ball_idx_opt {
                         // Parse and apply different input types
                         if let Some((angle_rad, power, weapon)) = parse_fire_input(&input_str) {
+                            // Snap ball to sender's authoritative position so projectile
+                            // starts at the correct spot on all clients.
+                            if let (Some(bx_f), Some(by_f)) = (
+                                parse_json_number(&msg, "bx").map(|v| v as f32),
+                                parse_json_number(&msg, "by").map(|v| v as f32),
+                            ) {
+                                if ball_idx < self.balls.len() {
+                                    self.balls[ball_idx].x = bx_f;
+                                    self.balls[ball_idx].y = by_f;
+                                }
+                            }
                             self.do_fire(ball_idx, angle_rad, power, weapon);
                             self.has_fired = true;
                             // Reset budget on the firing ball so remote players also get
@@ -2420,6 +2477,30 @@ impl Game {
                 // behalf of a bot, or the client enters TurnEnd with stale state.
                 if self.turn_timer <= 0.0 && (self.is_my_turn() || (is_bot_turn && !self.net.connected)) {
                     self.end_turn();
+                }
+
+                // Watchdog for non-active players: if the turn timer has expired but
+                // we are not the active player, nudge the server so it force-advances.
+                // This unsticks games where the active client's WebSocket silently dropped
+                // or DO alarms are unavailable (local dev). Sends a ping after 3 s, then
+                // every 10 s until the server responds with turn_advanced/force_advance.
+                if self.turn_timer <= 0.0 && !self.is_my_turn() && self.net.connected {
+                    self.non_active_stuck_timer += dt;
+                    let next_ping = if self.non_active_stuck_timer >= 3.0 {
+                        let cycles = ((self.non_active_stuck_timer - 3.0) / 10.0) as u32;
+                        3.0 + cycles as f32 * 10.0
+                    } else {
+                        3.0
+                    };
+                    if (self.non_active_stuck_timer >= 3.0) && 
+                       ((self.non_active_stuck_timer - dt) < next_ping) {
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            let msg = format!("[WATCHDOG] Non-active player stuck {:.1}s past turn end — pinging server\0", self.non_active_stuck_timer);
+                            unsafe { console_log(msg.as_ptr()); }
+                        }
+                        self.net.send_message(r#"{"type":"ping"}"#);
+                    }
                 }
 
                 // ── Bot AI ──────────────────────────────────────────────────────
@@ -2970,7 +3051,8 @@ impl Game {
                             // The server ignores it from non-active players, but if we
                             // ARE the active player it will unstick the server too.
                             if self.net.connected {
-                                self.net.send_message(r#"{"type":"end_turn"}"#);
+                                let et_msg = format!(r#"{{"type":"end_turn","bi":{}}}"#, self.current_ball);
+                                self.net.send_message(&et_msg);
                             }
                             self.advance_turn();
                         }
@@ -3941,6 +4023,15 @@ fn parse_walk_input(input: &str) -> Option<f32> {
         return None;
     }
     parse_json_number(input, "dir").map(|v| v as f32)
+}
+
+fn parse_bi_from_message(msg: &str) -> Option<usize> {
+    let search = "\"bi\":";
+    let pos = msg.find(search)?;
+    let after = msg[pos + search.len()..].trim_start();
+    let end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+    if end == 0 { return None; }
+    after[..end].parse().ok()
 }
 
 fn parse_aim_message(msg: &str) -> Option<(usize, f32)> {

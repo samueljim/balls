@@ -33,6 +33,8 @@ export interface GameState {
   playerOrder: { playerId: string; isBot: boolean; name: string }[];
   inputLog: string[];
   currentTurnIndex: number;
+  /** Index into the flat balls[] array of the currently active ball (authoritative) */
+  currentBallIndex: number;
   turnEndTime: number;
   phase: string;
   rngSeed: number;
@@ -41,7 +43,7 @@ export interface GameState {
 
 export type GameMessage =
   | { type: "state"; state: Partial<GameState> }
-  | { type: "input"; input: string; turnIndex: number }
+  | { type: "input"; input: string; turnIndex: number; bi: number; bx?: number; by?: number }
   | { type: "aim"; aim: number; turnIndex: number }
   | { type: "turn_advanced"; turnIndex: number }
   | { type: "error"; message: string };

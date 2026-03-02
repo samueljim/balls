@@ -14,9 +14,9 @@ interface PersistedGameData {
   phaseStartTime: number;
 }
 /** Grace period after turnEndTime before the server forcibly advances the turn */
-const WATCHDOG_GRACE_MS = 5_000;
+const WATCHDOG_GRACE_MS = 1_000;
 /** Max time (ms) a "projectile" phase can last before the server force-advances */
-const PROJECTILE_TIMEOUT_MS = 20_000;
+const PROJECTILE_TIMEOUT_MS = 12_000;
 
 export class Game implements DurableObject {
   private state: DurableObjectState;
@@ -24,6 +24,7 @@ export class Game implements DurableObject {
     playerOrder: [],
     inputLog: [],
     currentTurnIndex: 0,
+    currentBallIndex: 0,
     turnEndTime: 0,
     phase: "aiming",
     rngSeed: 0, // Set by lobby via /init POST
@@ -93,6 +94,7 @@ export class Game implements DurableObject {
     this.gameState.terrainId = body.terrainId ?? 0;
     this.gameState.inputLog = [];
     this.gameState.currentTurnIndex = 0;
+    this.gameState.currentBallIndex = 0;
     this.gameState.phase = "aiming";
     this.gameState.turnEndTime = Date.now() + TURN_TIME_MS;
     this.playerIdToIndex.clear();
@@ -173,6 +175,7 @@ export class Game implements DurableObject {
           type: "game_resync",
           phase: this.gameState.phase,
           currentTurnIndex: this.gameState.currentTurnIndex,
+          currentBallIndex: this.gameState.currentBallIndex,
           turnTimeRemainingMs,
           // Only ship authoritative ball data once we have real positions from clients
           balls: gameHasProgressed ? this.ballSnapshots : undefined,
@@ -205,6 +208,7 @@ export class Game implements DurableObject {
   private advanceTurn(): void {
     this.gameState.currentTurnIndex =
       (this.gameState.currentTurnIndex + 1) % this.gameState.playerOrder.length;
+    this.gameState.currentBallIndex = 0; // Will be set by first input of the new turn
     this.gameState.phase = "aiming";
     this.gameState.turnEndTime = Date.now() + TURN_TIME_MS;
     this.phaseStartTime = Date.now();
@@ -457,10 +461,31 @@ export class Game implements DurableObject {
     const idx = this.playerIdToIndex.get(playerId);
     if (idx === undefined) return;
 
-    // Accept terrain_damages from ANY connected player (not just current turn)
-    // so the worker always has the latest cumulative damage log.
+    // Accept several message types from ANY connected player (not just active turn).
     try {
       const parsed = JSON.parse(data) as { type: string; [k: string]: unknown };
+
+      // ping: any client can send this when they detect the active player's turn
+      // has expired. Re-broadcast state so all clients stay informed, and if the
+      // turn really has expired, force-advance immediately (handles dev environments
+      // where DO alarms are unavailable and the normal watchdog never fires).
+      if (parsed.type === "ping") {
+        const now = Date.now();
+        if (this.gameState.playerOrder.length > 0 &&
+            now >= this.gameState.turnEndTime + WATCHDOG_GRACE_MS) {
+          // Turn has genuinely expired — force-advance
+          this.broadcast({ type: "force_advance", reason: "ping_watchdog" });
+          this.advanceTurnAndMaybeBot();
+        } else {
+          // Turn still live: re-broadcast state and re-arm alarm in case it was dropped
+          this.broadcast({ type: "state", state: this.gameState });
+          this.scheduleWatchdog();
+        }
+        return;
+      }
+
+      // terrain_damages: accept from ANY player (not just current turn)
+      // so the worker always has the latest cumulative damage log.
       if (parsed.type === "terrain_damages") {
         const dmgMsg = parsed as { type: string; log?: number[][] };
         if (Array.isArray(dmgMsg.log) && dmgMsg.log.length >= this.terrainDamageLog.length) {
@@ -517,7 +542,14 @@ export class Game implements DurableObject {
       if (msg.type === "input" && typeof msg.input === "string") {
         // Check if this is a firing action (not movement)
         const isFiring = msg.input.includes('"Fire"');
-        
+        // Track which ball is active (client sends bi in every input message)
+        const incomingBi = typeof (msg as any).bi === "number" ? (msg as any).bi as number : undefined;
+        if (incomingBi !== undefined) {
+          this.gameState.currentBallIndex = incomingBi;
+        }
+        const incomingBx = typeof (msg as any).bx === "number" ? (msg as any).bx as number : undefined;
+        const incomingBy = typeof (msg as any).by === "number" ? (msg as any).by as number : undefined;
+
         if (isFiring) {
           // Only log and change phase for firing actions
           this.gameState.inputLog.push(msg.input);
@@ -526,11 +558,19 @@ export class Game implements DurableObject {
           this.scheduleWatchdog();
           this.persistState();
         }
-        
+
         // Always broadcast the input to all clients (Jump, Backflip, Fire)
         // Walk movement is no longer relayed via inputs — pos_update handles position sync.
-        this.broadcast({ type: "input", input: msg.input, turnIndex: this.gameState.currentTurnIndex });
-        
+        // Include bi/bx/by so receivers know exactly which ball to apply this to.
+        this.broadcast({
+          type: "input",
+          input: msg.input,
+          turnIndex: this.gameState.currentTurnIndex,
+          bi: this.gameState.currentBallIndex,
+          ...(incomingBx !== undefined ? { bx: incomingBx } : {}),
+          ...(incomingBy !== undefined ? { by: incomingBy } : {}),
+        });
+
         if (isFiring) {
           this.broadcast({ type: "state", state: this.gameState });
         }

@@ -103,7 +103,6 @@ struct Game {
     bot_think_timer: f32,
 
     cam: GameCamera,
-    panning: bool,
     last_mouse: (f32, f32),
     /// Origin of a left-button press; cleared once drag threshold exceeded or released.
     left_drag_start: Option<(f32, f32)>,
@@ -324,7 +323,6 @@ impl Game {
             drill_log: Vec::new(),
             bot_think_timer: 3.0,
             cam: GameCamera::new(cam_x, cam_y),
-            panning: false,
             last_mouse: (0.0, 0.0),
             left_drag_start: None,
             left_drag_panning: false,
@@ -446,14 +444,6 @@ impl Game {
         
         let (mx, my) = mouse_position();
 
-        if is_mouse_button_pressed(MouseButton::Right) || is_mouse_button_pressed(MouseButton::Middle) {
-            self.panning = true;
-            self.last_mouse = (mx, my);
-        }
-        if is_mouse_button_released(MouseButton::Right) || is_mouse_button_released(MouseButton::Middle) {
-            self.panning = false;
-        }
-
         // Left-click drag-to-pan: record press origin and promote to pan once cursor moves > 8px.
         if is_mouse_button_pressed(MouseButton::Left) {
             self.left_drag_start = Some((mx, my));
@@ -503,7 +493,7 @@ impl Game {
             }
         }
 
-        if self.panning || self.left_drag_panning {
+        if self.left_drag_panning {
             let dx = mx - self.last_mouse.0;
             let dy = my - self.last_mouse.1;
             if dx.abs() > 0.5 || dy.abs() > 0.5 {

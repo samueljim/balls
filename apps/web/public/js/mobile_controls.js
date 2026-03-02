@@ -15,9 +15,9 @@
  *   - Virtual joystick (bottom-left, mobile)  → Left / Right arrow key_down/up
  *                                               Push UP on joystick → Space (jump, one-shot)
  *   - Weapon button (bottom-right, mobile)    → Tab key_down  (toggles weapon menu)
- *   - Single-finger drag on canvas (mobile)   → mouse_move (aim) — always works anywhere
+ *   - Single-finger drag on canvas (mobile)   → click-drag pan (left_drag_panning, Rust 8 px threshold)
  *   - Single-finger tap on canvas (mobile)    → toggle aim-lock (or select weapon if menu open)
- *   - Two-finger drag on canvas (mobile)      → right-click drag (camera pan)
+ *   - Two-finger drag on canvas (mobile)      → camera pan (left-button drag on midpoint)
  *   - Pinch on canvas (mobile)                → mouse_wheel (zoom)
  *   - Zoom + / − buttons (mobile)             → mouse_wheel
  */
@@ -333,27 +333,25 @@
    * e.stopImmediatePropagation() to prevent gl.js's native canvas touch handlers
    * from mapping touches to mouse_down/mouse_up (which would fire the weapon).
    *
-   * Single-finger short drag (< PAN_THRESHOLD CSS px): aims (mouse_move).
-   *   Clean tap (< TAP_MOVE_THRESHOLD px movement): toggles aim-lock or
-   *   selects a weapon when the menu is open (mouse_down + mouse_up).
-   *   Long drag (≥ PAN_THRESHOLD CSS px): promotes to right-click-drag camera pan.
+   * Single-finger: tap (< TAP_MOVE_THRESHOLD px) = aim-lock toggle / weapon select.
+   *   Drag (any distance) = camera pan via the Rust left_drag_panning system —
+   *   Rust automatically promotes a left-button press into camera pan once the
+   *   cursor moves > 8 px, so no explicit PAN_THRESHOLD logic is needed here.
    *
-   * Two-finger: camera pan (right-button drag) + pinch zoom.
+   * Two-finger drag: camera pan (left-button drag on midpoint).
+   * Two-finger pinch: zoom (mouse_wheel).
    */
   function setupCanvasTouches(canvas) {
-    /* Single-finger aim state */
+    /* Single-finger state */
     var aimId = null;
     var aimStartX = 0, aimStartY = 0;
     var aimMoved = false;
     var TAP_MOVE_THRESHOLD = 15;
-    /* Set to true once a single-finger drag exceeds PAN_THRESHOLD and switches
-     * to right-click-drag camera pan. Reset on touchend/touchcancel. */
-    var aimPanActive = false;
-    /* Distance in CSS pixels before a single-finger drag promotes to a camera pan.
-     * Multiplied by devicePixelRatio when comparing against canvas-space coords. */
-    var PAN_THRESHOLD = 30;
 
-    /* Two-finger pan / pinch state */
+    /* Two-finger pan / pinch state.
+     * Uses left-button drag so it goes through the same left_drag_panning path
+     * as desktop click-drag — eliminates the stuck-panning bug that occurred
+     * when mouse_up fired off-canvas with the old right-button approach. */
     var panning = false;
     var lastPanCvs = null;
     var lastPinchDist = null;
@@ -373,19 +371,22 @@
       };
     }
 
+    /* End a two-finger pan by releasing the left button. */
     function stopPan(pos) {
       if (panning) {
-        wasm_exports.mouse_up(pos.x, pos.y, 2);
+        wasm_exports.mouse_up(pos.x, pos.y, 0);
         panning = false;
         lastPanCvs = null;
         lastPinchDist = null;
       }
     }
 
-    function stopAimPan(pos) {
-      if (aimPanActive) {
-        wasm_exports.mouse_up(pos.x, pos.y, 2);
-        aimPanActive = false;
+    /* Cancel an in-progress single-finger touch without triggering a tap action. */
+    function cancelSingleFinger(pos) {
+      if (aimId !== null) {
+        wasm_exports.mouse_up(pos.x, pos.y, 0);
+        aimId = null;
+        aimMoved = false;
       }
     }
 
@@ -396,14 +397,13 @@
       var ts = e.touches;
 
       if (ts.length === 1) {
-        /* Transitioning from two-finger to one: stop pan cleanly */
+        /* Transitioning from two-finger back to one: stop pan cleanly */
         if (panning) stopPan(cvsPos(ts[0].clientX, ts[0].clientY));
 
         var p = cvsPos(ts[0].clientX, ts[0].clientY);
         aimId = ts[0].identifier;
         aimStartX = p.x; aimStartY = p.y;
         aimMoved = false;
-        aimPanActive = false;
         lastAimX = p.x; lastAimY = p.y;
 
         if (menuOpen) {
@@ -411,23 +411,26 @@
           menuTouchStartCvsX = p.x;
           menuTouchStartCvsY = p.y;
           menuDragging = false;
-          return;
         }
 
-        /* Snap aim to touch position immediately so the angle updates right away */
+        /* Snap aim and start a left-button press.
+         * Rust will promote this to left_drag_panning once the finger moves > 8 px,
+         * which covers both camera pan (any drag) and tap detection. */
         wasm_exports.mouse_move(p.x, p.y);
+        wasm_exports.mouse_down(p.x, p.y, 0);
 
       } else if (ts.length >= 2) {
-        /* Two or more fingers: cancel single-finger tracking and start pan */
-        if (aimPanActive) stopAimPan(cvsPos(ts[0].clientX, ts[0].clientY));
-        aimId = null;
+        /* Two or more fingers: cancel single-finger and start two-finger pan */
+        if (aimId !== null) {
+          cancelSingleFinger({ x: lastAimX, y: lastAimY });
+        }
         menuScrollLastCvsY = null;
         var mid = midpoint(ts[0], ts[1]);
         var cMid = cvsPos(mid.x, mid.y);
         lastPinchDist = pinchDist(ts[0], ts[1]);
         if (!panning) {
           panning = true;
-          wasm_exports.mouse_down(cMid.x, cMid.y, 2);
+          wasm_exports.mouse_down(cMid.x, cMid.y, 0);
           lastPanCvs = cMid;
         }
       }
@@ -444,7 +447,6 @@
         for (var i = 0; i < ct.length; i++) {
           if (ct[i].identifier !== aimId) continue;
           var p = cvsPos(ct[i].clientX, ct[i].clientY);
-          var dpr = window.devicePixelRatio || 1;
           var totalMove = Math.abs(p.x - aimStartX) + Math.abs(p.y - aimStartY);
           if (totalMove > TAP_MOVE_THRESHOLD) aimMoved = true;
           lastAimX = p.x; lastAimY = p.y;
@@ -462,21 +464,8 @@
             break;
           }
 
-          /* Once the finger has moved far enough, promote to right-click-drag
-           * camera pan instead of aiming. Short drags (< PAN_THRESHOLD CSS px)
-           * still update the aim angle so fine adjustments remain possible. */
-          if (!aimPanActive) {
-            var ddx = p.x - aimStartX;
-            var ddy = p.y - aimStartY;
-            var panDist = Math.sqrt(ddx * ddx + ddy * ddy);
-            if (panDist > PAN_THRESHOLD * dpr) {
-              aimPanActive = true;
-              wasm_exports.mouse_down(p.x, p.y, 2);
-            }
-          }
-
-          /* Always send mouse_move so aim tracks short drags and pan delta
-           * is computed correctly once pan mode is active. */
+          /* Send mouse_move so aim tracks short drags; Rust auto-promotes to
+           * left_drag_panning once the drag exceeds the 8 px threshold. */
           wasm_exports.mouse_move(p.x, p.y);
           break;
         }
@@ -506,39 +495,26 @@
       }
       if (remaining === 0) {
         if (aimId !== null) {
-          if (aimPanActive) {
-            /* End single-finger camera pan */
-            stopAimPan({ x: lastAimX, y: lastAimY });
-          } else if (!aimMoved) {
-            /* A tap (no significant movement) triggers mouse_down+up.
-             * • When menu is open: selects a weapon or closes the menu.
-             * • Otherwise: toggles aim-lock (mirrors desktop clean-left-click). */
-            var tapX = lastAimX, tapY = lastAimY;
-            if (menuOpen && !menuDragging) {
-              wasm_exports.mouse_down(tapX, tapY, 0);
-              requestAnimationFrame(function () { wasm_exports.mouse_up(tapX, tapY, 0); });
-              menuOpen = false;
-            } else if (!menuOpen) {
-              wasm_exports.mouse_down(tapX, tapY, 0);
-              requestAnimationFrame(function () { wasm_exports.mouse_up(tapX, tapY, 0); });
-            }
+          /* Release left button — Rust handles tap vs pan detection via was_tap flag:
+           * • If left_drag_panning was active: was_tap=false → no tap action.
+           * • If finger barely moved (true tap): was_tap=true → aim-lock / weapon select. */
+          if (menuOpen && !menuDragging) {
+            wasm_exports.mouse_up(lastAimX, lastAimY, 0);
+            menuOpen = false;
+          } else {
+            wasm_exports.mouse_up(lastAimX, lastAimY, 0);
           }
-          /* Short drag that didn't reach pan threshold: no extra mouse event needed */
+          aimId = null;
+          aimMoved = false;
+          menuScrollLastCvsY = null;
         }
-        aimId = null;
-        aimMoved = false;
-        aimPanActive = false;
-        menuScrollLastCvsY = null;
       }
     }, { capture: true, passive: false });
 
     canvas.addEventListener("touchcancel", function (e) {
       e.stopImmediatePropagation();
       stopPan({ x: lastAimX, y: lastAimY });
-      stopAimPan({ x: lastAimX, y: lastAimY });
-      aimId = null;
-      aimMoved = false;
-      aimPanActive = false;
+      cancelSingleFinger({ x: lastAimX, y: lastAimY });
       menuScrollLastCvsY = null;
     }, { capture: true, passive: false });
   }

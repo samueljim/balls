@@ -17,7 +17,7 @@ use state::Phase;
 use terrain::Terrain;
 use weapons::Weapon;
 
-const TURN_TIME: f32 = 55.0;
+const TURN_TIME: f32 = 45.0;
 const TURN_END_DELAY: f32 = 0.5;
 const SETTLE_TIMEOUT: f32 = 3.0;
 const CHARGE_SPEED: f32 = 55.0;
@@ -142,6 +142,8 @@ struct Game {
     /// regardless of whether current_turn_index appears unchanged from the freshly
     /// re-initialised value of 0.
     just_reconnected: bool,
+    /// True once we've received init at least once; used to detect reconnect vs first connect.
+    had_network_connection: bool,
     /// Throttle for network aim messages (seconds since last send)
     last_aim_send: f32,
     /// Throttle for position-streaming messages (seconds since last send)
@@ -342,6 +344,7 @@ impl Game {
             pending_turn_sync: None,
             restart_seed: None,
             just_reconnected: false,
+            had_network_connection: false,
             last_aim_send: 0.0,
             last_pos_send: 0.0,
             last_pos_sent: None,
@@ -2040,6 +2043,11 @@ impl Game {
                 // Any `init` message means we (re)connected. Force a full turn sync
                 // once the subsequent state/game_resync arrives.
                 self.just_reconnected = true;
+                #[cfg(target_arch = "wasm32")]
+                if self.had_network_connection {
+                    self.net.send_game_event(r#"{"type":"reconnected"}"#);
+                }
+                self.had_network_connection = true;
                 if let Some(idx) = parse_json_number(&msg, "myPlayerIndex") {
                     self.net.my_player_index = Some(idx as usize);
                     #[cfg(target_arch = "wasm32")]
@@ -2089,7 +2097,17 @@ impl Game {
                         if let Some(bots_str) = parse_json_string(&msg, "playerBots") {
                             self.net.player_is_bot = bots_str.split(',').map(|s| s == "1").collect();
                         }
+                        self.had_network_connection = true;
                     }
+                }
+                continue;
+            }
+            if msg.contains("\"type\":\"ws_close\"") || msg.contains("\"type\": \"ws_close\"") {
+                self.net.connected = false;
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let event = r#"{"type":"connection_lost"}"#;
+                    self.net.send_game_event(event);
                 }
                 continue;
             }
@@ -2106,6 +2124,16 @@ impl Game {
                     _ => {
                         // During projectile/settling, just note that a sync is coming
                     }
+                }
+                continue;
+            }
+            if msg.contains("\"type\":\"game_over\"") || msg.contains("\"type\": \"game_over\"") {
+                // Server detected game over (e.g. after skipping dead teams)
+                self.phase = Phase::GameOver;
+                if let Some(winner) = parse_json_string(&msg, "winner") {
+                    let event = format!("{{\"type\":\"game_over\",\"winner\":\"{}\"}}",
+                        sanitize_event_name(&winner));
+                    self.net.send_game_event(&event);
                 }
                 continue;
             }
@@ -2230,6 +2258,7 @@ impl Game {
                 // Restore phase from server
                 let restored_phase = if let Some(phase_str) = parse_json_string(&msg, "phase") {
                     match phase_str {
+                        "game_over" => Phase::GameOver,
                         "retreat"   => Phase::Retreat,
                         "projectile" | "settling" => Phase::Settling, // missed the flight — settle
                         "turn_end"  => Phase::TurnEnd,
@@ -3749,6 +3778,7 @@ impl Game {
             self.weapon_menu_open,
             self.weapon_menu_scroll,
             &self.weapon_search,
+            self.net.connected,
         );
     }
 

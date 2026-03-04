@@ -12,11 +12,16 @@ interface PersistedGameData {
   ballSnapshots: BallSnapshot[];
   playerIdToIndex: [string, number][];
   phaseStartTime: number;
+  /** Per-team last ball index used (round-robin), matches client last_ball_per_team */
+  lastBallPerTeam?: (number | undefined)[];
+  hostId?: string | null;
 }
 /** Grace period after turnEndTime before the server forcibly advances the turn */
 const WATCHDOG_GRACE_MS = 1_000;
 /** Max time (ms) a "projectile" phase can last before the server force-advances */
 const PROJECTILE_TIMEOUT_MS = 12_000;
+/** Max WebSocket message size (chars/bytes) to prevent memory exhaustion */
+const MAX_MESSAGE_SIZE = 100_000;
 
 export class Game implements DurableObject {
   private state: DurableObjectState;
@@ -29,6 +34,7 @@ export class Game implements DurableObject {
     phase: "aiming",
     rngSeed: 0, // Set by lobby via /init POST
     terrainId: 0,
+    globalTurnNumber: 0,
   };
   private sockets: Map<string, WebSocket> = new Map();
   private playerIdToIndex: Map<string, number> = new Map();
@@ -40,6 +46,18 @@ export class Game implements DurableObject {
   private lastWindValue: number = 0;
   /** Timestamp (ms) when the current phase last changed – used by watchdog */
   private phaseStartTime: number = 0;
+  /** Per-team last ball index used for round-robin (aligns with client last_ball_per_team) */
+  private lastBallPerTeam: (number | undefined)[] = [];
+  /** Host player id (only host can request restart) */
+  private hostId: string | null = null;
+  /** Per-player last ping timestamp (rate-limit: 1 force-advance per 2s per player) */
+  private lastPingPerPlayer: Map<string, number> = new Map();
+  /** Per-player last input timestamp (rate-limit: 25/sec) */
+  private lastInputPerPlayer: Map<string, number> = new Map();
+  /** Per-player last aim timestamp (rate-limit: 30/sec) */
+  private lastAimPerPlayer: Map<string, number> = new Map();
+  /** When we last received input/ball_state/end_turn from the active player (for terrain fallback) */
+  private lastActivePlayerActivity: number = 0;
 
   constructor(state: DurableObjectState, _env: unknown) {
     this.state = state;
@@ -53,8 +71,12 @@ export class Game implements DurableObject {
           this.ballSnapshots = saved.ballSnapshots ?? [];
           this.phaseStartTime = saved.phaseStartTime ?? 0;
           this.playerIdToIndex = new Map(saved.playerIdToIndex ?? []);
+          this.lastBallPerTeam = saved.lastBallPerTeam ?? [];
+          this.hostId = saved.hostId ?? null;
         }
-      } catch (_) {}
+      } catch (e) {
+        console.warn("[Game] Failed to restore persisted state:", e);
+      }
     });
   }
 
@@ -66,7 +88,11 @@ export class Game implements DurableObject {
       ballSnapshots: this.ballSnapshots,
       playerIdToIndex: [...this.playerIdToIndex.entries()],
       phaseStartTime: this.phaseStartTime,
-    }).catch(() => {});
+      lastBallPerTeam: this.lastBallPerTeam,
+      hostId: this.hostId,
+    }).catch((e) => {
+      console.warn("[Game] Failed to persist state:", e);
+    });
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -85,10 +111,14 @@ export class Game implements DurableObject {
     if (this.gameState.playerOrder.length > 0) {
       return Response.json({ ok: true, alreadyInitialized: true });
     }
-    const body = await request.json().catch(() => ({})) as {
+    const body = await request.json().catch((e) => {
+      console.warn("[Game] Invalid init JSON:", e);
+      return {};
+    }) as {
       playerOrder?: { playerId: string; isBot: boolean; name: string }[];
       rngSeed?: number;
       terrainId?: number;
+      hostId?: string;
     };
     this.gameState.playerOrder = body.playerOrder ?? [];
     // Use seed from lobby (always provided via start_game)
@@ -107,6 +137,8 @@ export class Game implements DurableObject {
     this.ballSnapshots = Array.from({ length: totalBalls }, () => ({
       x: 0, y: 0, vx: 0, vy: 0, hp: 100, alive: true,
     }));
+    this.lastBallPerTeam = Array.from({ length: this.gameState.playerOrder.length }, () => undefined);
+    if (typeof body.hostId === "string") this.hostId = body.hostId;
     // Send identity to all already-connected sockets (they connected before /init was called)
     for (const [pid, ws] of this.sockets) {
       const idx = this.playerIdToIndex.get(pid);
@@ -118,7 +150,9 @@ export class Game implements DurableObject {
             playerId: pid,
             rngSeed: this.gameState.rngSeed,
           }));
-        } catch (_) {}
+        } catch (e) {
+          console.warn("[Game] Failed to send identity to", pid, e);
+        }
       }
     }
     this.broadcast({ type: "state", state: this.gameState });
@@ -132,10 +166,29 @@ export class Game implements DurableObject {
     return Response.json({ ok: true });
   }
 
+  /** Validate playerId format: reasonable length, no control chars (security) */
+  private isValidPlayerId(id: string): boolean {
+    if (typeof id !== "string" || id.length < 1 || id.length > 64) return false;
+    for (let i = 0; i < id.length; i++) {
+      const c = id.charCodeAt(i);
+      if (c < 32 || c > 126) return false; // No control chars, only printable ASCII
+    }
+    return true;
+  }
+
   private async handleWebSocket(request: Request, url: URL): Promise<Response> {
     const playerId = url.searchParams.get("playerId");
     if (!playerId) {
       return new Response("playerId required", { status: 400 });
+    }
+    if (!this.isValidPlayerId(playerId)) {
+      return new Response("Invalid playerId format", { status: 400 });
+    }
+    if (this.gameState.playerOrder.length > 0) {
+      const inGame = this.gameState.playerOrder.some((p) => p.playerId === playerId);
+      if (!inGame) {
+        return new Response("playerId not in game", { status: 400 });
+      }
     }
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
@@ -153,7 +206,9 @@ export class Game implements DurableObject {
           playerId,
           rngSeed: this.gameState.rngSeed
         }));
-      } catch (_) {}
+      } catch (e) {
+        console.warn("[Game] Failed to send identity on connect:", e);
+      }
 
       // On reconnect, send terrain damage log and a comprehensive resync message
       // so the client can fully restore game state without a reset.
@@ -163,7 +218,9 @@ export class Game implements DurableObject {
             type: "terrain_sync",
             log: this.terrainDamageLog,
           }));
-        } catch (_) {}
+        } catch (e) {
+          console.warn("[Game] Failed to send terrain_sync on reconnect:", e);
+        }
       }
       // Send game_resync: full snapshot including phase and turn timer remaining.
       // Only include ball positions once the game has actually progressed and the
@@ -171,7 +228,7 @@ export class Game implements DurableObject {
       // start, ballSnapshots are all (0,0), and including them would overwrite the
       // deterministic spawn positions the client already computed from the seed.
       const turnTimeRemainingMs = Math.max(0, this.gameState.turnEndTime - Date.now());
-      const gameHasProgressed = this.gameState.inputLog.length > 0 || this.gameState.currentTurnIndex > 0;
+      const gameHasProgressed = this.gameState.inputLog.length > 0 || (this.gameState.globalTurnNumber ?? 0) > 0;
       try {
         server.send(JSON.stringify({
           type: "game_resync",
@@ -179,10 +236,13 @@ export class Game implements DurableObject {
           currentTurnIndex: this.gameState.currentTurnIndex,
           currentBallIndex: this.gameState.currentBallIndex,
           turnTimeRemainingMs,
+          globalTurnNumber: this.gameState.globalTurnNumber ?? 0,
           // Only ship authoritative ball data once we have real positions from clients
           balls: gameHasProgressed ? this.ballSnapshots : undefined,
         }));
-      } catch (_) {}
+      } catch (e) {
+        console.warn("[Game] Failed to send game_resync on reconnect:", e);
+      }
     }
     
     // Then send current game state
@@ -200,26 +260,89 @@ export class Game implements DurableObject {
       }
     }
     const data = JSON.stringify(msg);
-    for (const ws of this.sockets.values()) {
+    for (const [pid, ws] of this.sockets) {
       try {
         ws.send(data);
-      } catch (_) {}
+      } catch (e) {
+        console.warn("[Game] Broadcast failed for", pid, e);
+      }
     }
   }
 
+  /** Check if the given team (player index) has any alive balls. */
+  private teamHasAliveBalls(teamIndex: number): boolean {
+    const numPlayers = this.gameState.playerOrder.length;
+    const ballsPerTeam = 3;
+    for (let wi = 0; wi < ballsPerTeam; wi++) {
+      const bi = teamIndex + wi * numPlayers;
+      if (bi < this.ballSnapshots.length && this.ballSnapshots[bi].alive) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Count teams with at least one alive ball. Returns winner team index (0-based) or -1 if draw/none. */
+  private getAliveTeams(): { count: number; winner: number } {
+    const numPlayers = this.gameState.playerOrder.length;
+    let count = 0;
+    let lastAlive = -1;
+    for (let t = 0; t < numPlayers; t++) {
+      if (this.teamHasAliveBalls(t)) {
+        count++;
+        lastAlive = t;
+      }
+    }
+    return { count, winner: lastAlive };
+  }
+
   private advanceTurn(): void {
-    this.gameState.currentTurnIndex =
-      (this.gameState.currentTurnIndex + 1) % this.gameState.playerOrder.length;
+    const numPlayers = this.gameState.playerOrder.length;
+    if (numPlayers === 0) return;
+
+    // Check game over before advancing — if we're already down to 0–1 teams, broadcast and stop
+    const { count: aliveCount, winner } = this.getAliveTeams();
+    if (aliveCount <= 1) {
+      const winnerName = winner >= 0
+        ? this.gameState.playerOrder[winner]?.name ?? `Team ${winner + 1}`
+        : "Nobody";
+      this.broadcast({ type: "game_over", winner: winnerName });
+      this.gameState.phase = "game_over";
+      this.persistState();
+      return;
+    }
+
+    // Increment global monotonic counter and skip dead teams
+    const maxAttempts = numPlayers + 1; // avoid infinite loop
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      this.gameState.globalTurnNumber = (this.gameState.globalTurnNumber ?? 0) + 1;
+      this.gameState.currentTurnIndex =
+        this.gameState.globalTurnNumber % numPlayers;
+
+      if (this.teamHasAliveBalls(this.gameState.currentTurnIndex)) {
+        break;
+      }
+    }
+
     this.gameState.currentBallIndex = 0; // Will be set by first input of the new turn
     this.gameState.phase = "aiming";
     this.gameState.turnEndTime = Date.now() + TURN_TIME_MS;
     this.phaseStartTime = Date.now();
+    this.lastActivePlayerActivity = Date.now(); // Reset for terrain fallback (allow non-active after 8s silence)
+
     // Include authoritative ball snapshots, wind, and terrain so all clients hard-sync
     // before starting the new turn, correcting any physics divergence from the previous turn.
+    // Omit balls when previous turn was a bot — no client sent ball_state or pos_update for bot's balls.
+    const prevTurnWasBot = this.gameState.playerOrder[
+      (this.gameState.globalTurnNumber - 1 + numPlayers) % numPlayers
+    ]?.isBot ?? false;
+    const includeBalls = !prevTurnWasBot && this.ballSnapshots.length > 0;
+
     this.broadcast({
       type: "turn_advanced",
       turnIndex: this.gameState.currentTurnIndex,
-      balls: this.ballSnapshots.length > 0 ? this.ballSnapshots : undefined,
+      turnNumber: this.gameState.globalTurnNumber,
+      balls: includeBalls ? this.ballSnapshots : undefined,
       wind: this.lastWindValue,
       terrain: this.terrainDamageLog.length > 0 ? this.terrainDamageLog : undefined,
     });
@@ -248,6 +371,7 @@ export class Game implements DurableObject {
     const now = Date.now();
 
     if (this.gameState.playerOrder.length === 0) return; // Game not started
+    if (this.gameState.phase === "game_over") return; // Game ended, no more advances
 
     if (this.gameState.phase === "projectile") {
       if (now >= this.phaseStartTime + PROJECTILE_TIMEOUT_MS) {
@@ -358,8 +482,10 @@ export class Game implements DurableObject {
     return { angleDeg: bestAngleDeg, power: bestPower };
   }
 
-  /** Work out a complete bot action plan: optional walk steps + a fire input. */
+  /** Work out a complete bot action plan: optional walk steps + a fire input.
+   *  Returns ballIndex (bi) so the server can broadcast it with inputs for client sync. */
   private getBotActions(): {
+    ballIndex: number;
     walkDir: number;
     walkSteps: number;
     fireInput: string;
@@ -379,18 +505,19 @@ export class Game implements DurableObject {
       }
     }
 
-    const fallback = (): { walkDir: number; walkSteps: number; fireInput: string } => {
+    const fallback = (ballIdx: number): { ballIndex: number; walkDir: number; walkSteps: number; fireInput: string } => {
       const r = this.botRand();
       const angle = (r * 120) - 60; // -60..60 deg
       const power = 45 + Math.floor(r * 45);
       return {
+        ballIndex: ballIdx,
         walkDir: 0,
         walkSteps: 0,
         fireInput: JSON.stringify({ Fire: { weapon: "Bazooka", angle_deg: angle, power_percent: power } }),
       };
     };
 
-    if (balls.length === 0) return fallback();
+    if (balls.length === 0) return fallback(0);
 
     // The bot's own ball indices follow the interleaved spawn pattern:
     // team t has balls at [t, t+numPlayers, t+numPlayers*2]
@@ -400,18 +527,29 @@ export class Game implements DurableObject {
       if (i < balls.length) botBallSet.add(i);
     }
 
-    // Pick first alive bot ball as shooter
-    let shooter: (BallData & { index: number }) | null = null;
+    // Collect alive balls for this team (round-robin, same logic as client sync_to_player_turn)
+    const teamBalls: number[] = [];
     for (const i of botBallSet) {
-      if (balls[i].alive) { shooter = { ...balls[i], index: i }; break; }
+      if (balls[i].alive) teamBalls.push(i);
     }
-    if (!shooter) return fallback();
+    if (teamBalls.length === 0) return fallback([...botBallSet][0] ?? 0);
+
+    // Pick next in rotation after last
+    const last = this.lastBallPerTeam[idx];
+    let chosen: number;
+    if (last !== undefined) {
+      const afterPrev = teamBalls.find((bi) => bi > last);
+      chosen = afterPrev ?? teamBalls[0];
+    } else {
+      chosen = teamBalls[0];
+    }
+    const shooter: BallData & { index: number } = { ...balls[chosen], index: chosen };
 
     // Collect alive enemy balls
     const enemies = balls
       .map((b, i) => ({ ...b, index: i }))
       .filter(b => b.alive && !botBallSet.has(b.index));
-    if (enemies.length === 0) return fallback();
+    if (enemies.length === 0) return fallback(chosen);
 
     // Sort enemies: prioritise low-HP ones nearby, otherwise nearest
     const sx = shooter.x, sy = shooter.y;
@@ -452,6 +590,7 @@ export class Game implements DurableObject {
     }
 
     return {
+      ballIndex: chosen,
       walkDir,
       walkSteps,
       fireInput: JSON.stringify({ Fire: { weapon: "Bazooka", angle_deg: angleDeg, power_percent: power } }),
@@ -459,6 +598,11 @@ export class Game implements DurableObject {
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    const size = typeof message === "string" ? message.length : message.byteLength;
+    if (size > MAX_MESSAGE_SIZE) {
+      ws.close(1009, "Message too large");
+      return;
+    }
     const data = typeof message === "string" ? message : new TextDecoder().decode(message);
     let playerId: string | null = null;
     for (const [pid, s] of this.sockets) {
@@ -481,33 +625,43 @@ export class Game implements DurableObject {
       // where DO alarms are unavailable and the normal watchdog never fires).
       if (parsed.type === "ping") {
         const now = Date.now();
+        const lastPing = this.lastPingPerPlayer.get(playerId) ?? 0;
+        const pingRateLimited = now - lastPing < 2000;
         if (this.gameState.playerOrder.length > 0 &&
-            now >= this.gameState.turnEndTime + WATCHDOG_GRACE_MS) {
-          // Turn has genuinely expired — force-advance
+            now >= this.gameState.turnEndTime + WATCHDOG_GRACE_MS &&
+            !pingRateLimited) {
+          this.lastPingPerPlayer.set(playerId, now);
           this.broadcast({ type: "force_advance", reason: "ping_watchdog" });
           this.advanceTurnAndMaybeBot();
         } else {
-          // Turn still live: re-broadcast state and re-arm alarm in case it was dropped
           this.broadcast({ type: "state", state: this.gameState });
           this.scheduleWatchdog();
         }
         return;
       }
 
-      // terrain_damages: accept from ANY player (not just current turn)
-      // so the worker always has the latest cumulative damage log.
-      // Also relay as terrain_sync to all other clients so their terrain stays in
-      // sync with the active player's authoritative state.
+      // terrain_damages: accept from active player during their turn; if active player has been
+      // silent > 8s (e.g. disconnected), allow from any player to prevent permanent desync.
       if (parsed.type === "terrain_damages") {
         const dmgMsg = parsed as { type: string; log?: number[][] };
-        if (Array.isArray(dmgMsg.log) && dmgMsg.log.length >= this.terrainDamageLog.length) {
-          this.terrainDamageLog = dmgMsg.log;
+        const isActivePlayer = this.gameState.currentTurnIndex === idx;
+        const phaseAllowsTerrain = ["aiming", "charging", "projectile", "settling", "retreat"].includes(this.gameState.phase);
+        const activeSilentTooLong = Date.now() - this.lastActivePlayerActivity > 8000;
+        const logValid = Array.isArray(dmgMsg.log) && dmgMsg.log.length >= this.terrainDamageLog.length
+          && dmgMsg.log.every((e: unknown) => Array.isArray(e) && e.length >= 3 && (e as unknown[]).every((n) => typeof n === "number"));
+        const allowTerrain = (isActivePlayer && phaseAllowsTerrain) || (phaseAllowsTerrain && activeSilentTooLong);
+        if (allowTerrain && logValid) {
+          this.terrainDamageLog = dmgMsg.log as number[][];
           this.persistState();
           // Forward to all OTHER clients as terrain_sync so they stay in sync
           const syncMsg = JSON.stringify({ type: "terrain_sync", log: dmgMsg.log });
           for (const [pid, sock] of this.sockets) {
             if (pid !== playerId) {
-              try { sock.send(syncMsg); } catch (_) {}
+              try {
+                sock.send(syncMsg);
+              } catch (e) {
+                console.warn("[Game] terrain_sync send failed for", pid, e);
+              }
             }
           }
         }
@@ -522,15 +676,19 @@ export class Game implements DurableObject {
         const bi = pu.bi;
         if (typeof bi === "number" && bi >= 0 && bi < this.ballSnapshots.length) {
           const snap = this.ballSnapshots[bi];
-          if (typeof pu.x === "number") snap.x = pu.x;
-          if (typeof pu.y === "number") snap.y = pu.y;
-          if (typeof pu.vx === "number") snap.vx = pu.vx;
-          if (typeof pu.vy === "number") snap.vy = pu.vy;
+          // Clamp to world bounds (terrain is 1400x800) to prevent extreme values
+          const WORLD_W = 1400, WORLD_H = 800, VEL_MAX = 800;
+          if (typeof pu.x === "number") snap.x = Math.max(-50, Math.min(WORLD_W + 50, pu.x));
+          if (typeof pu.y === "number") snap.y = Math.max(-100, Math.min(WORLD_H + 100, pu.y));
+          if (typeof pu.vx === "number") snap.vx = Math.max(-VEL_MAX, Math.min(VEL_MAX, pu.vx));
+          if (typeof pu.vy === "number") snap.vy = Math.max(-VEL_MAX, Math.min(VEL_MAX, pu.vy));
         }
         this.broadcast(parsed as { type: string; [k: string]: unknown });
         return;
       }
-    } catch (_) {}
+    } catch (e) {
+      console.warn("[Game] Parse error in message from", playerId, e);
+    }
 
     // All other message types require it to be the current turn player
     if (this.gameState.currentTurnIndex !== idx) return;
@@ -538,20 +696,30 @@ export class Game implements DurableObject {
     const current = this.gameState.playerOrder[this.gameState.currentTurnIndex];
     if (current?.isBot) return;
 
+    const now = Date.now();
+
     try {
       const msg = JSON.parse(data) as { type: string; input?: string; aim?: number };
-        // Allow clients to request a restart which we broadcast to all clients
+        // Allow host to request a restart (broadcast to all clients)
         if (msg.type === "restart" && typeof (msg as any).seed === "number") {
+          if (this.hostId != null && playerId !== this.hostId) return; // Only host can restart
           const seed = (msg as any).seed as number;
+          if (!Number.isInteger(seed) || seed < 0 || seed > 0xFFFFFFFF) return; // Invalid 32-bit seed
           // Reset server-side minimal state for the new game
+          const numPlayers = this.gameState.playerOrder.length;
           this.gameState.rngSeed = seed;
           this.gameState.inputLog = [];
           this.gameState.currentTurnIndex = 0;
+          this.gameState.globalTurnNumber = 0;
           this.gameState.phase = "aiming";
           this.gameState.turnEndTime = Date.now() + TURN_TIME_MS;
           this.phaseStartTime = Date.now();
-          this.ballSnapshots = [];
+          this.ballSnapshots = Array.from({ length: numPlayers * 3 }, () => ({
+            x: 0, y: 0, vx: 0, vy: 0, hp: 100, alive: true,
+          }));
           this.terrainDamageLog = [];
+          this.lastBallPerTeam = Array.from({ length: numPlayers }, () => undefined);
+          this.lastActivePlayerActivity = Date.now();
           this.broadcast({ type: "restart", seed });
           this.broadcast({ type: "state", state: this.gameState });
           this.scheduleWatchdog();
@@ -559,12 +727,25 @@ export class Game implements DurableObject {
           return;
         }
       if (msg.type === "input" && typeof msg.input === "string") {
+        // Validate input: max 2000 chars, must look like JSON (Fire, Walk, Jump, Backflip)
+        if (msg.input.length > 2000 || msg.input.length < 2) return;
+        const trimmed = msg.input.trim();
+        if (trimmed[0] !== "{" && trimmed[0] !== "[") return; // Must be JSON object/array
+        const lastInput = this.lastInputPerPlayer.get(playerId) ?? 0;
+        if (now - lastInput < 40) return; // 25/sec max
+        this.lastInputPerPlayer.set(playerId, now);
+        this.lastActivePlayerActivity = now;
         // Check if this is a firing action (not movement)
         const isFiring = msg.input.includes('"Fire"');
         // Track which ball is active (client sends bi in every input message)
         const incomingBi = typeof (msg as any).bi === "number" ? (msg as any).bi as number : undefined;
-        if (incomingBi !== undefined) {
-          this.gameState.currentBallIndex = incomingBi;
+        const biValid = incomingBi !== undefined && incomingBi >= 0 && incomingBi < this.ballSnapshots.length;
+        if (biValid) {
+          this.gameState.currentBallIndex = incomingBi!;
+          // Update round-robin for human players
+          const ti = this.gameState.currentTurnIndex;
+          while (this.lastBallPerTeam.length <= ti) this.lastBallPerTeam.push(undefined);
+          this.lastBallPerTeam[ti] = incomingBi;
         }
         const incomingBx = typeof (msg as any).bx === "number" ? (msg as any).bx as number : undefined;
         const incomingBy = typeof (msg as any).by === "number" ? (msg as any).by as number : undefined;
@@ -594,20 +775,25 @@ export class Game implements DurableObject {
           this.broadcast({ type: "state", state: this.gameState });
         }
       } else if (msg.type === "aim" && typeof msg.aim === "number") {
-        // Broadcast aim angle updates without changing game state
+        if (!Number.isFinite(msg.aim) || msg.aim < -4 || msg.aim > 7) return; // Valid angle (radians, ~-230° to 400°)
+        const lastAim = this.lastAimPerPlayer.get(playerId) ?? 0;
+        if (now - lastAim < 34) return; // ~30/sec max
+        this.lastAimPerPlayer.set(playerId, now);
         this.broadcast({ type: "aim", aim: msg.aim, turnIndex: this.gameState.currentTurnIndex });
       } else if (msg.type === "ball_state") {
+        this.lastActivePlayerActivity = now;
         // Update per-ball snapshots (health + alive + positions) from active player
         const bs = msg as { balls?: Array<{x?: number; y?: number; vx?: number; vy?: number; hp?: number; alive?: boolean}> };
         if (Array.isArray(bs.balls)) {
+          const WORLD_W = 1400, WORLD_H = 800, VEL_MAX = 800, HP_MAX = 100;
           bs.balls.forEach((b, i) => {
-            if (i < this.ballSnapshots.length) {
+            if (i < this.ballSnapshots.length && b !== null && typeof b === "object") {
               const s = this.ballSnapshots[i];
-              if (typeof b.x === "number") s.x = b.x;
-              if (typeof b.y === "number") s.y = b.y;
-              if (typeof b.vx === "number") s.vx = b.vx;
-              if (typeof b.vy === "number") s.vy = b.vy;
-              if (typeof b.hp === "number") s.hp = b.hp;
+              if (typeof b.x === "number" && !Number.isNaN(b.x)) s.x = Math.max(-50, Math.min(WORLD_W + 50, b.x));
+              if (typeof b.y === "number" && !Number.isNaN(b.y)) s.y = Math.max(-100, Math.min(WORLD_H + 100, b.y));
+              if (typeof b.vx === "number" && !Number.isNaN(b.vx)) s.vx = Math.max(-VEL_MAX, Math.min(VEL_MAX, b.vx));
+              if (typeof b.vy === "number" && !Number.isNaN(b.vy)) s.vy = Math.max(-VEL_MAX, Math.min(VEL_MAX, b.vy));
+              if (typeof b.hp === "number" && !Number.isNaN(b.hp)) s.hp = Math.max(0, Math.min(HP_MAX, Math.round(b.hp)));
               if (typeof b.alive === "boolean") s.alive = b.alive;
             }
           });
@@ -616,19 +802,22 @@ export class Game implements DurableObject {
         this.broadcast(msg as { type: string; [k: string]: unknown });
         this.persistState();
       } else if (msg.type === "end_turn") {
+        this.lastActivePlayerActivity = now;
         // If the active player embedded a ball snapshot in end_turn, store it
         // so we can forward it in turn_advanced for authoritative end-of-turn sync.
         const etMsg = msg as any;
         if (Array.isArray(etMsg.balls)) {
-          etMsg.balls.forEach((b: any, i: number) => {
-            if (i < this.ballSnapshots.length) {
+          const WORLD_W = 1400, WORLD_H = 800, VEL_MAX = 800, HP_MAX = 100;
+          etMsg.balls.forEach((b: unknown, i: number) => {
+            if (i < this.ballSnapshots.length && b !== null && typeof b === "object") {
+              const obj = b as Record<string, unknown>;
               const s = this.ballSnapshots[i];
-              if (typeof b.x === "number") s.x = b.x;
-              if (typeof b.y === "number") s.y = b.y;
-              if (typeof b.vx === "number") s.vx = b.vx;
-              if (typeof b.vy === "number") s.vy = b.vy;
-              if (typeof b.hp === "number") s.hp = b.hp;
-              if (typeof b.alive === "boolean") s.alive = b.alive;
+              const x = obj.x; if (typeof x === "number" && !Number.isNaN(x)) s.x = Math.max(-50, Math.min(WORLD_W + 50, x));
+              const y = obj.y; if (typeof y === "number" && !Number.isNaN(y)) s.y = Math.max(-100, Math.min(WORLD_H + 100, y));
+              const vx = obj.vx; if (typeof vx === "number" && !Number.isNaN(vx)) s.vx = Math.max(-VEL_MAX, Math.min(VEL_MAX, vx));
+              const vy = obj.vy; if (typeof vy === "number" && !Number.isNaN(vy)) s.vy = Math.max(-VEL_MAX, Math.min(VEL_MAX, vy));
+              const hp = obj.hp; if (typeof hp === "number" && !Number.isNaN(hp)) s.hp = Math.max(0, Math.min(HP_MAX, Math.round(hp)));
+              if (typeof obj.alive === "boolean") s.alive = obj.alive;
             }
           });
         }
@@ -637,10 +826,18 @@ export class Game implements DurableObject {
         if (typeof etMsg.wind === "number") {
           this.lastWindValue = etMsg.wind;
         }
+        // Update round-robin from end_turn (human's last ball used this turn)
+        const ti = this.gameState.currentTurnIndex;
+        if (typeof this.gameState.currentBallIndex === "number") {
+          while (this.lastBallPerTeam.length <= ti) this.lastBallPerTeam.push(undefined);
+          this.lastBallPerTeam[ti] = this.gameState.currentBallIndex;
+        }
         this.advanceTurn();
         this.maybeBotTurn();
       }
-    } catch (_) {}
+    } catch (e) {
+      console.warn("[Game] Parse error in turn message from", playerId, e);
+    }
   }
 
   private maybeBotTurn(): void {
@@ -648,7 +845,13 @@ export class Game implements DurableObject {
     if (!current?.isBot) return;
 
     const turnIndex = this.gameState.currentTurnIndex;
-    const { walkDir, walkSteps, fireInput } = this.getBotActions();
+    const { ballIndex, walkDir, walkSteps, fireInput } = this.getBotActions();
+
+    // Set authoritative ball index so clients apply bot inputs to the correct worm
+    this.gameState.currentBallIndex = ballIndex;
+    // Update round-robin so next bot turn picks the next ball
+    while (this.lastBallPerTeam.length <= turnIndex) this.lastBallPerTeam.push(undefined);
+    this.lastBallPerTeam[turnIndex] = ballIndex;
 
     // Send an aim-angle preview so other clients see the bot "aiming"
     // (angle extracted from the fire input so it matches what will be fired)
@@ -656,7 +859,9 @@ export class Game implements DurableObject {
     try {
       const parsed = JSON.parse(fireInput) as { Fire?: { angle_deg?: number } };
       previewAngleRad = ((parsed.Fire?.angle_deg ?? 0) * Math.PI) / 180;
-    } catch (_) {}
+    } catch (e) {
+      console.warn("[Game] Bot fire input parse failed:", e);
+    }
     this.broadcast({ type: "aim", aim: previewAngleRad, turnIndex });
 
     let stepIdx = 0;
@@ -668,13 +873,13 @@ export class Game implements DurableObject {
         const walkInput = walkDir > 0
           ? '{"Walk":{"dir":1.0}}'
           : '{"Walk":{"dir":-1.0}}';
-        this.broadcast({ type: "input", input: walkInput, turnIndex });
+        this.broadcast({ type: "input", input: walkInput, turnIndex, bi: ballIndex });
         stepIdx++;
         setTimeout(doStep, 180);
       } else {
         // Fire
         this.gameState.inputLog.push(fireInput);
-        this.broadcast({ type: "input", input: fireInput, turnIndex });
+        this.broadcast({ type: "input", input: fireInput, turnIndex, bi: ballIndex });
         this.gameState.phase = "projectile";
         this.phaseStartTime = Date.now();
         this.scheduleWatchdog();

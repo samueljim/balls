@@ -2,6 +2,10 @@ name = "balls-worker"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
+# Optional: restrict CORS in production. Uncomment and set to your domains, e.g.:
+# [vars]
+# ALLOWED_ORIGINS = "https://worms.example.com,https://www.worms.example.com"
+
 # API + WebSockets at https://api.balls.bne.sh (requires bne.sh zone in your CF account)
 [[routes]]
 pattern = "api.balls.bne.sh"

@@ -16,12 +16,14 @@ export default function GameView({ overrideId }: { overrideId?: string } = {}) {
   const mounted = useRef(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadStep, setLoadStep] = useState<string>("Loading graphics…");
+  const [canRetry, setCanRetry] = useState(false);
   const { addToast } = useToast();
 
   // Listen for game events emitted by the WASM engine via js_game_event → CustomEvent
   useEffect(() => {
     function handleGameEvent(e: Event) {
-      const ev = (e as CustomEvent<{ type: string; name?: string; damage?: number; hp?: number; winner?: string; ball?: string }>).detail;
+      const ev = (e as CustomEvent<{ type: string; name?: string; damage?: number; hp?: number; winner?: string; ball?: string; message?: string }>).detail;
       switch (ev.type) {
         case "hit":
           if (ev.name && ev.damage != null && ev.hp != null) {
@@ -44,6 +46,15 @@ export default function GameView({ overrideId }: { overrideId?: string } = {}) {
             addToast(`${ev.winner} wins!`, "success");
           }
           break;
+        case "connection_lost":
+          addToast("Connection lost. Reconnecting…", "error");
+          break;
+        case "reconnected":
+          addToast("Reconnected", "success");
+          break;
+        case "connection_error":
+          addToast(ev.message ?? "Failed to connect", "error");
+          break;
       }
     }
     window.addEventListener("game_event", handleGameEvent);
@@ -65,6 +76,8 @@ export default function GameView({ overrideId }: { overrideId?: string } = {}) {
     if (!gameId || mounted.current) return;
     mounted.current = true;
     setLoadError(null);
+    setCanRetry(false);
+    setLoadStep("Loading graphics…");
 
     (window as unknown as { __BALLS_WS_BASE?: string }).__BALLS_WS_BASE = API_BASE;
 
@@ -96,7 +109,7 @@ export default function GameView({ overrideId }: { overrideId?: string } = {}) {
       new Promise<void>((resolve, reject) => {
         const tried: string[] = [];
         const tryNext = (i: number) => {
-          if (i >= urls.length) return reject(new Error("All script load attempts failed: " + tried.join(", ")));
+          if (i >= urls.length) return reject(new Error("Could not load graphics library. Check your connection."));
           const src = urls[i];
           if (!src) return tryNext(i + 1);
           tried.push(src);
@@ -114,21 +127,33 @@ export default function GameView({ overrideId }: { overrideId?: string } = {}) {
 
     // Try origin static file first, then fall back to API host if needed.
     loadScriptWithFallback([originGlJs, apiGlJs])
-      .then(() => loadScript(base + "/js/ws_plugin.js"))
+      .then(() => {
+        setLoadStep("Loading game engine…");
+        return loadScript(base + "/js/ws_plugin.js");
+      })
       .then(() => loadScript(base + "/js/mobile_controls.js"))
       .then(() => {
+        setLoadStep("Connecting…");
         const load = (window as unknown as { load?: (url: string) => void }).load;
         if (typeof load === "function") {
           load(wasmUrl);
           // Focus canvas so keyboard input works (macroquad/miniquad expects focused canvas)
           setTimeout(() => canvasRef.current?.focus(), 500);
+          // Hide loading overlay once game has had time to initialize
+          setTimeout(() => setLoadStep(""), 2500);
         } else {
-          setLoadError("Game loader not found.");
+          setLoadError("Game engine failed to initialize. Please refresh the page.");
+          setCanRetry(true);
         }
       })
       .catch((e) => {
         const msg = e instanceof Error ? e.message : String(e);
-        setLoadError(msg);
+        const friendly =
+          msg.includes("Failed to load") ? "Could not load game files. Check your internet connection."
+          : msg.includes("graphics") ? "Graphics library unavailable. Try again later."
+          : msg;
+        setLoadError(friendly);
+        setCanRetry(true);
         console.error("[game] Load error:", e);
       });
   }, [gameId]);
@@ -146,15 +171,35 @@ export default function GameView({ overrideId }: { overrideId?: string } = {}) {
 
   if (loadError) {
     return (
-      <main className="min-h-screen flex flex-col items-center justify-center bg-[#0d1f0d] gap-4">
-        <p className="text-amber-400">Failed to load game</p>
+      <main className="min-h-screen flex flex-col items-center justify-center bg-[#0d1f0d] gap-4 px-4">
+        <p className="text-amber-400 font-medium">Failed to load game</p>
         <p className="text-stone-500 text-sm max-w-md text-center">{loadError}</p>
+        {canRetry && (
+          <button
+            onClick={() => window.location.reload()}
+            className="mt-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg transition-colors"
+          >
+            Retry
+          </button>
+        )}
+        <Link href="/" className="text-emerald-500 underline text-sm mt-2">
+          Back to home
+        </Link>
       </main>
     );
   }
 
   return (
     <>
+      {/* Loading overlay: shown until WASM game starts (canvas covers it; overlay fades when ready) */}
+      <div
+        className="fixed inset-0 flex flex-col items-center justify-center bg-[#0d1f0d] z-20 pointer-events-none transition-opacity duration-500"
+        style={{ opacity: loadStep ? 1 : 0 }}
+        aria-live="polite"
+        aria-busy={!!loadStep}
+      >
+        <div className="animate-pulse text-emerald-400/80 text-sm">{loadStep}</div>
+      </div>
       <canvas
         ref={canvasRef}
         id="glcanvas"

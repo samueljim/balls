@@ -39,13 +39,23 @@ export interface GameState {
   phase: string;
   rngSeed: number;
   terrainId: number;
+  /** Monotonically increasing global turn counter. Drives deterministic worm selection:
+   *  currentTurnIndex = globalTurnNumber % numPlayers
+   *  worm_slot = floor(globalTurnNumber / numPlayers) % aliveBallsForTeam.length */
+  globalTurnNumber: number;
 }
 
 export type GameMessage =
   | { type: "state"; state: Partial<GameState> }
   | { type: "input"; input: string; turnIndex: number; bi: number; bx?: number; by?: number }
   | { type: "aim"; aim: number; turnIndex: number }
-  | { type: "turn_advanced"; turnIndex: number; balls?: Array<{ x: number; y: number; vx: number; vy: number; hp: number; alive: boolean }>; wind?: number; terrain?: number[][] }
+  | { type: "turn_advanced"; turnIndex: number; turnNumber?: number; balls?: Array<{ x: number; y: number; vx: number; vy: number; hp: number; alive: boolean }>; wind?: number; terrain?: number[][] }
+  | { type: "force_advance"; reason?: string }
+  | { type: "game_over"; winner: string }
+  | { type: "restart"; seed: number }
+  | { type: "terrain_sync"; log: number[][] }
+  | { type: "identity"; myPlayerIndex: number; playerId: string; rngSeed: number }
+  | { type: "game_resync"; phase: string; currentTurnIndex: number; currentBallIndex: number; turnTimeRemainingMs: number; globalTurnNumber: number; balls?: Array<{ x: number; y: number; vx: number; vy: number; hp: number; alive: boolean }> }
   | { type: "error"; message: string };
 
 export type GameClientMessage =

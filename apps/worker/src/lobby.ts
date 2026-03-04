@@ -127,6 +127,7 @@ export class Lobby implements DurableObject {
         gameId: this.gameId,
         playerOrder: this.gamePlayerOrder,
         rngSeed: this.rngSeed,
+        hostId: this.hostId,
       });
     }
     return Response.json({
@@ -155,6 +156,7 @@ export class Lobby implements DurableObject {
         gameId: this.gameId,
         playerOrder: this.gamePlayerOrder,
         rngSeed: this.rngSeed,
+        hostId: this.hostId,
       });
     }
     return Response.json({ playerId, playerName });
@@ -204,10 +206,12 @@ export class Lobby implements DurableObject {
   /** Send to all connected clients. Used for real-time lobby state (player_list on join/leave/rename/bots). */
   private broadcast(msg: { type: string; [k: string]: unknown }): void {
     const data = JSON.stringify(msg);
-    for (const ws of this.sockets.values()) {
+    for (const [pid, ws] of this.sockets) {
       try {
         ws.send(data);
-      } catch (_) {}
+      } catch (e) {
+        console.warn("[Lobby] Broadcast failed for", pid, e);
+      }
     }
   }
 
@@ -268,7 +272,7 @@ export class Lobby implements DurableObject {
         // Generate random seed for consistent terrain/randomness across all players
         this.rngSeed = Math.floor(Math.random() * 0xFFFFFFFF);
         await this.persist();
-        this.broadcast({ type: "game_started", gameId, playerOrder: this.gamePlayerOrder, rngSeed: this.rngSeed });
+        this.broadcast({ type: "game_started", gameId, playerOrder: this.gamePlayerOrder, rngSeed: this.rngSeed, hostId: this.hostId });
       } else if (msg.type === "add_bot") {
         if (this.hostId !== playerId) {
           this.sendTo(playerId, { type: "error", message: "Only host can add bots" });
@@ -290,7 +294,9 @@ export class Lobby implements DurableObject {
         this.broadcast({ type: "remove_bot", playerId: msg.playerId });
         this.broadcast({ type: "player_list", players: [...this.players] });
       }
-    } catch (_) {}
+    } catch (e) {
+      console.warn("[Lobby] Parse error in message from", playerId, e);
+    }
   }
 
   async webSocketClose(ws: WebSocket): Promise<void> {

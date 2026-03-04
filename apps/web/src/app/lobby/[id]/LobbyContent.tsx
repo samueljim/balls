@@ -116,7 +116,7 @@ export default function LobbyContent({
     messageQueueRef.current = [];
 
     let latestPlayerList: Player[] | null = null;
-    let gameStarted: { gameId: string; playerOrder?: unknown; rngSeed?: number } | null = null;
+    let gameStarted: { gameId: string; playerOrder?: unknown; rngSeed?: number; hostId?: string } | null = null;
 
     for (const msg of queue) {
       if (!msg || typeof msg !== "object") continue;
@@ -134,7 +134,7 @@ export default function LobbyContent({
       } else if (m.type === "player_list" && m.players) {
         latestPlayerList = m.players;
       } else if (m.type === "game_started" && m.gameId) {
-        gameStarted = { gameId: m.gameId, playerOrder: m.playerOrder, rngSeed: m.rngSeed };
+        gameStarted = { gameId: m.gameId, playerOrder: m.playerOrder, rngSeed: m.rngSeed, hostId: (m as { hostId?: string }).hostId };
       }
     }
 
@@ -149,7 +149,7 @@ export default function LobbyContent({
         rngSeed?: number;
       };
       if (m.type === "player_list" && Array.isArray(m.players)) latestPlayerList = m.players;
-      else if (m.type === "game_started" && m.gameId) gameStarted = { gameId: m.gameId, playerOrder: m.playerOrder, rngSeed: m.rngSeed };
+      else if (m.type === "game_started" && m.gameId) gameStarted = { gameId: m.gameId, playerOrder: m.playerOrder, rngSeed: m.rngSeed, hostId: (m as { hostId?: string }).hostId };
       else if (m.type === "error" && m.message) {
         setIsStarting(false);
         addToast(m.message, "error");
@@ -192,6 +192,7 @@ export default function LobbyContent({
         sessionStorage.setItem(`balls:${gameStarted.gameId}`, JSON.stringify({ 
           playerOrder: gameStarted.playerOrder ?? [],
           rngSeed: gameStarted.rngSeed,
+          hostId: gameStarted.hostId,
         }));
       } catch (_) {}
       window.location.href = `/game/${gameStarted.gameId}?playerId=${encodeURIComponent(playerId)}`;

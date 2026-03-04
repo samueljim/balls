@@ -12,6 +12,7 @@
   var playerId = "";
   var playerOrder = [];
   var lobbyRngSeed = null; // Seed from lobby (set at game start by host)
+  var hostId = null; // Host player id (only host can restart)
 
   function getApiBase() {
     if (typeof window !== "undefined" && window.__BALLS_WS_BASE) return window.__BALLS_WS_BASE;
@@ -44,9 +45,8 @@
           playerOrder = parsed;
         } else if (parsed && Array.isArray(parsed.playerOrder)) {
           playerOrder = parsed.playerOrder;
-          if (typeof parsed.rngSeed === "number") {
-            lobbyRngSeed = parsed.rngSeed;
-          }
+          if (typeof parsed.rngSeed === "number") lobbyRngSeed = parsed.rngSeed;
+          if (typeof parsed.hostId === "string") hostId = parsed.hostId;
         }
       }
     } catch (e) {
@@ -83,7 +83,6 @@
       try {
         var heap = new Uint8Array(wasm_memory.buffer, ptr, len);
         var str = UTF8ToString(heap, 0, len);
-        console.log("[ws_plugin] Sending:", str.substring(0, 100)); // Log first 100 chars
         ws.send(str);
       } catch (e) {
         console.warn("[ws_plugin] send failed", e);
@@ -169,17 +168,18 @@
       }
     }
 
-    var reconnectDelay = 1000;
+    var reconnectAttempt = 0;
     var reconnectTimer = null;
 
     function scheduleReconnect() {
       if (reconnectTimer) return; // already scheduled
-      console.log("[ws_plugin] Reconnecting in " + reconnectDelay + "ms");
+      var delay = Math.min(1000 * Math.pow(2, Math.min(reconnectAttempt, 4)), 16000);
+      reconnectAttempt++;
+      console.log("[ws_plugin] Reconnecting in " + delay + "ms (attempt " + reconnectAttempt + ")");
       reconnectTimer = setTimeout(function () {
         reconnectTimer = null;
         connect();
-      }, reconnectDelay);
-      reconnectDelay = Math.min(reconnectDelay * 2, 16000); // cap at 16 s
+      }, delay);
     }
 
     function connect() {
@@ -189,24 +189,44 @@
 
       ws.onopen = function () {
         console.log("[ws_plugin] WebSocket OPENED");
-        reconnectDelay = 1000; // reset backoff on successful connect
+        reconnectAttempt = 0; // reset backoff on successful connect
         var seedToSend = lobbyRngSeed !== null ? lobbyRngSeed : (serverRngSeed !== null ? serverRngSeed : fallbackSeed);
-        console.log("[ws_plugin] POST /init with rngSeed=" + seedToSend);
-        fetch(getHttpBase() + "/game/" + gameId + "/init", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ playerOrder: playerOrder, rngSeed: seedToSend, terrainId: 0 }),
-        }).then(function(r) {
-          console.log("[ws_plugin] /init response:", r.status);
-        }).catch(function (e) {
-          console.warn("[ws_plugin] init POST failed", e);
-        });
+        var initPayload = { playerOrder: playerOrder, rngSeed: seedToSend, terrainId: 0 };
+        if (hostId) initPayload.hostId = hostId;
+        var initBody = JSON.stringify(initPayload);
+        var delays = [0, 500, 1000, 2000]; // 4 attempts: immediate, +500ms, +1s, +2s
+        function doInitPost(attempt) {
+          if (attempt >= 4) {
+            console.error("[ws_plugin] init POST failed after 3 retries");
+            window.dispatchEvent(new CustomEvent("game_event", { detail: { type: "connection_error", message: "Failed to initialize game" } }));
+            return;
+          }
+          var delay = delays[attempt] || 0;
+          var run = function () {
+            fetch(getHttpBase() + "/game/" + gameId + "/init", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: initBody,
+            }).then(function (r) {
+              console.log("[ws_plugin] /init response:", r.status);
+            }).catch(function (e) {
+              console.warn("[ws_plugin] init POST failed (attempt " + (attempt + 1) + "):", e);
+              doInitPost(attempt + 1);
+            });
+          };
+          if (delay > 0) setTimeout(run, delay);
+          else run();
+        }
+        doInitPost(0);
       };
 
       ws.onmessage = evtHandler;
 
       ws.onclose = function (event) {
         console.warn("[ws_plugin] WebSocket CLOSED: code=" + event.code + ", reason=" + event.reason);
+        if (typeof wasm_exports !== "undefined" && wasm_exports.on_ws_close) {
+          wasm_exports.on_ws_close();
+        }
         scheduleReconnect();
       };
       ws.onerror = function (err) {

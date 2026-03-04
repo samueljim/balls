@@ -121,3 +121,11 @@ pub extern "C" fn on_game_init(ptr: *const u8, len: u32) {
         });
     }
 }
+
+/// Called by JS when WebSocket closes. Pushes ws_close into message queue so WASM can set connected=false.
+#[no_mangle]
+pub extern "C" fn on_ws_close() {
+    INCOMING.with(|q| {
+        q.borrow_mut().push(r#"{"type":"ws_close"}"#.to_string());
+    });
+}

@@ -125,6 +125,7 @@ pub fn draw_hud(
     weapon_menu_open: bool,
     weapon_menu_scroll: f32,
     weapon_search: &str,
+    connected: bool,
 ) {
     let sw = screen_width();
     let sh = screen_height();
@@ -185,7 +186,12 @@ pub fn draw_hud(
             } else {
                 "Opponent".to_string()
             };
-            (format!("{}'s Turn", name), Color::new(1.0, 0.85, 0.35, 1.0))
+            let label = if connected && !phase.allows_input() {
+                format!("Waiting for {}…", name)
+            } else {
+                format!("{}'s Turn", name)
+            };
+            (label, Color::new(1.0, 0.85, 0.35, 1.0))
         };
         // Clamp label so it never overlaps the timer
         let max_label_w = (sw - tw - 24.0).max(0.0);
@@ -296,7 +302,11 @@ pub fn draw_hud(
             } else {
                 turn_owner_name.to_string()
             };
-            let label = format!("{} — {}", owner, phase.label());
+            let label = if connected && !phase.allows_input() {
+                format!("Waiting for {}…", owner)
+            } else {
+                format!("{} — {}", owner, phase.label())
+            };
             (label, Color::new(0.85, 0.75, 0.4, 1.0))
         };
         let pw = measure_text(&phase_label, None, 20, 1.0).width;

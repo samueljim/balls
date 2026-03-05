@@ -56,6 +56,7 @@ export type GameMessage =
   | { type: "terrain_sync"; log: number[][] }
   | { type: "identity"; myPlayerIndex: number; playerId: string; rngSeed: number }
   | { type: "game_resync"; phase: string; currentTurnIndex: number; currentBallIndex: number; turnTimeRemainingMs: number; globalTurnNumber: number; balls?: Array<{ x: number; y: number; vx: number; vy: number; hp: number; alive: boolean }> }
+  | { type: "current_turn"; currentTurnIndex: number; turnNumber: number; turnTimeRemainingMs: number; phase: string }
   | { type: "error"; message: string };
 
 export type GameClientMessage =

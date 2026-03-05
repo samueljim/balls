@@ -23,6 +23,13 @@ const SETTLE_TIMEOUT: f32 = 3.0;
 const CHARGE_SPEED: f32 = 55.0;
 /// Default camera zoom level. Values > 1 mean “more zoomed in” relative to BASE_SHORT_AXIS.
 const DEFAULT_ZOOM: f32 = 2.0;
+/// Seconds past zero before the TurnEnd watchdog sends pings to the server.
+const TURN_END_PING_START: f32 = -1.0;
+/// Seconds past zero before the TurnEnd watchdog force-advances locally (server silent).
+const TURN_END_FORCE_ADVANCE: f32 = -4.0;
+/// Maximum timer drift (s) tolerated before the heartbeat correction is applied.
+/// Kept large to avoid jittering the visual countdown display.
+const TURN_TIMER_RESYNC_THRESHOLD: f32 = 3.0;
 
 #[cfg(target_arch = "wasm32")]
 extern "C" {
@@ -2185,6 +2192,41 @@ impl Game {
                 }
                 continue;
             }
+            if msg.contains("\"type\":\"current_turn\"") || msg.contains("\"type\": \"current_turn\"") {
+                // 1-second heartbeat from the server confirming the authoritative turn state.
+                // Use it to reconcile local confusion about whose turn it is (e.g. if a
+                // turn_advanced message was dropped or the client got stuck in TurnEnd).
+                if let Some(server_turn_index) = parse_json_number(&msg, "currentTurnIndex").map(|v| v as usize) {
+                    let should_sync = server_turn_index != self.current_turn_index;
+                    if should_sync {
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            let debug_msg = format!("[NET] current_turn heartbeat: server={}, local={} – syncing\0",
+                                server_turn_index, self.current_turn_index);
+                            unsafe { console_log(debug_msg.as_ptr()); }
+                        }
+                        self.current_turn_index = server_turn_index;
+                        match self.phase {
+                            Phase::Aiming | Phase::Charging | Phase::TurnEnd => {
+                                self.sync_to_player_turn(server_turn_index);
+                            }
+                            _ => {
+                                self.pending_turn_sync = Some(server_turn_index);
+                            }
+                        }
+                    }
+                    // Also sync the turn timer so clients don't drift
+                    if let Some(remaining_ms) = parse_json_number(&msg, "turnTimeRemainingMs") {
+                        let remaining_s = (remaining_ms / 1000.0) as f32;
+                        // Only update timer from heartbeat when our local timer is noticeably
+                        // out of sync (> 3 s difference) to avoid jittering the countdown.
+                        if (self.turn_timer - remaining_s).abs() > TURN_TIMER_RESYNC_THRESHOLD {
+                            self.turn_timer = remaining_s.min(TURN_TIME).max(0.0);
+                        }
+                    }
+                }
+                continue;
+            }
             if msg.contains("\"type\":\"state\"") || msg.contains("\"type\": \"state\"") {
                 // Handle state message to sync with server's current turn
                 if let Some(current_turn_index) = parse_state_turn_index(&msg) {
@@ -3004,7 +3046,13 @@ impl Game {
                     } else if self.is_my_turn() {
                         self.end_turn();
                     } else {
-                        // Not our turn in multiplayer: enter TurnEnd and wait for worker
+                        // Not our turn in multiplayer: report our own ball positions/health
+                        // so the server has up-to-date alive status for win detection
+                        // (important during bot turns when no active player sends ball_state).
+                        if self.net.connected {
+                            self.send_ball_state();
+                        }
+                        // Enter TurnEnd and wait for worker to advance the turn
                         self.phase = Phase::TurnEnd;
                         self.turn_end_timer = TURN_END_DELAY;
                     }
@@ -3146,8 +3194,21 @@ impl Game {
                     } else {
                         // Still waiting for turn_advanced from server. Count down an extra
                         // safety window (turn_end_timer is already ≤0 and going further
-                        // negative — we treat -8.0 as "server is silent, force locally").
-                        if self.turn_end_timer < -4.0 {
+                        // negative — we treat -4.0 as "server is silent, force locally").
+                        //
+                        // Send a ping once per second (at -1.0, -2.0, -3.0) so the server
+                        // knows we are waiting. The server will either force-advance (if the
+                        // turn expired) or re-broadcast state so we can reconcile whose turn it is.
+                        if self.turn_end_timer <= TURN_END_PING_START {
+                            // Fire a ping each time the timer crosses an integer second mark
+                            // going negative (i.e., floor transitions from n to n-1).
+                            let prev = self.turn_end_timer + dt;
+                            let crossed_second = prev.floor() > self.turn_end_timer.floor();
+                            if crossed_second && self.turn_end_timer > TURN_END_FORCE_ADVANCE {
+                                self.net.send_message(r#"{"type":"ping"}"#);
+                            }
+                        }
+                        if self.turn_end_timer < TURN_END_FORCE_ADVANCE {
                             #[cfg(target_arch = "wasm32")]
                             {
                                 let s = "[TURN] Safety timeout: force-advancing because server never sent turn_advanced\0";

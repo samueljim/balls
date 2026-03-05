@@ -58,6 +58,8 @@ export class Game implements DurableObject {
   private lastAimPerPlayer: Map<string, number> = new Map();
   /** When we last received input/ball_state/end_turn from the active player (for terrain fallback) */
   private lastActivePlayerActivity: number = 0;
+  /** Timer handle for the 1-second turn-authority heartbeat */
+  private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(state: DurableObjectState, _env: unknown) {
     this.state = state;
@@ -162,6 +164,7 @@ export class Game implements DurableObject {
     }
     this.phaseStartTime = Date.now();
     this.scheduleWatchdog();
+    this.scheduleHeartbeat();
     this.persistState();
     return Response.json({ ok: true });
   }
@@ -282,6 +285,13 @@ export class Game implements DurableObject {
     return false;
   }
 
+  /** Return the team (player) index that owns the given flat ball index.
+   *  Ball layout: bi = teamIndex + wormSlot * numPlayers, so teamIndex = bi % numPlayers. */
+  private ballTeamIndex(bi: number): number {
+    const numPlayers = this.gameState.playerOrder.length;
+    return numPlayers > 0 ? bi % numPlayers : 0;
+  }
+
   /** Count teams with at least one alive ball. Returns winner team index (0-based) or -1 if draw/none. */
   private getAliveTeams(): { count: number; winner: number } {
     const numPlayers = this.gameState.playerOrder.length;
@@ -324,6 +334,20 @@ export class Game implements DurableObject {
       }
     }
 
+    // Safety: after skipping dead teams, re-check if the chosen team is actually alive.
+    // This handles the case where ball-state updates caused more teams to die between
+    // the pre-loop check and now (e.g. simultaneous kills in the same explosion).
+    if (!this.teamHasAliveBalls(this.gameState.currentTurnIndex)) {
+      const { winner: recheckWinner } = this.getAliveTeams();
+      const winnerName = recheckWinner >= 0
+        ? this.gameState.playerOrder[recheckWinner]?.name ?? `Team ${recheckWinner + 1}`
+        : "Nobody";
+      this.broadcast({ type: "game_over", winner: winnerName });
+      this.gameState.phase = "game_over";
+      this.persistState();
+      return;
+    }
+
     this.gameState.currentBallIndex = 0; // Will be set by first input of the new turn
     this.gameState.phase = "aiming";
     this.gameState.turnEndTime = Date.now() + TURN_TIME_MS;
@@ -332,11 +356,9 @@ export class Game implements DurableObject {
 
     // Include authoritative ball snapshots, wind, and terrain so all clients hard-sync
     // before starting the new turn, correcting any physics divergence from the previous turn.
-    // Omit balls when previous turn was a bot — no client sent ball_state or pos_update for bot's balls.
-    const prevTurnWasBot = this.gameState.playerOrder[
-      (this.gameState.globalTurnNumber - 1 + numPlayers) % numPlayers
-    ]?.isBot ?? false;
-    const includeBalls = !prevTurnWasBot && this.ballSnapshots.length > 0;
+    // Always include balls so all clients — including those whose turn was skipped — get the
+    // latest alive/health state and can correctly detect end-of-game conditions.
+    const includeBalls = this.ballSnapshots.length > 0;
 
     this.broadcast({
       type: "turn_advanced",
@@ -348,6 +370,7 @@ export class Game implements DurableObject {
     });
     this.broadcast({ type: "state", state: this.gameState });
     this.scheduleWatchdog();
+    this.scheduleHeartbeat();
     this.persistState();
   }
 
@@ -363,6 +386,33 @@ export class Game implements DurableObject {
     } catch (_) {
       // setAlarm may not be available in all environments — fail silently
     }
+  }
+
+  /** Schedule the 1-second turn-authority heartbeat.
+   *  Safe to call multiple times — re-entrant calls are ignored. */
+  private scheduleHeartbeat(): void {
+    if (this.heartbeatTimer !== null) return;
+    this.heartbeatTimer = setTimeout(() => {
+      this.heartbeatTimer = null;
+      this.sendHeartbeat();
+    }, 1000);
+  }
+
+  /** Broadcast the server's authoritative turn state to all clients so they can
+   *  reconcile any local confusion about whose turn it is. */
+  private sendHeartbeat(): void {
+    if (this.gameState.phase === "game_over" || this.gameState.playerOrder.length === 0) {
+      return; // Nothing to broadcast after game ends or before init
+    }
+    const turnTimeRemainingMs = Math.max(0, this.gameState.turnEndTime - Date.now());
+    this.broadcast({
+      type: "current_turn",
+      currentTurnIndex: this.gameState.currentTurnIndex,
+      turnNumber: this.gameState.globalTurnNumber ?? 0,
+      turnTimeRemainingMs,
+      phase: this.gameState.phase,
+    });
+    this.scheduleHeartbeat(); // Keep it running
   }
 
   /** Cloudflare DO alarm handler — fires when a scheduled watchdog deadline hits.
@@ -686,6 +736,38 @@ export class Game implements DurableObject {
         this.broadcast(parsed as { type: string; [k: string]: unknown });
         return;
       }
+
+      // ball_state: accept from ANY player but limit non-active players to updating
+      // only their own team's balls.  This lets non-active clients (including observers
+      // during a bot turn) report deaths so the server can correctly detect game-over.
+      if (parsed.type === "ball_state") {
+        const bs = parsed as { balls?: Array<{ x?: number; y?: number; vx?: number; vy?: number; hp?: number; alive?: boolean }> };
+        if (Array.isArray(bs.balls)) {
+          const isActivePlayer = this.gameState.currentTurnIndex === idx;
+          const WORLD_W = 1400, WORLD_H = 800, VEL_MAX = 800, HP_MAX = 100;
+          bs.balls.forEach((b, i) => {
+            if (i < this.ballSnapshots.length && b !== null && typeof b === "object") {
+              // Non-active players may only update their own team's ball indices to prevent
+              // them from tampering with other teams' health/alive status.
+              if (!isActivePlayer && this.ballTeamIndex(i) !== idx) return;
+              const s = this.ballSnapshots[i];
+              if (typeof b.x === "number" && !Number.isNaN(b.x)) s.x = Math.max(-50, Math.min(WORLD_W + 50, b.x));
+              if (typeof b.y === "number" && !Number.isNaN(b.y)) s.y = Math.max(-100, Math.min(WORLD_H + 100, b.y));
+              if (typeof b.vx === "number" && !Number.isNaN(b.vx)) s.vx = Math.max(-VEL_MAX, Math.min(VEL_MAX, b.vx));
+              if (typeof b.vy === "number" && !Number.isNaN(b.vy)) s.vy = Math.max(-VEL_MAX, Math.min(VEL_MAX, b.vy));
+              if (typeof b.hp === "number" && !Number.isNaN(b.hp)) s.hp = Math.max(0, Math.min(HP_MAX, Math.round(b.hp)));
+              if (typeof b.alive === "boolean") s.alive = b.alive;
+            }
+          });
+          if (isActivePlayer) {
+            this.lastActivePlayerActivity = Date.now();
+          }
+          // Relay to other clients for position/health sync
+          this.broadcast(parsed as { type: string; [k: string]: unknown });
+          this.persistState();
+        }
+        return;
+      }
     } catch (e) {
       console.warn("[Game] Parse error in message from", playerId, e);
     }
@@ -723,6 +805,7 @@ export class Game implements DurableObject {
           this.broadcast({ type: "restart", seed });
           this.broadcast({ type: "state", state: this.gameState });
           this.scheduleWatchdog();
+          this.scheduleHeartbeat();
           this.persistState();
           return;
         }
@@ -780,27 +863,6 @@ export class Game implements DurableObject {
         if (now - lastAim < 34) return; // ~30/sec max
         this.lastAimPerPlayer.set(playerId, now);
         this.broadcast({ type: "aim", aim: msg.aim, turnIndex: this.gameState.currentTurnIndex });
-      } else if (msg.type === "ball_state") {
-        this.lastActivePlayerActivity = now;
-        // Update per-ball snapshots (health + alive + positions) from active player
-        const bs = msg as { balls?: Array<{x?: number; y?: number; vx?: number; vy?: number; hp?: number; alive?: boolean}> };
-        if (Array.isArray(bs.balls)) {
-          const WORLD_W = 1400, WORLD_H = 800, VEL_MAX = 800, HP_MAX = 100;
-          bs.balls.forEach((b, i) => {
-            if (i < this.ballSnapshots.length && b !== null && typeof b === "object") {
-              const s = this.ballSnapshots[i];
-              if (typeof b.x === "number" && !Number.isNaN(b.x)) s.x = Math.max(-50, Math.min(WORLD_W + 50, b.x));
-              if (typeof b.y === "number" && !Number.isNaN(b.y)) s.y = Math.max(-100, Math.min(WORLD_H + 100, b.y));
-              if (typeof b.vx === "number" && !Number.isNaN(b.vx)) s.vx = Math.max(-VEL_MAX, Math.min(VEL_MAX, b.vx));
-              if (typeof b.vy === "number" && !Number.isNaN(b.vy)) s.vy = Math.max(-VEL_MAX, Math.min(VEL_MAX, b.vy));
-              if (typeof b.hp === "number" && !Number.isNaN(b.hp)) s.hp = Math.max(0, Math.min(HP_MAX, Math.round(b.hp)));
-              if (typeof b.alive === "boolean") s.alive = b.alive;
-            }
-          });
-        }
-        // Relay to other clients for position/health sync
-        this.broadcast(msg as { type: string; [k: string]: unknown });
-        this.persistState();
       } else if (msg.type === "end_turn") {
         this.lastActivePlayerActivity = now;
         // If the active player embedded a ball snapshot in end_turn, store it

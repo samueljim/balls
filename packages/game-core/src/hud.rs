@@ -137,26 +137,96 @@ pub fn draw_hud(
     draw_rectangle(0.0, 0.0, sw, bar_h, Color::new(0.0, 0.0, 0.0, 0.80));
 
     if phase == Phase::GameOver {
-        if let Some(team) = winning_team {
+        // ── GAME OVER overlay ────────────────────────────────────────────────
+        // Dark semi-transparent backdrop over the full screen.
+        draw_rectangle(0.0, 0.0, sw, sh, Color::new(0.0, 0.0, 0.0, 0.65));
+
+        // ── Winner banner ────────────────────────────────────────────────────
+        let (winner_text, banner_col) = if let Some(team) = winning_team {
             let (r, g, b) = TEAM_COLORS[team as usize % TEAM_COLORS.len()];
-            let text = format!("Team {} Wins!", team + 1);
-            let tw = measure_text(&text, None, 36, 1.0).width;
-            draw_text(&text, sw / 2.0 - tw / 2.0, 32.0, 36.0, Color::new(r, g, b, 1.0));
+            // Try to find a name for the winning team.
+            let name = balls
+                .iter()
+                .find(|b| b.team == team)
+                .map(|b| b.name.as_str())
+                .unwrap_or("Unknown");
+            (format!("{} Wins!", name), Color::new(r, g, b, 1.0))
         } else {
-            let text = "Draw!";
-            let tw = measure_text(text, None, 36, 1.0).width;
-            draw_text(text, sw / 2.0 - tw / 2.0, 32.0, 36.0, WHITE);
+            ("Draw!".to_string(), WHITE)
+        };
+        let banner_font = if sw < 500.0 { 30u16 } else { 42u16 };
+        let tw = measure_text(&winner_text, None, banner_font, 1.0).width;
+        let banner_y = sh * 0.22;
+        // Shadow
+        draw_text(&winner_text, sw / 2.0 - tw / 2.0 + 2.0, banner_y + 2.0, banner_font as f32, Color::new(0.0, 0.0, 0.0, 0.7));
+        draw_text(&winner_text, sw / 2.0 - tw / 2.0, banner_y, banner_font as f32, banner_col);
+
+        // ── Score table ──────────────────────────────────────────────────────
+        // Show each ball sorted by team, with HP bars and status.
+        let table_y_start = sh * 0.32;
+        let row_h = if sw < 500.0 { 28.0_f32 } else { 34.0_f32 };
+        let name_font = if sw < 500.0 { 16u16 } else { 20u16 };
+        let bar_w = sw * 0.30;
+        let bar_h_px = if sw < 500.0 { 12.0_f32 } else { 16.0_f32 };
+        let col_name_x = sw * 0.12;
+        let col_bar_x  = sw * 0.50;
+
+        // Sort balls by team for a consistent ordering.
+        let mut sorted: Vec<&Ball> = balls.iter().collect();
+        sorted.sort_by_key(|b| b.team);
+
+        for (i, ball) in sorted.iter().enumerate() {
+            let row_y = table_y_start + i as f32 * row_h;
+            if row_y + row_h > sh * 0.78 { break; } // don't overflow into button
+
+            let (tr, tg, tb) = TEAM_COLORS[ball.team as usize % TEAM_COLORS.len()];
+            let team_col = Color::new(tr, tg, tb, 1.0);
+
+            // Team colour dot
+            draw_circle(col_name_x - 14.0, row_y + row_h * 0.45, 6.0, team_col);
+
+            // Ball name
+            let name_col = if ball.alive { WHITE } else { Color::new(0.55, 0.55, 0.55, 1.0) };
+            draw_text(&ball.name, col_name_x, row_y + name_font as f32, name_font as f32, name_col);
+
+            // HP bar (greyed out when eliminated)
+            let hp_frac = (ball.health as f32 / ball.max_health as f32).clamp(0.0, 1.0);
+            let bar_filled_w = bar_w * hp_frac;
+            draw_rectangle(col_bar_x, row_y + (row_h - bar_h_px) / 2.0, bar_w, bar_h_px,
+                Color::new(0.25, 0.25, 0.25, 0.9));
+            if bar_filled_w > 0.0 {
+                let bar_col = if ball.alive { Color::new(tr * 0.9, tg * 0.9, tb * 0.9, 1.0) }
+                              else { Color::new(0.4, 0.4, 0.4, 0.8) };
+                draw_rectangle(col_bar_x, row_y + (row_h - bar_h_px) / 2.0, bar_filled_w, bar_h_px, bar_col);
+            }
+            // HP text
+            let hp_label = if ball.alive {
+                format!("{} HP", ball.health)
+            } else {
+                "Eliminated".to_string()
+            };
+            let hp_font = (name_font - 2).max(12);
+            draw_text(&hp_label, col_bar_x + bar_w + 8.0, row_y + hp_font as f32, hp_font as f32,
+                Color::new(0.85, 0.85, 0.85, 0.9));
         }
 
-        let hint = "Press R to restart";
-        let hw = measure_text(hint, None, 24, 1.0).width;
-        draw_text(
-            hint,
-            sw / 2.0 - hw / 2.0,
-            sh / 2.0 + 40.0,
-            24.0,
-            Color::new(0.8, 0.8, 0.8, 0.8),
-        );
+        // ── NEW GAME button ──────────────────────────────────────────────────
+        let btn_w = (sw * 0.45).min(220.0);
+        let btn_h = if sw < 500.0 { 44.0_f32 } else { 52.0_f32 };
+        let btn_x = sw / 2.0 - btn_w / 2.0;
+        let btn_y = sh * 0.80;
+        // Button shadow
+        draw_rectangle(btn_x + 3.0, btn_y + 4.0, btn_w, btn_h, Color::new(0.0, 0.0, 0.0, 0.5));
+        // Button background
+        draw_rectangle(btn_x, btn_y, btn_w, btn_h, Color::new(0.15, 0.60, 0.25, 1.0));
+        // Button border
+        draw_rectangle_lines(btn_x, btn_y, btn_w, btn_h, 2.0, Color::new(0.4, 0.95, 0.5, 0.9));
+        // Button label
+        let label = "NEW GAME";
+        let label_font = if sw < 500.0 { 20u16 } else { 24u16 };
+        let lw = measure_text(label, None, label_font, 1.0).width;
+        draw_text(label, sw / 2.0 - lw / 2.0, btn_y + btn_h / 2.0 + label_font as f32 * 0.38, label_font as f32, WHITE);
+
         return;
     }
 

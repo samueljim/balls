@@ -477,13 +477,16 @@ impl Game {
                 && !self.baseball_bat_mode
             {
                 if self.airstrike_mode.is_some() {
-                    // Lock the airstrike at the current camera centre so the player
-                    // positions the target by panning, then taps to confirm.
-                    self.airstrike_locked_x = Some(self.cam.x);
+                    // Lock the airstrike at the tapped world position.
+                    // Tapping again overwrites the target so the player can reposition.
+                    let (wx, _wy) = self.cam.screen_to_world(mx, my);
+                    self.airstrike_locked_x = Some(wx.clamp(0.0, self.terrain.width as f32));
                 } else if self.teleport_mode {
-                    // Lock the teleport destination at the current camera centre.
-                    let tx = self.cam.x.clamp(0.0, self.terrain.width as f32);
-                    let ty = self.cam.y.clamp(0.0, self.terrain.height as f32);
+                    // Lock the teleport destination at the tapped world position.
+                    // Tapping again overwrites the destination so the player can reposition.
+                    let (wx, wy) = self.cam.screen_to_world(mx, my);
+                    let tx = wx.clamp(0.0, self.terrain.width as f32);
+                    let ty = wy.clamp(0.0, self.terrain.height as f32);
                     self.teleport_locked_pos = Some((tx, ty));
                 } else {
                     self.aim_locked = !self.aim_locked;
@@ -572,7 +575,22 @@ impl Game {
         }
 
         if self.phase == Phase::GameOver {
-            if is_key_pressed(KeyCode::R) {
+            // R key or click/tap on the NEW GAME button restarts the game.
+            let restart = is_key_pressed(KeyCode::R) || {
+                if is_mouse_button_pressed(MouseButton::Left) {
+                    let (mx, my) = mouse_position();
+                    let sw = screen_width();
+                    let sh = screen_height();
+                    let btn_w = (sw * 0.45).min(220.0);
+                    let btn_h = if sw < 500.0 { 44.0_f32 } else { 52.0_f32 };
+                    let btn_x = sw / 2.0 - btn_w / 2.0;
+                    let btn_y = sh * 0.80;
+                    mx >= btn_x && mx <= btn_x + btn_w && my >= btn_y && my <= btn_y + btn_h
+                } else {
+                    false
+                }
+            };
+            if restart {
                 let seed = lcg(self.rng_state);
                 if self.net.connected {
                     let msg = format!("{{\"type\":\"restart\",\"seed\":{}}}", seed);
@@ -1304,7 +1322,7 @@ impl Game {
             // Uzi - burst-fire 20 bullets in a straight line, one every 0.07 s
             Weapon::Uzi => {
                 self.uzi_bullets.clear();
-                let base_speed = 18.0; // always full power
+                let base_speed = 800.0; // fast bullets — always full power
 
                 // Spawn the first bullet immediately
                 self.uzi_bullets.push(UziBullet {
@@ -1397,13 +1415,13 @@ impl Game {
                 // Stay in aiming phase, will handle click for teleport
             },
             
-            // Sniper Rifle – instant raycast, no gravity, high damage but 30% miss chance
+            // Sniper Rifle – instant raycast, no gravity, high damage but 50% miss chance
             Weapon::SniperRifle => {
                 // Deterministic miss roll — must use rng_state (not rand::) so all
                 // clients reach the same outcome on replay.
                 self.rng_state = lcg(self.rng_state);
                 let miss_roll = (self.rng_state >> 16) as f32 / 65536.0;
-                let missed = miss_roll < 0.30;
+                let missed = miss_roll < 0.50;
                 let shoot_angle = if missed {
                     // Random deflection of 7–20° away from aim line
                     self.rng_state = lcg(self.rng_state);
@@ -3658,13 +3676,17 @@ impl Game {
         }
 
         // Airstrike / NapalmStrike preview: vertical drop lines at each target X.
-        // When no target is locked yet, the preview tracks the camera centre so the
-        // player pans to position the strike and then taps to confirm.
+        // When no target is locked yet, the preview tracks the mouse/touch position so
+        // the player can see exactly where tapping would place the strike.
         if let Some(airstrike_weapon) = self.airstrike_mode {
             if self.is_my_turn() {
                 let locked = self.airstrike_locked_x.is_some();
-                // Live preview uses cam centre; confirmed target uses the locked X.
-                let target_x = self.airstrike_locked_x.unwrap_or(self.cam.x);
+                // Live preview tracks mouse position; confirmed target uses the locked X.
+                let target_x = self.airstrike_locked_x.unwrap_or_else(|| {
+                    let (cur_mx, cur_my) = mouse_position();
+                    let (wx, _) = self.cam.screen_to_world(cur_mx, cur_my);
+                    wx.clamp(0.0, self.terrain.width as f32)
+                });
                 let top_y = self.cam.y - self.cam.visible_height() / 2.0 - 50.0;
                 let bot_y = self.cam.y + self.cam.visible_height() / 2.0;
                 let (count, spacing, base_color) = match airstrike_weapon {
@@ -3726,7 +3748,12 @@ impl Game {
             let (wx, wy, locked) = if let Some((lx, ly)) = self.teleport_locked_pos {
                 (lx, ly, true)
             } else {
-                (self.cam.x, self.cam.y, false)
+                // Preview follows mouse/touch so the player sees exactly where they'll teleport.
+                let (cur_mx, cur_my) = mouse_position();
+                let (pwx, pwy) = self.cam.screen_to_world(cur_mx, cur_my);
+                (pwx.clamp(0.0, self.terrain.width as f32),
+                 pwy.clamp(0.0, self.terrain.height as f32),
+                 false)
             };
             let alpha = if locked { 1.0f32 } else { 0.65 };
             let col = Color::new(0.35, 0.95, 1.0, alpha);
@@ -3762,9 +3789,9 @@ impl Game {
         // Teleport hint text (screen space, drawn after set_default_camera).
         if let Some(locked) = teleport_locked_for_hint {
             let hint = if locked {
-                "DESTINATION LOCKED \u{2014} Press FIRE to warp"
+                "DESTINATION SET \u{2014} Tap to reposition \u{2022} Press FIRE to warp"
             } else {
-                "[ TELEPORT ]  Pan to destination \u{2192} Tap to lock"
+                "[ TELEPORT ]  Tap anywhere to set destination"
             };
             let sw = screen_width();
             let tw = measure_text(hint, None, 22, 1.0).width;
@@ -3804,11 +3831,11 @@ impl Game {
                 let locked = self.airstrike_locked_x.is_some();
                 let name = if airstrike_weapon == Weapon::NapalmStrike { "NAPALM STRIKE" } else { "AIRSTRIKE" };
                 let hint = if locked {
-                    "TARGET LOCKED \u{2014} Press FIRE to launch"
+                    "TARGET SET \u{2014} Tap to reposition \u{2022} Press FIRE to launch"
                 } else {
                     match airstrike_weapon {
-                        Weapon::NapalmStrike => "[ NAPALM STRIKE ]  Pan to position \u{2192} Tap to lock target",
-                        _ =>                   "[ AIRSTRIKE ]  Pan to position \u{2192} Tap to lock target",
+                        Weapon::NapalmStrike => "[ NAPALM STRIKE ]  Tap anywhere to set target",
+                        _ =>                   "[ AIRSTRIKE ]  Tap anywhere to set target",
                     }
                 };
                 let _ = name; // suppress unused warning

@@ -5,7 +5,7 @@ const GRAVITY: f32 = 480.0;
 const WALK_SPEED: f32 = 115.0;         // Slightly snappier
 const JUMP_VEL: f32 = -320.0;          // More air — bigger, floatier jump
 const JUMP_HORIZONTAL_BOOST: f32 = 75.0; // Extra run on jump
-const MAX_CLIMB: i32 = 12;             // Can hop up over small terrain bumps
+const MAX_CLIMB: i32 = 16;             // Can hop up over small terrain bumps
 const GROUND_FRICTION: f32 = 0.80;
 const AIR_FRICTION: f32 = 0.985;       // Slightly less air drag
 const AIR_CONTROL_ACCEL: f32 = 420.0; // Horizontal acceleration applied per-frame while airborne
@@ -120,13 +120,18 @@ impl Ball {
         for &offset in &[-r * 0.4, 0.0, r * 0.4] {
             let cx = (self.x + offset) as i32;
             let foot_y = (self.y + r) as i32;
-            if terrain.is_solid(cx, foot_y) {
-                let mut sy = foot_y - 1;
+            // Check foot_y and one pixel below so floating-point rounding doesn't
+            // leave a 1-pixel gap that falsely reports the ball as airborne.
+            let check_y = if terrain.is_solid(cx, foot_y) { foot_y }
+                          else if terrain.is_solid(cx, foot_y + 1) { foot_y + 1 }
+                          else { continue };
+            {
+                let mut sy = check_y - 1;
                 while sy > (self.y as i32 - r as i32) && terrain.is_solid(cx, sy) {
                     sy -= 1;
                 }
                 let new_y = (sy + 1) as f32 - r;
-                if new_y < self.y + 2.0 {
+                if new_y < self.y + 3.0 {
                     self.y = new_y;
                     self.on_ground = true;
 

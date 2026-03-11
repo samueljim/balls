@@ -122,11 +122,11 @@ impl Ball {
             let foot_y = (self.y + r) as i32;
             // Check foot_y and one pixel below so floating-point rounding doesn't
             // leave a 1-pixel gap that falsely reports the ball as airborne.
-            let check_y = if terrain.is_solid(cx, foot_y) { foot_y }
+            let solid_ground_y = if terrain.is_solid(cx, foot_y) { foot_y }
                           else if terrain.is_solid(cx, foot_y + 1) { foot_y + 1 }
                           else { continue };
             {
-                let mut sy = check_y - 1;
+                let mut sy = solid_ground_y - 1;
                 while sy > (self.y as i32 - r as i32) && terrain.is_solid(cx, sy) {
                     sy -= 1;
                 }

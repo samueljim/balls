@@ -626,8 +626,10 @@ pub fn draw_weapon_menu_egui(
                 });
         });
 
-    // Close when the user clicks anywhere outside the menu window.
-    if ctx.input(|i| i.pointer.any_click()) && !ctx.is_pointer_over_area() {
+    // Close when the user LEFT-clicks anywhere outside the menu window.
+    // We use primary_clicked (left button only) so that right-clicking outside
+    // does not accidentally trigger a close.
+    if ctx.input(|i| i.pointer.primary_clicked()) && !ctx.is_pointer_over_area() {
         result = WeaponMenuResult::Close;
     }
 

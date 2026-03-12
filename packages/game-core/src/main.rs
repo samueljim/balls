@@ -9,13 +9,14 @@ mod terrain;
 mod weapons;
 
 use camera::GameCamera;
+use egui_macroquad::egui;
 use macroquad::prelude::*;
 use physics::{Ball, BALL_RADIUS};
 use projectile::{Projectile, ClusterBomblet, ShotgunPellet};
 use special_weapons::{AirstrikeDroplet, FirePool, UziBullet, PlacedExplosive, AirstrikeType};
 use state::Phase;
 use terrain::Terrain;
-use weapons::Weapon;
+use weapons::{Weapon, WeaponCategory};
 
 const TURN_TIME: f32 = 45.0;
 const TURN_END_DELAY: f32 = 0.5;
@@ -132,9 +133,8 @@ struct Game {
     winning_team: Option<u32>,
     
     weapon_menu_open: bool,
-    weapon_menu_scroll: f32,
-    /// Current text in the weapon menu search box.
-    weapon_search: String,
+    /// Currently visible category tab in the weapon menu.
+    weapon_menu_category: WeaponCategory,
 
     net: network::NetworkState,
     /// Current turn index from server (which player's turn it is: 0, 1, etc.)
@@ -343,8 +343,7 @@ impl Game {
             particles: Vec::new(),
             winning_team: None,
             weapon_menu_open: false,
-            weapon_menu_scroll: 0.0,
-            weapon_search: String::new(),
+            weapon_menu_category: WeaponCategory::Explosives,
             net: network::NetworkState::new(),
             current_turn_index: 0,
             num_teams,
@@ -454,8 +453,9 @@ impl Game {
         
         let (mx, my) = mouse_position();
 
-        // Left-click drag-to-pan: record press origin and promote to pan once cursor moves > 8px.
-        if is_mouse_button_pressed(MouseButton::Left) {
+        // Left-click drag-to-pan: only start when weapon menu is closed, so egui
+        // can handle touch/pointer events inside the menu without interference.
+        if is_mouse_button_pressed(MouseButton::Left) && !self.weapon_menu_open {
             self.left_drag_start = Some((mx, my));
             self.left_drag_panning = false;
             self.last_mouse = (mx, my);
@@ -531,37 +531,22 @@ impl Game {
             self.cam_return_timer = (self.cam_return_timer - ft).max(0.0);
         }
 
-        // Mouse wheel: scroll weapon menu when open, otherwise camera zoom
+        // Mouse wheel: camera zoom (weapon menu scroll is handled by egui's ScrollArea)
         let wheel = mouse_wheel().1;
-        if wheel.abs() > 0.1 {
-            if self.weapon_menu_open {
-                let layout = hud::WeaponMenuLayout::new();
-                // Normalize scroll so it feels consistent across input devices:
-                //   - Desktop mouse (Windows/Linux): browser deltaY ≈ ±100 per notch → snap one item
-                //   - macOS trackpad / mobile swipe: small deltas (≤5) → smooth proportional scroll
-                let item_step = layout.item_h + layout.item_padding;
-                let delta = if wheel.abs() > 5.0 {
-                    wheel.signum() * item_step   // one item per scroll click
-                } else {
-                    wheel * (item_step / 3.0)    // smooth trackpad / touch swipe
-                };
-                self.weapon_menu_scroll = (self.weapon_menu_scroll - delta)
-                    .clamp(0.0, layout.max_scroll(&self.weapon_search));
+        if wheel.abs() > 0.1 && !self.weapon_menu_open {
+            // Smooth trackpad pinch / fine scroll wheel use a proportional factor;
+            // discrete mouse clicks (large delta) snap by a fixed step.
+            let factor = if wheel.abs() > 5.0 {
+                // Discrete mouse wheel notch
+                if wheel > 0.0 { 1.15 } else { 1.0 / 1.15 }
             } else {
-                // Smooth trackpad pinch / fine scroll wheel use a proportional factor;
-                // discrete mouse clicks (large delta) snap by a fixed step.
-                let factor = if wheel.abs() > 5.0 {
-                    // Discrete mouse wheel notch
-                    if wheel > 0.0 { 1.15 } else { 1.0 / 1.15 }
-                } else {
-                    // Continuous trackpad — proportional zoom so it feels silky
-                    1.0 + wheel * 0.015
-                };
-                // Zoom toward the cursor position so the point under the mouse stays put
-                self.cam.zoom_toward_screen_point(mx, my, factor);
-                // Pin cam_target_zoom to the new level so the auto-return lerp doesn't fight
-                self.cam_target_zoom = self.cam.zoom;
-            }
+                // Continuous trackpad — proportional zoom so it feels silky
+                1.0 + wheel * 0.015
+            };
+            // Zoom toward the cursor position so the point under the mouse stays put
+            self.cam.zoom_toward_screen_point(mx, my, factor);
+            // Pin cam_target_zoom to the new level so the auto-return lerp doesn't fight
+            self.cam_target_zoom = self.cam.zoom;
         }
 
         // Keyboard zoom: + / = to zoom in, - to zoom out (toward screen centre)
@@ -673,13 +658,9 @@ impl Game {
                 self.phase = Phase::Aiming;
             }
             self.weapon_menu_open = !self.weapon_menu_open;
-            self.weapon_menu_scroll = 0.0;
-            self.weapon_search.clear();
             // Drain the char queue so the key that opened the menu (Q) isn't
-            // immediately captured into the search string on the same frame.
-            if self.weapon_menu_open {
-                while get_char_pressed().is_some() {}
-            }
+            // accidentally processed by egui on the same frame.
+            while get_char_pressed().is_some() {}
         }
 
         // ESC or right-click while charging cancels the charge (return to aiming).
@@ -705,110 +686,15 @@ impl Game {
                 self.weapon_menu_open = true;
             }
         }
-        
-        // Close menu with ESC
-        if self.weapon_menu_open && is_key_pressed(KeyCode::Escape) {
-            self.weapon_menu_open = false;
-            self.weapon_menu_scroll = 0.0;
-            self.weapon_search.clear();
-        }
 
-        // Always drain the char queue every frame so buffered keypresses from when
-        // the menu was closed (e.g. WASD movement) don't flood the search on open.
-        // Only write to weapon_search when the menu is actually visible.
-        if self.is_my_turn() && self.weapon_menu_open && is_key_pressed(KeyCode::Backspace) {
-            if self.weapon_search.pop().is_some() {
-                // Clamp scroll in case filtered list is now shorter
-                let layout = hud::WeaponMenuLayout::new();
-                self.weapon_menu_scroll = self.weapon_menu_scroll
-                    .min(layout.max_scroll(&self.weapon_search));
-            }
-        }
-        while let Some(c) = get_char_pressed() {
-            if self.is_my_turn() && self.weapon_menu_open && (c.is_ascii_graphic() || c == ' ') {
-                self.weapon_search.push(c);
-                self.weapon_menu_scroll = 0.0; // scroll to top on new search char
-            }
-            // chars are discarded when menu is closed — prevents buffer contamination
-        }
-        
-        // Handle weapon menu clicks (only on your turn)
-        if self.is_my_turn() && self.weapon_menu_open && is_mouse_button_pressed(MouseButton::Left) {
-            let layout = hud::WeaponMenuLayout::new();
-            
-            // Organize weapons by category (same as hud.rs), filtered by search
-            use weapons::WeaponCategory;
-            let sq = self.weapon_search.to_lowercase();
-            let all_weapons = Weapon::all();
-            let mut by_category: std::collections::HashMap<WeaponCategory, Vec<&Weapon>> = std::collections::HashMap::new();
-            for w in all_weapons {
-                if sq.is_empty() || w.name().to_lowercase().contains(&sq) || w.description().to_lowercase().contains(&sq) {
-                    by_category.entry(w.category()).or_insert_with(Vec::new).push(w);
-                }
-            }
-            
-            let categories = [
-                WeaponCategory::Explosives,
-                WeaponCategory::Ballistics,
-                WeaponCategory::Special,
-                WeaponCategory::Utilities,
-            ];
-            
-            let mut current_y = layout.content_y + 4.0 - self.weapon_menu_scroll; // 4px initial padding
-            
-            // Only accept clicks within the content viewport
-            let content_top = layout.content_y;
-            let content_bottom = layout.content_y + layout.content_h;
-            
-            for cat in &categories {
-                if let Some(weapons) = by_category.get(cat) {
-                    // Skip category header
-                    current_y += layout.cat_header_h + layout.item_padding;
-                    
-                    // Check weapon item clicks
-                    for w in weapons {
-                        let item_y = current_y;
-                        let item_x = layout.menu_x + layout.padding;
-                        let item_w = layout.menu_w - layout.padding * 2.0;
-                        
-                        // Only register clicks within the visible content area
-                        if item_y + layout.item_h > content_top && item_y < content_bottom {
-                            if mx >= item_x && mx <= item_x + item_w && my >= item_y && my <= item_y + layout.item_h {
-                                self.selected_weapon = **w;
-                                self.weapon_menu_open = false;
-                                self.weapon_menu_scroll = 0.0;
-                                self.weapon_search.clear();
-                                // Clear all special modes before activating the new one
-                                self.airstrike_mode = None;
-                                self.airstrike_locked_x = None;
-                                self.teleport_mode = false;
-                                self.teleport_locked_pos = None;
-                                self.build_wall_mode = false;
-                                self.build_wall_anchor = None;
-                                match self.selected_weapon {
-                                    Weapon::Teleport => { self.teleport_mode = true; }
-                                    Weapon::BuildWall => { self.build_wall_mode = true; }
-                                    Weapon::Airstrike => { self.airstrike_mode = Some(Weapon::Airstrike); }
-                                    Weapon::NapalmStrike => { self.airstrike_mode = Some(Weapon::NapalmStrike); }
-                                    _ => {}
-                                }
-                                return;
-                            }
-                        }
-                        
-                        current_y += layout.item_h + layout.item_padding;
-                    }
-                    
-                    current_y += layout.cat_spacing; // Space between categories
-                }
-            }
-            
-            // Close menu if clicking outside
-            if mx < layout.menu_x || mx > layout.menu_x + layout.menu_w || my < layout.menu_y || my > layout.menu_y + layout.menu_h {
-                self.weapon_menu_open = false;
-                self.weapon_menu_scroll = 0.0;
-                self.weapon_search.clear();
-            }
+        // Drain char queue every frame to prevent stale keypresses from leaking into
+        // other systems (e.g. WASD keys typed while menu was closed).
+        while get_char_pressed().is_some() {}
+
+        // Weapon menu input is now handled entirely by egui inside game.draw().
+        // When the menu is open, skip all the normal pointer / aim processing
+        // so egui's events are not double-consumed.
+        if self.weapon_menu_open {
             return;
         }
 
@@ -3456,7 +3342,7 @@ impl Game {
         }
     }
 
-    fn draw(&self) {
+    fn draw(&mut self) {
         clear_background(Color::new(0.40, 0.65, 0.88, 1.0));
 
         let mq_cam = self.cam.to_macroquad();
@@ -3863,11 +3749,63 @@ impl Game {
             self.winning_team,
             is_my_turn,
             &turn_owner,
-            self.weapon_menu_open,
-            self.weapon_menu_scroll,
-            &self.weapon_search,
             self.net.connected,
         );
+
+        // ── egui weapon menu ──────────────────────────────────────────────────
+        if self.weapon_menu_open {
+            // Draw dark overlay with macroquad before egui renders on top.
+            draw_rectangle(
+                0.0, 0.0,
+                screen_width(), screen_height(),
+                Color::new(0.0, 0.0, 0.0, 0.75),
+            );
+        }
+
+        let selected = self.selected_weapon;
+        let mut new_category = self.weapon_menu_category;
+        let mut chosen_weapon: Option<Weapon> = None;
+        let mut close_menu = false;
+        let menu_open = self.weapon_menu_open;
+
+        egui_macroquad::ui(|ctx| {
+            if menu_open {
+                match hud::draw_weapon_menu_egui(ctx, selected, &mut new_category) {
+                    hud::WeaponMenuResult::Select(w) => {
+                        chosen_weapon = Some(w);
+                    }
+                    hud::WeaponMenuResult::Close => {
+                        close_menu = true;
+                    }
+                    hud::WeaponMenuResult::None => {}
+                }
+            }
+        });
+        egui_macroquad::draw();
+
+        // Apply weapon selection from egui.
+        if let Some(w) = chosen_weapon {
+            self.selected_weapon = w;
+            self.weapon_menu_open = false;
+            // Reset special modes, then activate the new weapon's mode.
+            self.airstrike_mode = None;
+            self.airstrike_locked_x = None;
+            self.teleport_mode = false;
+            self.teleport_locked_pos = None;
+            self.build_wall_mode = false;
+            self.build_wall_anchor = None;
+            match w {
+                Weapon::Teleport    => { self.teleport_mode = true; }
+                Weapon::BuildWall   => { self.build_wall_mode = true; }
+                Weapon::Airstrike   => { self.airstrike_mode = Some(Weapon::Airstrike); }
+                Weapon::NapalmStrike => { self.airstrike_mode = Some(Weapon::NapalmStrike); }
+                _ => {}
+            }
+        }
+        if close_menu {
+            self.weapon_menu_open = false;
+        }
+        self.weapon_menu_category = new_category;
     }
 
     fn draw_sky(&self) {

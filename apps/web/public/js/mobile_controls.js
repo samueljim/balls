@@ -347,6 +347,8 @@
     var aimStartX = 0, aimStartY = 0;
     var aimMoved = false;
     var TAP_MOVE_THRESHOLD = 15;
+    /* Track whether we actually sent a mouse_down so we only send mouse_up to match. */
+    var mouseDownSent = false;
 
     /* Two-finger pan / pinch state.
      * Uses left-button drag so it goes through the same left_drag_panning path
@@ -356,10 +358,11 @@
     var lastPanCvs = null;
     var lastPinchDist = null;
 
-    /* Menu-scroll state */
-    var menuScrollLastCvsY = null;
-    var menuTouchStartCvsX = null;
-    var menuTouchStartCvsY = null;
+    /* Menu-scroll state — tracked in CSS pixels (clientY) for device-independent
+     * sensitivity regardless of the device pixel ratio. */
+    var menuScrollClientY = null;
+    var menuTouchStartClientX = null;
+    var menuTouchStartClientY = null;
     var menuDragging = false;
 
     function cvsPos(clientX, clientY) {
@@ -381,10 +384,14 @@
       }
     }
 
-    /* Cancel an in-progress single-finger touch without triggering a tap action. */
+    /* Cancel an in-progress single-finger touch without triggering a tap action.
+     * Only sends mouse_up if mouse_down was previously sent (mouseDownSent). */
     function cancelSingleFinger(pos) {
       if (aimId !== null) {
-        wasm_exports.mouse_up(pos.x, pos.y, 0);
+        if (mouseDownSent) {
+          wasm_exports.mouse_up(pos.x, pos.y, 0);
+          mouseDownSent = false;
+        }
         aimId = null;
         aimMoved = false;
       }
@@ -407,24 +414,29 @@
         lastAimX = p.x; lastAimY = p.y;
 
         if (menuOpen) {
-          menuScrollLastCvsY = p.y;
-          menuTouchStartCvsX = p.x;
-          menuTouchStartCvsY = p.y;
+          /* Menu is open: set up scroll tracking using CSS pixels.
+           * Do NOT send mouse_down — we defer the click to touchend so a scroll
+           * gesture doesn't accidentally select a weapon on the first frame. */
+          menuScrollClientY = ts[0].clientY;
+          menuTouchStartClientX = ts[0].clientX;
+          menuTouchStartClientY = ts[0].clientY;
           menuDragging = false;
+          mouseDownSent = false;
+        } else {
+          /* Normal game interaction: snap aim and start a left-button press.
+           * Rust will promote this to left_drag_panning once the finger moves > 8 px,
+           * which covers both camera pan (any drag) and tap detection. */
+          wasm_exports.mouse_move(p.x, p.y);
+          wasm_exports.mouse_down(p.x, p.y, 0);
+          mouseDownSent = true;
         }
-
-        /* Snap aim and start a left-button press.
-         * Rust will promote this to left_drag_panning once the finger moves > 8 px,
-         * which covers both camera pan (any drag) and tap detection. */
-        wasm_exports.mouse_move(p.x, p.y);
-        wasm_exports.mouse_down(p.x, p.y, 0);
 
       } else if (ts.length >= 2) {
         /* Two or more fingers: cancel single-finger and start two-finger pan */
         if (aimId !== null) {
           cancelSingleFinger({ x: lastAimX, y: lastAimY });
         }
-        menuScrollLastCvsY = null;
+        menuScrollClientY = null;
         var mid = midpoint(ts[0], ts[1]);
         var cMid = cvsPos(mid.x, mid.y);
         lastPinchDist = pinchDist(ts[0], ts[1]);
@@ -452,15 +464,19 @@
           lastAimX = p.x; lastAimY = p.y;
 
           if (menuOpen) {
-            var menuTotalMove = Math.abs(p.x - menuTouchStartCvsX) + Math.abs(p.y - menuTouchStartCvsY);
-            if (menuTotalMove > TAP_MOVE_THRESHOLD) menuDragging = true;
-            if (menuScrollLastCvsY !== null) {
-              var scrollDelta = menuScrollLastCvsY - p.y;
-              if (Math.abs(scrollDelta) > 0.5) {
-                wasm_exports.mouse_wheel(0, -scrollDelta * 0.05);
+            /* Scroll the weapon menu using CSS-pixel delta for device-independent
+             * sensitivity. Factor ~0.3 gives roughly one weapon item per 15-20 px
+             * of finger movement (item_h≈50 CSS px, Rust smooth factor = item_h/3). */
+            var menuTotalMoveClient = Math.abs(ct[i].clientX - menuTouchStartClientX) +
+                                   Math.abs(ct[i].clientY - menuTouchStartClientY);
+            if (menuTotalMoveClient > TAP_MOVE_THRESHOLD) menuDragging = true;
+            if (menuScrollClientY !== null) {
+              var scrollDeltaClient = menuScrollClientY - ct[i].clientY;
+              if (Math.abs(scrollDeltaClient) > 0.5) {
+                wasm_exports.mouse_wheel(0, -scrollDeltaClient * 0.3);
               }
             }
-            menuScrollLastCvsY = p.y;
+            menuScrollClientY = ct[i].clientY;
             break;
           }
 
@@ -495,18 +511,31 @@
       }
       if (remaining === 0) {
         if (aimId !== null) {
-          /* Release left button — Rust handles tap vs pan detection via was_tap flag:
-           * • If left_drag_panning was active: was_tap=false → no tap action.
-           * • If finger barely moved (true tap): was_tap=true → aim-lock / weapon select. */
           if (menuOpen && !menuDragging) {
-            wasm_exports.mouse_up(lastAimX, lastAimY, 0);
+            /* Tap on the weapon menu: fire a click so Rust selects the weapon
+             * (or closes the menu if tapped outside).  We send mouse_move first
+             * so Rust has the correct cursor position, then down+up so
+             * is_mouse_button_pressed fires on the next game frame. */
+            wasm_exports.mouse_move(lastAimX, lastAimY);
+            wasm_exports.mouse_down(lastAimX, lastAimY, 0);
+            /* Release on the next animation frame so macroquad sees a full
+             * press→release cycle with is_mouse_button_pressed = true. */
+            (function (x, y) {
+              requestAnimationFrame(function () {
+                wasm_exports.mouse_up(x, y, 0);
+              });
+            }(lastAimX, lastAimY));
             menuOpen = false;
-          } else {
+          } else if (mouseDownSent) {
+            /* Normal game touch ended: release the button. */
             wasm_exports.mouse_up(lastAimX, lastAimY, 0);
           }
+          /* menuOpen && menuDragging: scroll completed, no click — nothing to release
+           * since no mouse_down was sent. */
           aimId = null;
           aimMoved = false;
-          menuScrollLastCvsY = null;
+          mouseDownSent = false;
+          menuScrollClientY = null;
         }
       }
     }, { capture: true, passive: false });
@@ -515,7 +544,8 @@
       e.stopImmediatePropagation();
       stopPan({ x: lastAimX, y: lastAimY });
       cancelSingleFinger({ x: lastAimX, y: lastAimY });
-      menuScrollLastCvsY = null;
+      menuScrollClientY = null;
+      mouseDownSent = false;
     }, { capture: true, passive: false });
   }
 

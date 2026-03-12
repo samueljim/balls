@@ -14,7 +14,7 @@ const FALL_DAMAGE_THRESHOLD: f32 = 120.0;
 const FALL_DAMAGE_FACTOR: f32 = 0.25;
 const WALL_IMPACT_THRESHOLD: f32 = 250.0; // min speed to take wall-impact damage
 const WALL_IMPACT_FACTOR: f32 = 0.04;    // damage per unit of excess speed
-const MOVEMENT_BUDGET: f32 = 170.0;   // Slightly more movement per turn
+const MOVEMENT_BUDGET: f32 = 10000.0;  // Effectively unlimited — players can always move
 const COYOTE_TIME: f32 = 0.15;        // Grace window after walking off edge
 const JUMP_BUFFER_TIME: f32 = 0.12;   // Jump pressed just before landing
 

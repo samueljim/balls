@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 macroquad = "0.4"
+egui-macroquad = { version = "0.17.3", default-features = false }
 
 [profile.release]
 opt-level = "s"

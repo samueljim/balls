@@ -1,114 +1,18 @@
+use egui_macroquad::egui;
 use macroquad::prelude::*;
 
 use crate::physics::{Ball, TEAM_COLORS, BALL_RADIUS};
 use crate::state::Phase;
 use crate::weapons::{Weapon, WeaponCategory};
 
-/// Shared layout constants for the weapon menu (used by hud rendering and click hit-testing).
-pub struct WeaponMenuLayout {
-    pub menu_x: f32,
-    pub menu_y: f32,
-    pub menu_w: f32,
-    pub menu_h: f32,
-    pub header_h: f32,
-    pub footer_h: f32,
-    pub content_y: f32,
-    pub content_h: f32,
-    pub padding: f32,
-    pub item_h: f32,
-    pub cat_header_h: f32,
-    pub item_padding: f32,
-    pub cat_spacing: f32,
-    pub is_mobile: bool,
-    /// Device pixel ratio (1.0 on desktop, 2-3 on HiDPI mobile).
-    /// Used ONLY to convert CSS px → physical pixels for the GL scissor rect.
-    pub dpi: f32,
-    /// Height of the title-only strip at the top of the header (above search bar).
-    pub title_h: f32,
-    /// Y position (CSS px) of the search input bar within the header.
-    pub search_bar_y: f32,
-    /// Height (CSS px) of the search input bar.
-    pub search_bar_h: f32,
-}
-
-impl WeaponMenuLayout {
-    pub fn new() -> Self {
-        let sw = screen_width();
-        let sh = screen_height();
-        // screen_width/height return CSS (logical) pixels in macroquad WASM.
-        // screen_dpi_scale() gives the device pixel ratio — use it ONLY for
-        // is_mobile detection (where we compare against CSS px thresholds) and
-        // for the GL scissor rect which needs physical pixels.
-        let dpi = screen_dpi_scale();
-        let css_w = sw;
-        let css_h = sh;
-        let is_mobile = css_w < 600.0 || css_h < 700.0;
-
-        // All sizes below are in CSS pixels — no * dpi.
-        let menu_w = if is_mobile { sw * 0.97 } else { 520.0_f32.min(sw * 0.85) };
-        // On mobile the controls overlay (joystick + buttons) occupies ~225 px at the bottom.
-        // Anchor the menu just below the top HUD bar (50 px) so it never extends under them.
-        let controls_reserved = if is_mobile { 225.0_f32 } else { 0.0_f32 };
-        let menu_h = if is_mobile {
-            (sh - 50.0 - controls_reserved).max(200.0)
-        } else {
-            620.0_f32.min(sh * 0.85)
-        };
-        let menu_x = sw / 2.0 - menu_w / 2.0;
-        let menu_y = if is_mobile { 50.0 } else { sh / 2.0 - menu_h / 2.0 };
-        let title_h = if is_mobile { 36.0 } else { 52.0 };
-        let search_bar_h = if is_mobile { 26.0 } else { 32.0 };
-        let search_bar_y = menu_y + title_h + 4.0;
-        let header_h = title_h + search_bar_h + 10.0; // 4px above + 6px below search bar
-        let footer_h = if is_mobile { 36.0 } else { 44.0 };
-        let content_y = menu_y + header_h + 6.0;
-        let content_h = menu_h - header_h - 6.0 - footer_h;
-        let padding = if is_mobile { 6.0 } else { 12.0 };
-        let item_h = if is_mobile { 50.0 } else { 58.0 };
-        let cat_header_h = if is_mobile { 24.0 } else { 30.0 };
-        let item_padding = 2.0;
-        let cat_spacing = 6.0;
-        Self { menu_x, menu_y, menu_w, menu_h, header_h, title_h, search_bar_y, search_bar_h,
-               footer_h, content_y, content_h,
-               padding, item_h, cat_header_h, item_padding, cat_spacing, is_mobile, dpi }
-    }
-
-    /// Total height of all content (categories + weapons) to determine max scroll.
-    /// Pass `search` to account for filtered weapon lists.
-    pub fn total_content_height(&self, search: &str) -> f32 {
-        let sq = search.to_lowercase();
-        let categories = [
-            WeaponCategory::Explosives,
-            WeaponCategory::Ballistics,
-            WeaponCategory::Special,
-            WeaponCategory::Utilities,
-        ];
-        let all_weapons = Weapon::all();
-        let mut by_category: std::collections::HashMap<WeaponCategory, Vec<&Weapon>> = std::collections::HashMap::new();
-        for w in all_weapons {
-            if sq.is_empty() || w.name().to_lowercase().contains(&sq) || w.description().to_lowercase().contains(&sq) {
-                by_category.entry(w.category()).or_insert_with(Vec::new).push(w);
-            }
-        }
-        let mut h = 4.0_f32; // initial top padding
-        let cats_with_weapons: Vec<_> = categories.iter()
-            .filter(|cat| by_category.get(*cat).map_or(false, |v| !v.is_empty()))
-            .collect();
-        for (i, cat) in cats_with_weapons.iter().enumerate() {
-            if let Some(weapons) = by_category.get(*cat) {
-                h += self.cat_header_h + self.item_padding;
-                h += weapons.len() as f32 * (self.item_h + self.item_padding);
-                if i < cats_with_weapons.len() - 1 {
-                    h += self.cat_spacing;
-                }
-            }
-        }
-        h
-    }
-
-    pub fn max_scroll(&self, search: &str) -> f32 {
-        (self.total_content_height(search) - self.content_h).max(0.0)
-    }
+/// Result returned by `draw_weapon_menu_egui`.
+pub enum WeaponMenuResult {
+    /// Player selected this weapon.
+    Select(Weapon),
+    /// Player closed the menu without selecting.
+    Close,
+    /// No action this frame.
+    None,
 }
 
 pub fn draw_hud(
@@ -122,9 +26,6 @@ pub fn draw_hud(
     winning_team: Option<u32>,
     is_my_turn: bool,
     turn_owner_name: &str,
-    weapon_menu_open: bool,
-    weapon_menu_scroll: f32,
-    weapon_search: &str,
     connected: bool,
 ) {
     let sw = screen_width();
@@ -448,326 +349,297 @@ pub fn draw_hud(
             Color::new(0.5, 0.5, 0.5, 0.5),
         );
     }
-    
-    // Draw weapon menu
-    if weapon_menu_open {
-        draw_weapon_menu(selected_weapon, weapon_menu_scroll, weapon_search);
-    }
 }
 
-fn draw_weapon_menu(selected_weapon: Weapon, scroll_offset: f32, search: &str) {
+/// Draws the weapon selection menu using egui.
+///
+/// Returns a [`WeaponMenuResult`] indicating whether a weapon was selected, the
+/// menu was closed, or nothing happened this frame.  The caller must call
+/// `egui_macroquad::draw()` after this function returns.
+pub fn draw_weapon_menu_egui(
+    ctx: &egui::Context,
+    selected_weapon: Weapon,
+    active_category: &mut WeaponCategory,
+) -> WeaponMenuResult {
     let sw = screen_width();
     let sh = screen_height();
-    let layout = WeaponMenuLayout::new();
-    let menu_x = layout.menu_x;
-    let menu_y = layout.menu_y;
-    let menu_w = layout.menu_w;
-    let menu_h = layout.menu_h;
-    let is_mobile = layout.is_mobile;
-    let dpi = layout.dpi;
-    
-    // Dark overlay
-    draw_rectangle(0.0, 0.0, sw, sh, Color::new(0.0, 0.0, 0.0, 0.75));
-    
-    // Modern rounded panel with shadow
-    for i in 0..4 {
-        let offset = (4 - i) as f32;
-        draw_rectangle(
-            menu_x + offset,
-            menu_y + offset,
-            menu_w,
-            menu_h,
-            Color::new(0.0, 0.0, 0.0, 0.15 * (i as f32 + 1.0)),
-        );
-    }
-    
-    // Main panel
-    draw_rectangle(menu_x, menu_y, menu_w, menu_h, Color::new(0.08, 0.1, 0.14, 0.98));
-    draw_rectangle(menu_x, menu_y, menu_w, 2.0, Color::new(0.3, 0.6, 0.9, 0.8));
-    draw_rectangle_lines(menu_x, menu_y, menu_w, menu_h, 2.0, Color::new(0.25, 0.45, 0.65, 0.9));
-    
-    // Header
-    let header_h = layout.header_h;
-    draw_rectangle(menu_x, menu_y, menu_w, header_h, Color::new(0.12, 0.15, 0.2, 1.0));
-    draw_rectangle(menu_x, menu_y + header_h, menu_w, 1.0, Color::new(0.3, 0.5, 0.7, 0.5));
-    
-    let title = "WEAPONS";
-    let title_size = if is_mobile { 18.0 } else { 22.0 };
-    let title_w = measure_text(title, None, title_size as u16, 1.0).width;
-    draw_text(
-        title,
-        menu_x + menu_w / 2.0 - title_w / 2.0,
-        menu_y + layout.title_h - 12.0,
-        title_size,
-        Color::new(0.9, 0.95, 1.0, 1.0),
-    );
+    let is_mobile = sw < 600.0 || sh < 700.0;
 
-    // Search bar
-    let sb_x = menu_x + layout.padding;
-    let sb_w = menu_w - layout.padding * 2.0;
-    let sb_y = layout.search_bar_y;
-    let sb_h = layout.search_bar_h;
-    let is_searching = !search.is_empty();
-    draw_rectangle(sb_x, sb_y, sb_w, sb_h, Color::new(0.06, 0.08, 0.12, 0.95));
-    let border_color = if is_searching {
-        Color::new(0.4, 0.65, 1.0, 0.9)
+    // Menu dimensions — match the old layout so nothing looks jarring.
+    let menu_w = if is_mobile { sw * 0.97 } else { 520.0_f32.min(sw * 0.85) };
+    let controls_reserved = if is_mobile { 225.0_f32 } else { 0.0_f32 };
+    let menu_h = if is_mobile {
+        (sh - 50.0 - controls_reserved).max(200.0)
     } else {
-        Color::new(0.2, 0.3, 0.48, 0.7)
+        620.0_f32.min(sh * 0.85)
     };
-    draw_rectangle_lines(sb_x, sb_y, sb_w, sb_h, 1.5, border_color);
-    let search_text_size = if is_mobile { 13.0 } else { 15.0 };
-    let cursor_on = (get_time() % 1.0) < 0.6;
-    let (display_text, text_color) = if !is_searching {
-        ("/  search weapons...".to_string(), Color::new(0.35, 0.4, 0.52, 0.65))
-    } else if cursor_on {
-        (format!("/  {}|", search), Color::new(0.9, 0.95, 1.0, 1.0))
-    } else {
-        (format!("/  {}", search), Color::new(0.9, 0.95, 1.0, 1.0))
-    };
-    draw_text(
-        &display_text,
-        sb_x + 8.0,
-        sb_y + sb_h * 0.5 + search_text_size * 0.38,
-        search_text_size,
-        text_color,
+    let menu_x = sw / 2.0 - menu_w / 2.0;
+    let menu_y = if is_mobile { 50.0 } else { sh / 2.0 - menu_h / 2.0 };
+
+    // ── Visuals ───────────────────────────────────────────────────────────────
+    let mut visuals = egui::Visuals::dark();
+    visuals.window_fill         = egui::Color32::from_rgb(20, 25, 36);
+    visuals.panel_fill          = egui::Color32::from_rgb(20, 25, 36);
+    visuals.extreme_bg_color    = egui::Color32::from_rgb(13, 16, 23);
+    // Default widget backgrounds
+    visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(20, 25, 36);
+    visuals.widgets.inactive.bg_fill       = egui::Color32::from_rgb(28, 36, 52);
+    visuals.widgets.hovered.bg_fill        = egui::Color32::from_rgb(38, 60, 90);
+    visuals.widgets.active.bg_fill         = egui::Color32::from_rgb(48, 105, 130);
+    // Category tab "selected" colour
+    visuals.selection.bg_fill   = egui::Color32::from_rgb(45, 110, 80);
+    visuals.selection.stroke    = egui::Stroke::new(1.0, egui::Color32::from_rgb(77, 220, 127));
+    visuals.window_stroke       = egui::Stroke::new(2.0, egui::Color32::from_rgb(64, 115, 166));
+    visuals.window_corner_radius = egui::CornerRadius::same(6);
+    ctx.set_visuals(visuals);
+
+    // ── Text styles ───────────────────────────────────────────────────────────
+    let body_size   = if is_mobile { 14.0 } else { 15.0 };
+    let button_size = if is_mobile { 12.5 } else { 13.5 };
+    let mut style = (*ctx.style()).clone();
+    style.text_styles.insert(
+        egui::TextStyle::Body,
+        egui::FontId::proportional(body_size),
     );
+    style.text_styles.insert(
+        egui::TextStyle::Button,
+        egui::FontId::proportional(button_size),
+    );
+    style.text_styles.insert(
+        egui::TextStyle::Small,
+        egui::FontId::proportional(11.0),
+    );
+    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    style.spacing.item_spacing   = egui::vec2(4.0, 3.0);
+    ctx.set_style(style);
 
-    // Content area dimensions
-    let content_y = layout.content_y;
-    let content_h = layout.content_h;
-    let padding = layout.padding;
-    let item_h = layout.item_h;
-    let cat_header_h = layout.cat_header_h;
-    let item_padding = layout.item_padding;
-    let cat_spacing = layout.cat_spacing;
-    
-    // Organize weapons by category (with optional search filter)
-    let sq = search.to_lowercase();
-    let all_weapons = Weapon::all();
-    let mut by_category: std::collections::HashMap<WeaponCategory, Vec<&Weapon>> = std::collections::HashMap::new();
-    for w in all_weapons {
-        if sq.is_empty() || w.name().to_lowercase().contains(&sq) || w.description().to_lowercase().contains(&sq) {
-            by_category.entry(w.category()).or_insert_with(Vec::new).push(w);
-        }
-    }
-    
-    let categories = [
-        WeaponCategory::Explosives,
-        WeaponCategory::Ballistics,
-        WeaponCategory::Special,
-        WeaponCategory::Utilities,
-    ];
-    
-    // Enable scissor clipping for the scrollable content area.
-    // IMPORTANT: flush the pending draw batch before changing scissor state, otherwise
-    // macroquad applies the new scissor retroactively to queued header/overlay draws.
-    // Scissor coordinates must be in PHYSICAL pixels; drawing coords are CSS px.
-    let phys_clip_x = (menu_x * dpi) as i32;
-    let phys_clip_sy = ((sh - (content_y + content_h)) * dpi) as i32; // GL: bottom-left origin
-    let phys_clip_w = (menu_w * dpi) as i32;
-    let phys_clip_h = (content_h * dpi) as i32;
-    unsafe {
-        let mut gl = get_internal_gl();
-        gl.flush();
-        gl.quad_gl.scissor(Some((phys_clip_x, phys_clip_sy, phys_clip_w, phys_clip_h)));
-    }
+    let mut result = WeaponMenuResult::None;
 
-    // No-results message
-    let has_results = categories.iter().any(|cat| by_category.get(cat).map_or(false, |v| !v.is_empty()));
-    if !has_results && !sq.is_empty() {
-        let msg = "No weapons found";
-        let msg_size = if is_mobile { 14.0 } else { 16.0 };
-        let msg_w = measure_text(msg, None, msg_size as u16, 1.0).width;
-        draw_text(
-            msg,
-            menu_x + menu_w / 2.0 - msg_w / 2.0,
-            content_y + content_h / 2.0 + msg_size / 2.0,
-            msg_size,
-            Color::new(0.45, 0.5, 0.6, 0.8),
-        );
-    }
+    egui::Window::new("weapon_menu")
+        .title_bar(false)
+        .resizable(false)
+        .collapsible(false)
+        .fixed_pos([menu_x, menu_y])
+        .fixed_size([menu_w, menu_h])
+        .frame(
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(20, 25, 36))
+                .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(64, 115, 166)))
+                .inner_margin(egui::Margin::same(0))
+                .corner_radius(egui::CornerRadius::same(6)),
+        )
+        .show(ctx, |ui| {
+            // ── Header ────────────────────────────────────────────────────────
+            let header_h = if is_mobile { 40.0 } else { 48.0 };
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(15, 20, 30))
+                .inner_margin(egui::Margin::symmetric(12, 0))
+                .show(ui, |ui| {
+                    ui.set_min_width(menu_w);
+                    ui.set_min_height(header_h);
+                    ui.horizontal_centered(|ui| {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new("\u{2694}  WEAPONS")
+                                .size(if is_mobile { 17.0 } else { 20.0 })
+                                .color(egui::Color32::from_rgb(230, 240, 255))
+                                .strong(),
+                        ));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let close_btn = egui::Button::new(
+                                egui::RichText::new("\u{2715}")
+                                    .size(14.0)
+                                    .color(egui::Color32::from_rgb(180, 190, 210)),
+                            )
+                            .fill(egui::Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::NONE);
+                            if ui.add(close_btn).clicked() {
+                                result = WeaponMenuResult::Close;
+                            }
+                        });
+                    });
+                });
 
-    let mut current_y = content_y + 4.0 - scroll_offset; // 4px initial top padding
-    
-    for cat in &categories {
-        if let Some(weapons) = by_category.get(cat) {
-            if weapons.is_empty() { continue; }
-            // Category header
-            let cat_y = current_y;
-            
-            if cat_y + cat_header_h > content_y - 10.0 && cat_y < content_y + content_h + 10.0 {
-                draw_rectangle(
-                    menu_x + padding,
-                    cat_y,
-                    menu_w - padding * 2.0,
-                    cat_header_h,
-                    Color::new(0.15, 0.2, 0.28, 0.8),
-                );
-                
-                let cat_size = if is_mobile { 12.0 } else { 14.0 };
-                draw_text(
-                    cat.name(),
-                    menu_x + padding + 8.0,
-                    cat_y + cat_header_h - 6.0,
-                    cat_size,
-                    Color::new(0.7, 0.8, 0.95, 1.0),
-                );
-            }
-            
-            current_y += cat_header_h + item_padding;
-            
-            // Weapon items
-            for w in weapons {
-                let item_y = current_y;
-                let item_x = menu_x + padding;
-                let item_w = menu_w - padding * 2.0;
-                
-                if item_y + item_h > content_y - 10.0 && item_y < content_y + content_h + 10.0 {
-                    let is_selected = **w == selected_weapon;
-                    
-                    let bg_color = if is_selected {
-                        Color::new(0.2, 0.45, 0.35, 0.95)
-                    } else {
-                        Color::new(0.12, 0.14, 0.18, 0.7)
-                    };
-                    
-                    draw_rectangle(item_x, item_y, item_w, item_h, bg_color);
-                    
-                    if is_selected {
-                        draw_rectangle_lines(item_x, item_y, item_w, item_h, 2.0, Color::new(0.3, 0.9, 0.5, 1.0));
-                        draw_rectangle_lines(item_x - 1.0, item_y - 1.0, item_w + 2.0, item_h + 2.0, 1.0, Color::new(0.5, 1.0, 0.7, 0.5));
-                    } else {
-                        draw_rectangle_lines(item_x, item_y, item_w, item_h, 1.0, Color::new(0.25, 0.28, 0.35, 0.7));
-                    }
-                    
-                    // Weapon icon
-                    let icon_size = if is_mobile { 16.0 } else { 20.0 };
-                    let icon_x = item_x + 8.0;
-                    draw_text(
-                        w.icon(),
-                        icon_x,
-                        item_y + item_h / 2.0 + icon_size / 3.0,
-                        icon_size,
-                        Color::new(1.0, 1.0, 1.0, 1.0),
-                    );
-                    
-                    // Weapon name — vertically centred in item
-                    let name_x = icon_x + if is_mobile { 26.0 } else { 32.0 };
-                    let name_size = if is_mobile { 15.0 } else { 17.0 };
-                    let name_y = if is_mobile {
-                        // On mobile: show name only, centred; show description below if selected
-                        item_y + item_h / 2.0 + name_size * 0.35
-                    } else {
-                        item_y + item_h / 2.0 + name_size * 0.35
-                    };
-                    draw_text(
-                        w.name(),
-                        name_x,
-                        name_y,
-                        name_size,
-                        if is_selected {
-                            Color::new(1.0, 1.0, 1.0, 1.0)
-                        } else {
-                            Color::new(0.85, 0.88, 0.95, 1.0)
-                        },
-                    );
+            ui.add(egui::Separator::default().spacing(0.0));
 
-                    if is_mobile {
-                        // Mobile: show a short description line below name when selected
-                        if is_selected {
-                            let desc_size = 10.0;
-                            draw_text(
+            // ── Category tabs ─────────────────────────────────────────────────
+            let cats = [
+                WeaponCategory::Explosives,
+                WeaponCategory::Ballistics,
+                WeaponCategory::Special,
+                WeaponCategory::Utilities,
+            ];
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(18, 23, 34))
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.set_min_width(menu_w);
+                    ui.horizontal_wrapped(|ui| {
+                        for cat in &cats {
+                            let is_active = *active_category == *cat;
+                            let label = egui::RichText::new(cat.name())
+                                .size(if is_mobile { 12.0 } else { 13.0 })
+                                .color(if is_active {
+                                    egui::Color32::from_rgb(120, 230, 160)
+                                } else {
+                                    egui::Color32::from_rgb(155, 170, 195)
+                                });
+                            if ui.add(egui::SelectableLabel::new(is_active, label)).clicked() {
+                                *active_category = *cat;
+                            }
+                        }
+                    });
+                });
+
+            ui.add(egui::Separator::default().spacing(0.0));
+
+            // ── Weapon list ───────────────────────────────────────────────────
+            let item_h    = if is_mobile { 46.0_f32 } else { 52.0_f32 };
+            let name_size = if is_mobile { 14.5 } else { 15.5 };
+            let desc_size = if is_mobile { 10.5 } else { 11.5 };
+            let icon_size = if is_mobile { 14.0 } else { 15.0 };
+
+            let weapons: Vec<Weapon> = Weapon::all()
+                .iter()
+                .filter(|w| w.category() == *active_category)
+                .cloned()
+                .collect();
+
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .id_source("weapon_list")
+                .show(ui, |ui| {
+                    ui.set_min_width(menu_w);
+                    for w in weapons {
+                        let is_selected = w == selected_weapon;
+                        let avail_w = ui.available_width();
+                        let (rect, response) = ui.allocate_exact_size(
+                            egui::vec2(avail_w, item_h),
+                            egui::Sense::click(),
+                        );
+                        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+
+                        if ui.is_rect_visible(rect) {
+                            let bg = if is_selected {
+                                egui::Color32::from_rgb(38, 88, 62)
+                            } else if response.hovered() {
+                                egui::Color32::from_rgb(28, 48, 72)
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            ui.painter().rect_filled(rect, 0.0, bg);
+
+                            // Green accent bar on left edge for selected weapon
+                            if is_selected {
+                                let accent_rect = egui::Rect::from_min_size(
+                                    rect.min,
+                                    egui::vec2(3.0, item_h),
+                                );
+                                ui.painter().rect_filled(
+                                    accent_rect,
+                                    0.0,
+                                    egui::Color32::from_rgb(77, 200, 120),
+                                );
+                                ui.painter().rect_stroke(
+                                    rect.shrink(1.0),
+                                    egui::CornerRadius::same(2),
+                                    egui::Stroke::new(
+                                        1.0,
+                                        egui::Color32::from_rgba_unmultiplied(77, 200, 120, 60),
+                                    ),
+                                    egui::StrokeKind::Middle,
+                                );
+                            }
+
+                            let icon_x  = rect.left() + 12.0;
+                            let text_x  = icon_x + (if is_mobile { 28.0 } else { 32.0 });
+                            let name_y  = rect.top() + item_h * 0.31;
+                            let desc_y  = rect.top() + item_h * 0.60;
+
+                            // Icon (monospace keeps alignment consistent across symbols)
+                            ui.painter().text(
+                                egui::pos2(icon_x, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                w.icon(),
+                                egui::FontId::monospace(icon_size),
+                                egui::Color32::from_rgb(195, 210, 230),
+                            );
+
+                            // Weapon name
+                            let name_color = if is_selected {
+                                egui::Color32::from_rgb(130, 245, 170)
+                            } else {
+                                egui::Color32::from_rgb(220, 228, 240)
+                            };
+                            ui.painter().text(
+                                egui::pos2(text_x, name_y),
+                                egui::Align2::LEFT_TOP,
+                                w.name(),
+                                egui::FontId::proportional(name_size),
+                                name_color,
+                            );
+
+                            // Description
+                            ui.painter().text(
+                                egui::pos2(text_x, desc_y),
+                                egui::Align2::LEFT_TOP,
                                 w.description(),
-                                name_x,
-                                item_y + item_h - 8.0,
-                                desc_size,
-                                Color::new(0.6, 0.85, 0.7, 0.9),
+                                egui::FontId::proportional(desc_size),
+                                egui::Color32::from_rgb(115, 130, 158),
+                            );
+
+                            // Subtle row divider
+                            ui.painter().hline(
+                                rect.left()..=rect.right(),
+                                rect.bottom(),
+                                egui::Stroke::new(
+                                    0.5,
+                                    egui::Color32::from_rgba_unmultiplied(60, 80, 110, 80),
+                                ),
                             );
                         }
-                    } else {
-                        // Desktop: always show description + stats badges
-                        let desc_size = 12.0;
-                        draw_text(
-                            w.description(),
-                            name_x,
-                            item_y + 42.0,
-                            desc_size,
-                            Color::new(0.55, 0.6, 0.7, 0.95),
-                        );
 
-                        let stats_x = item_x + item_w - 120.0;
-                        let badge_y = item_y + 16.0;
-                        let badge_w = 52.0;
-                        let badge_h = 24.0;
-                        let badge_spacing = 4.0;
-
-                        if w.base_damage() > 0 {
-                            draw_rectangle(stats_x, badge_y, badge_w, badge_h, Color::new(0.7, 0.2, 0.2, 0.7));
-                            let dmg_text = format!("{}", w.base_damage());
-                            let dmg_w = measure_text(&dmg_text, None, desc_size as u16, 1.0).width;
-                            draw_text(&dmg_text, stats_x + badge_w / 2.0 - dmg_w / 2.0, badge_y + badge_h - 5.0, desc_size, WHITE);
-                        }
-                        if w.explosion_radius() > 0.0 {
-                            draw_rectangle(stats_x + badge_w + badge_spacing, badge_y, badge_w, badge_h, Color::new(0.2, 0.4, 0.7, 0.7));
-                            let rad_text = format!("{:.0}", w.explosion_radius());
-                            let rad_w = measure_text(&rad_text, None, desc_size as u16, 1.0).width;
-                            draw_text(&rad_text, stats_x + badge_w + badge_spacing + badge_w / 2.0 - rad_w / 2.0, badge_y + badge_h - 5.0, desc_size, WHITE);
+                        if response.clicked() {
+                            result = WeaponMenuResult::Select(w);
                         }
                     }
-                }
-                
-                current_y += item_h + item_padding;
-            }
-            
-            current_y += cat_spacing;
-        }
+                });
+
+            // ── Footer hint ───────────────────────────────────────────────────
+            ui.add(egui::Separator::default().spacing(0.0));
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(15, 18, 26))
+                .inner_margin(egui::Margin::symmetric(0, 6))
+                .show(ui, |ui| {
+                    ui.set_min_width(menu_w);
+                    ui.vertical_centered(|ui| {
+                        let hint = if is_mobile {
+                            "Tap to select  \u{2022}  Swipe to scroll  \u{2022}  Tap outside to close"
+                        } else {
+                            "Click to select  \u{2022}  Scroll to browse  \u{2022}  ESC to close"
+                        };
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(hint)
+                                .size(if is_mobile { 10.0 } else { 11.5 })
+                                .color(egui::Color32::from_rgb(95, 110, 138)),
+                        ));
+                    });
+                });
+        });
+
+    // Close when the user clicks anywhere outside the menu window.
+    if ctx.input(|i| i.pointer.any_click()) && !ctx.is_pointer_over_area() {
+        result = WeaponMenuResult::Close;
     }
-    
-    // Flush scissored draws, then disable scissor before drawing scrollbar + footer.
-    unsafe {
-        let mut gl = get_internal_gl();
-        gl.flush();
-        gl.quad_gl.scissor(None);
+
+    // Close on Escape.
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        result = WeaponMenuResult::Close;
     }
-    
-    // Scrollbar
-    let max_scroll = layout.max_scroll(search);
-    if max_scroll > 0.0 {
-        let track_w = 6.0;
-        let track_x = menu_x + menu_w - track_w - 4.0;
-        let track_y = content_y;
-        let track_h = content_h;
-        
-        draw_rectangle(track_x, track_y, track_w, track_h, Color::new(0.15, 0.18, 0.22, 0.6));
-        
-        let visible_ratio = (content_h / layout.total_content_height(search)).min(1.0);
-        let thumb_h = (track_h * visible_ratio).max(24.0);
-        let scroll_ratio = scroll_offset / max_scroll;
-        let thumb_y = track_y + scroll_ratio * (track_h - thumb_h);
-        draw_rectangle(track_x, thumb_y, track_w, thumb_h, Color::new(0.5, 0.6, 0.8, 0.8));
-    }
-    
-    // Footer with hints
-    let footer_h = layout.footer_h;
-    let footer_y = menu_y + menu_h - footer_h;
-    draw_rectangle(menu_x, footer_y, menu_w, footer_h, Color::new(0.1, 0.12, 0.16, 1.0));
-    draw_rectangle(menu_x, footer_y, menu_w, 1.0, Color::new(0.3, 0.5, 0.7, 0.4));
-    
-    let hint = if is_mobile {
-        "Tap to select  •  Swipe to scroll  •  Tap outside to close"
-    } else {
-        "Click to select • Scroll to browse • TAB/ESC to close"
-    };
-    let hint_size = if is_mobile { 11.0 } else { 13.0 };
-    let hint_w = measure_text(hint, None, hint_size as u16, 1.0).width;
-    draw_text(
-        hint,
-        menu_x + menu_w / 2.0 - hint_w / 2.0,
-        footer_y + footer_h - 10.0,
-        hint_size,
-        Color::new(0.6, 0.65, 0.75, 0.95),
-    );
+
+    result
 }
+
+
 
 pub fn draw_ball_world(balls: &[Ball], current_ball: usize) {
     for (i, ball) in balls.iter().enumerate() {

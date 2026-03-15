@@ -32,8 +32,6 @@ export class Lobby implements DurableObject {
   private gameId: string | null = null;
   private gamePlayerOrder: { playerId: string; isBot: boolean; name: string }[] = [];
   private rngSeed: number = 0;
-  private sockets: Map<string, WebSocket> = new Map();
-  private playerIdToSocket: Map<string, string> = new Map();
 
   constructor(state: DurableObjectState, env: Record<string, unknown>) {
     this.state = state;
@@ -171,6 +169,7 @@ export class Lobby implements DurableObject {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     this.state.acceptWebSocket(server);
+    server.serializeAttachment({ playerId });
     const incomingName = (playerName ?? "").trim().slice(0, 32);
     const isPlaceholder = !incomingName || incomingName === "…" || incomingName === "...";
     const existing = this.players.find((p) => p.id === playerId);
@@ -184,8 +183,6 @@ export class Lobby implements DurableObject {
         isBot: false,
       });
     }
-    this.sockets.set(playerId, server);
-    this.playerIdToSocket.set(playerId, playerId);
     await this.persist();
     this.broadcast({ type: "player_list", players: [...this.players] });
     return new Response(null, { status: 101, webSocket: client });
@@ -206,11 +203,12 @@ export class Lobby implements DurableObject {
   /** Send to all connected clients. Used for real-time lobby state (player_list on join/leave/rename/bots). */
   private broadcast(msg: { type: string; [k: string]: unknown }): void {
     const data = JSON.stringify(msg);
-    for (const [pid, ws] of this.sockets) {
+    for (const ws of this.state.getWebSockets()) {
       try {
         ws.send(data);
       } catch (e) {
-        console.warn("[Lobby] Broadcast failed for", pid, e);
+        const att = ws.deserializeAttachment() as { playerId: string } | null;
+        console.warn("[Lobby] Broadcast failed for", att?.playerId, e);
       }
     }
   }
@@ -221,20 +219,21 @@ export class Lobby implements DurableObject {
   }
 
   private sendTo(playerId: string, msg: { type: string; [k: string]: unknown }): void {
-    const ws = this.sockets.get(playerId);
-    if (ws) ws.send(JSON.stringify(msg));
+    const data = JSON.stringify(msg);
+    for (const ws of this.state.getWebSockets()) {
+      const att = ws.deserializeAttachment() as { playerId: string } | null;
+      if (att?.playerId === playerId) {
+        try { ws.send(data); } catch (e) { console.warn("[Lobby] Send failed for", playerId, e); }
+        break;
+      }
+    }
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const data = typeof message === "string" ? message : new TextDecoder().decode(message);
-    let playerId: string | null = null;
-    for (const [pid, s] of this.sockets) {
-      if (s === ws) {
-        playerId = pid;
-        break;
-      }
-    }
-    if (!playerId) return;
+    const att = ws.deserializeAttachment() as { playerId: string } | null;
+    if (!att) return;
+    const playerId = att.playerId;
     try {
       const msg = JSON.parse(data) as { type: string; ready?: boolean; playerId?: string; playerName?: string };
       if (msg.type === "get_player_list") {
@@ -273,6 +272,23 @@ export class Lobby implements DurableObject {
         this.rngSeed = Math.floor(Math.random() * 0xFFFFFFFF);
         await this.persist();
         this.broadcast({ type: "game_started", gameId, playerOrder: this.gamePlayerOrder, rngSeed: this.rngSeed, hostId: this.hostId });
+        // Delete the join code from Registry so the slot is freed immediately
+        try {
+          const registry = (this.env as { REGISTRY?: DurableObjectNamespace }).REGISTRY;
+          if (registry) {
+            registry.get(registry.idFromName("default")).fetch(
+              new Request("https://r/delete", {
+                method: "POST",
+                body: JSON.stringify({ code: this.lobbyCode }),
+                headers: { "Content-Type": "application/json" },
+              })
+            ).catch((e) => console.warn("[Lobby] Failed to delete registry code:", e));
+          }
+        } catch (e) {
+          console.warn("[Lobby] Failed to reach registry for code deletion:", e);
+        }
+        // Schedule lobby storage cleanup 60s after game starts — players have moved to the Game DO
+        try { this.state.storage.setAlarm(Date.now() + 60_000); } catch (_) {}
       } else if (msg.type === "add_bot") {
         if (this.hostId !== playerId) {
           this.sendTo(playerId, { type: "error", message: "Only host can add bots" });
@@ -300,16 +316,9 @@ export class Lobby implements DurableObject {
   }
 
   async webSocketClose(ws: WebSocket): Promise<void> {
-    let playerId: string | null = null;
-    for (const [pid, s] of this.sockets) {
-      if (s === ws) {
-        playerId = pid;
-        break;
-      }
-    }
+    const att = ws.deserializeAttachment() as { playerId: string } | null;
+    const playerId = att?.playerId ?? null;
     if (playerId) {
-      this.sockets.delete(playerId);
-      this.playerIdToSocket.delete(playerId);
       // Only remove from lobby list and broadcast when game hasn't started (tab close / disconnect)
       if (!this.started) {
         this.players = this.players.filter((p) => p.id !== playerId);
@@ -317,5 +326,10 @@ export class Lobby implements DurableObject {
         this.broadcast({ type: "player_list", players: [...this.players] });
       }
     }
+  }
+
+  /** Delete all lobby storage once the game is underway to free DO resources. */
+  async alarm(): Promise<void> {
+    await this.state.storage.deleteAll();
   }
 }

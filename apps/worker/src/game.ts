@@ -36,7 +36,6 @@ export class Game implements DurableObject {
     terrainId: 0,
     globalTurnNumber: 0,
   };
-  private sockets: Map<string, WebSocket> = new Map();
   private playerIdToIndex: Map<string, number> = new Map();
   /** Accumulated terrain damage events [[cx,cy,r], ...] for replay on reconnect */
   private terrainDamageLog: number[][] = [];
@@ -58,8 +57,6 @@ export class Game implements DurableObject {
   private lastAimPerPlayer: Map<string, number> = new Map();
   /** When we last received input/ball_state/end_turn from the active player (for terrain fallback) */
   private lastActivePlayerActivity: number = 0;
-  /** Timer handle for the 1-second turn-authority heartbeat */
-  private heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(state: DurableObjectState, _env: unknown) {
     this.state = state;
@@ -142,7 +139,10 @@ export class Game implements DurableObject {
     this.lastBallPerTeam = Array.from({ length: this.gameState.playerOrder.length }, () => undefined);
     if (typeof body.hostId === "string") this.hostId = body.hostId;
     // Send identity to all already-connected sockets (they connected before /init was called)
-    for (const [pid, ws] of this.sockets) {
+    for (const ws of this.state.getWebSockets()) {
+      const att = ws.deserializeAttachment() as { playerId: string } | null;
+      const pid = att?.playerId;
+      if (!pid) continue;
       const idx = this.playerIdToIndex.get(pid);
       if (idx !== undefined) {
         try {
@@ -164,7 +164,6 @@ export class Game implements DurableObject {
     }
     this.phaseStartTime = Date.now();
     this.scheduleWatchdog();
-    this.scheduleHeartbeat();
     this.persistState();
     return Response.json({ ok: true });
   }
@@ -196,8 +195,8 @@ export class Game implements DurableObject {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     this.state.acceptWebSocket(server);
+    server.serializeAttachment({ playerId });
     // Reconnecting with same playerId takes back that slot (we never remove from playerOrder on disconnect)
-    this.sockets.set(playerId, server);
     
     // Send authoritative player identity and game seed
     const myPlayerIndex = this.playerIdToIndex.get(playerId);
@@ -263,11 +262,12 @@ export class Game implements DurableObject {
       }
     }
     const data = JSON.stringify(msg);
-    for (const [pid, ws] of this.sockets) {
+    for (const ws of this.state.getWebSockets()) {
       try {
         ws.send(data);
       } catch (e) {
-        console.warn("[Game] Broadcast failed for", pid, e);
+        const att = ws.deserializeAttachment() as { playerId: string } | null;
+        console.warn("[Game] Broadcast failed for", att?.playerId, e);
       }
     }
   }
@@ -370,52 +370,30 @@ export class Game implements DurableObject {
     });
     this.broadcast({ type: "state", state: this.gameState });
     this.scheduleWatchdog();
-    this.scheduleHeartbeat();
     this.persistState();
   }
 
-  /** Schedule a Cloudflare DO alarm to fire when the current turn/phase should time out.
+  /** Schedule a Cloudflare DO alarm to fire when the current turn/phase should time out,
+   *  or in 1 second for the heartbeat tick — whichever is sooner.
    *  Silently ignored in environments that don't support alarms (local dev). */
   private scheduleWatchdog(): void {
+    if (this.gameState.playerOrder.length === 0 || this.gameState.phase === "game_over") return;
     const deadline =
       this.gameState.phase === "projectile"
         ? this.phaseStartTime + PROJECTILE_TIMEOUT_MS
         : this.gameState.turnEndTime + WATCHDOG_GRACE_MS;
+    // Fire at most every second (heartbeat) or at the watchdog deadline, whichever is sooner.
+    // This lets the DO hibernate between ticks instead of keeping a live setTimeout.
+    const nextAlarm = Math.min(deadline, Date.now() + 1000);
     try {
-      this.state.storage.setAlarm(deadline);
+      this.state.storage.setAlarm(nextAlarm);
     } catch (_) {
       // setAlarm may not be available in all environments — fail silently
     }
   }
 
-  /** Schedule the 1-second turn-authority heartbeat.
-   *  Safe to call multiple times — re-entrant calls are ignored. */
-  private scheduleHeartbeat(): void {
-    if (this.heartbeatTimer !== null) return;
-    this.heartbeatTimer = setTimeout(() => {
-      this.heartbeatTimer = null;
-      this.sendHeartbeat();
-    }, 1000);
-  }
-
-  /** Broadcast the server's authoritative turn state to all clients so they can
-   *  reconcile any local confusion about whose turn it is. */
-  private sendHeartbeat(): void {
-    if (this.gameState.phase === "game_over" || this.gameState.playerOrder.length === 0) {
-      return; // Nothing to broadcast after game ends or before init
-    }
-    const turnTimeRemainingMs = Math.max(0, this.gameState.turnEndTime - Date.now());
-    this.broadcast({
-      type: "current_turn",
-      currentTurnIndex: this.gameState.currentTurnIndex,
-      turnNumber: this.gameState.globalTurnNumber ?? 0,
-      turnTimeRemainingMs,
-      phase: this.gameState.phase,
-    });
-    this.scheduleHeartbeat(); // Keep it running
-  }
-
-  /** Cloudflare DO alarm handler — fires when a scheduled watchdog deadline hits.
+  /** Cloudflare DO alarm handler — fires when a scheduled watchdog deadline hits or
+   *  every ~1 second as a turn-authority heartbeat (whichever is sooner).
    *  Forces the game forward if it has stalled (frozen client, disconnected player, etc.) */
   async alarm(): Promise<void> {
     const now = Date.now();
@@ -429,7 +407,7 @@ export class Game implements DurableObject {
         this.broadcast({ type: "force_advance", reason: "projectile_timeout" });
         this.advanceTurnAndMaybeBot();
       } else {
-        // Not yet expired — re-arm
+        // Not yet expired — re-arm (also reschedules next heartbeat)
         this.scheduleWatchdog();
       }
       return;
@@ -442,7 +420,15 @@ export class Game implements DurableObject {
       return;
     }
 
-    // Turn hasn't expired yet (e.g. alarm fired early) — re-arm for when it should
+    // Watchdog hasn't fired yet — send heartbeat and re-arm for next tick
+    const turnTimeRemainingMs = Math.max(0, this.gameState.turnEndTime - now);
+    this.broadcast({
+      type: "current_turn",
+      currentTurnIndex: this.gameState.currentTurnIndex,
+      turnNumber: this.gameState.globalTurnNumber ?? 0,
+      turnTimeRemainingMs,
+      phase: this.gameState.phase,
+    });
     this.scheduleWatchdog();
   }
 
@@ -654,14 +640,9 @@ export class Game implements DurableObject {
       return;
     }
     const data = typeof message === "string" ? message : new TextDecoder().decode(message);
-    let playerId: string | null = null;
-    for (const [pid, s] of this.sockets) {
-      if (s === ws) {
-        playerId = pid;
-        break;
-      }
-    }
-    if (!playerId) return;
+    const att = ws.deserializeAttachment() as { playerId: string } | null;
+    if (!att) return;
+    const playerId = att.playerId;
     const idx = this.playerIdToIndex.get(playerId);
     if (idx === undefined) return;
 
@@ -705,12 +686,13 @@ export class Game implements DurableObject {
           this.persistState();
           // Forward to all OTHER clients as terrain_sync so they stay in sync
           const syncMsg = JSON.stringify({ type: "terrain_sync", log: dmgMsg.log });
-          for (const [pid, sock] of this.sockets) {
-            if (pid !== playerId) {
+          for (const sock of this.state.getWebSockets()) {
+            const sockAtt = sock.deserializeAttachment() as { playerId: string } | null;
+            if (sockAtt?.playerId !== playerId) {
               try {
                 sock.send(syncMsg);
               } catch (e) {
-                console.warn("[Game] terrain_sync send failed for", pid, e);
+                console.warn("[Game] terrain_sync send failed for", sockAtt?.playerId, e);
               }
             }
           }
@@ -764,7 +746,6 @@ export class Game implements DurableObject {
           }
           // Relay to other clients for position/health sync
           this.broadcast(parsed as { type: string; [k: string]: unknown });
-          this.persistState();
         }
         return;
       }
@@ -805,7 +786,6 @@ export class Game implements DurableObject {
           this.broadcast({ type: "restart", seed });
           this.broadcast({ type: "state", state: this.gameState });
           this.scheduleWatchdog();
-          this.scheduleHeartbeat();
           this.persistState();
           return;
         }
@@ -960,13 +940,7 @@ export class Game implements DurableObject {
   }
 
   async webSocketClose(_ws: WebSocket): Promise<void> {
-    let pid: string | null = null;
-    for (const [id, s] of this.sockets) {
-      if (s === _ws) {
-        pid = id;
-        break;
-      }
-    }
-    if (pid) this.sockets.delete(pid);
+    // The closed socket is automatically removed from state.getWebSockets().
+    // No cleanup needed since we no longer maintain an in-memory sockets Map.
   }
 }

@@ -272,6 +272,23 @@ export class Lobby implements DurableObject {
         this.rngSeed = Math.floor(Math.random() * 0xFFFFFFFF);
         await this.persist();
         this.broadcast({ type: "game_started", gameId, playerOrder: this.gamePlayerOrder, rngSeed: this.rngSeed, hostId: this.hostId });
+        // Delete the join code from Registry so the slot is freed immediately
+        try {
+          const registry = (this.env as { REGISTRY?: DurableObjectNamespace }).REGISTRY;
+          if (registry) {
+            registry.get(registry.idFromName("default")).fetch(
+              new Request("https://r/delete", {
+                method: "POST",
+                body: JSON.stringify({ code: this.lobbyCode }),
+                headers: { "Content-Type": "application/json" },
+              })
+            ).catch((e) => console.warn("[Lobby] Failed to delete registry code:", e));
+          }
+        } catch (e) {
+          console.warn("[Lobby] Failed to reach registry for code deletion:", e);
+        }
+        // Schedule lobby storage cleanup 60s after game starts — players have moved to the Game DO
+        try { this.state.storage.setAlarm(Date.now() + 60_000); } catch (_) {}
       } else if (msg.type === "add_bot") {
         if (this.hostId !== playerId) {
           this.sendTo(playerId, { type: "error", message: "Only host can add bots" });
@@ -309,5 +326,10 @@ export class Lobby implements DurableObject {
         this.broadcast({ type: "player_list", players: [...this.players] });
       }
     }
+  }
+
+  /** Delete all lobby storage once the game is underway to free DO resources. */
+  async alarm(): Promise<void> {
+    await this.state.storage.deleteAll();
   }
 }

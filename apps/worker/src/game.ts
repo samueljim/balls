@@ -22,6 +22,8 @@ const WATCHDOG_GRACE_MS = 1_000;
 const PROJECTILE_TIMEOUT_MS = 12_000;
 /** Max WebSocket message size (chars/bytes) to prevent memory exhaustion */
 const MAX_MESSAGE_SIZE = 100_000;
+/** Minimum ms between pos_update relays per player (20/sec cap) */
+const POS_UPDATE_INTERVAL_MS = 50;
 
 export class Game implements DurableObject {
   private state: DurableObjectState;
@@ -55,6 +57,8 @@ export class Game implements DurableObject {
   private lastInputPerPlayer: Map<string, number> = new Map();
   /** Per-player last aim timestamp (rate-limit: 30/sec) */
   private lastAimPerPlayer: Map<string, number> = new Map();
+  /** Per-player last pos_update timestamp (rate-limit: 20/sec) */
+  private lastPosUpdatePerPlayer: Map<string, number> = new Map();
   /** When we last received input/ball_state/end_turn from the active player (for terrain fallback) */
   private lastActivePlayerActivity: number = 0;
 
@@ -319,6 +323,8 @@ export class Game implements DurableObject {
       this.broadcast({ type: "game_over", winner: winnerName });
       this.gameState.phase = "game_over";
       this.persistState();
+      // Schedule storage cleanup 60s from now (clients have time to see the result)
+      try { this.state.storage.setAlarm(Date.now() + 60_000); } catch (_) {}
       return;
     }
 
@@ -345,6 +351,8 @@ export class Game implements DurableObject {
       this.broadcast({ type: "game_over", winner: winnerName });
       this.gameState.phase = "game_over";
       this.persistState();
+      // Schedule storage cleanup 60s from now (clients have time to see the result)
+      try { this.state.storage.setAlarm(Date.now() + 60_000); } catch (_) {}
       return;
     }
 
@@ -382,9 +390,9 @@ export class Game implements DurableObject {
       this.gameState.phase === "projectile"
         ? this.phaseStartTime + PROJECTILE_TIMEOUT_MS
         : this.gameState.turnEndTime + WATCHDOG_GRACE_MS;
-    // Fire at most every second (heartbeat) or at the watchdog deadline, whichever is sooner.
+    // Fire at most every 5 seconds (heartbeat) or at the watchdog deadline, whichever is sooner.
     // This lets the DO hibernate between ticks instead of keeping a live setTimeout.
-    const nextAlarm = Math.min(deadline, Date.now() + 1000);
+    const nextAlarm = Math.min(deadline, Date.now() + 5_000);
     try {
       this.state.storage.setAlarm(nextAlarm);
     } catch (_) {
@@ -393,13 +401,20 @@ export class Game implements DurableObject {
   }
 
   /** Cloudflare DO alarm handler — fires when a scheduled watchdog deadline hits or
-   *  every ~1 second as a turn-authority heartbeat (whichever is sooner).
-   *  Forces the game forward if it has stalled (frozen client, disconnected player, etc.) */
+   *  every ~5 seconds as a turn-authority heartbeat (whichever is sooner).
+   *  Forces the game forward if it has stalled (frozen client, disconnected player, etc.)
+   *  Also handles post-game storage cleanup. */
   async alarm(): Promise<void> {
     const now = Date.now();
 
     if (this.gameState.playerOrder.length === 0) return; // Game not started
-    if (this.gameState.phase === "game_over") return; // Game ended, no more advances
+
+    // Post-game cleanup: purge all storage once clients have had time to see the result.
+    // deleteAll() also cancels any pending alarms, so the DO will go fully idle.
+    if (this.gameState.phase === "game_over") {
+      await this.state.storage.deleteAll();
+      return;
+    }
 
     if (this.gameState.phase === "projectile") {
       if (now >= this.phaseStartTime + PROJECTILE_TIMEOUT_MS) {
@@ -704,6 +719,10 @@ export class Game implements DurableObject {
       // Also update our persisted snapshots so reconnecting clients get
       // fresh positions, not stale end-of-turn data.
       if (parsed.type === "pos_update") {
+        const posNow = Date.now();
+        const lastPos = this.lastPosUpdatePerPlayer.get(playerId) ?? 0;
+        if (posNow - lastPos < POS_UPDATE_INTERVAL_MS) return; // 20/sec max per player
+        this.lastPosUpdatePerPlayer.set(playerId, posNow);
         const pu = parsed as { bi?: number; x?: number; y?: number; vx?: number; vy?: number };
         const bi = pu.bi;
         if (typeof bi === "number" && bi >= 0 && bi < this.ballSnapshots.length) {

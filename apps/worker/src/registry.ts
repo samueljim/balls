@@ -36,6 +36,14 @@ export class Registry implements DurableObject {
       await this.state.storage.put("codes", Array.from(this.map));
       return Response.json({ ok: true });
     }
+    if (url.pathname === "/delete" && request.method === "POST") {
+      const body = await request.json() as { code: string };
+      if (body.code && this.map.has(body.code)) {
+        this.map.delete(body.code);
+        await this.state.storage.put("codes", Array.from(this.map));
+      }
+      return Response.json({ ok: true });
+    }
     if (url.pathname === "/get" && request.method === "GET") {
       const code = url.searchParams.get("code");
       if (!code) return Response.json({ lobbyId: null });

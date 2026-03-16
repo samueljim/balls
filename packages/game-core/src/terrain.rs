@@ -84,11 +84,18 @@ impl Terrain {
 
     /// Replay a damage log on this terrain (e.g. after regenerating from seed on reconnect)
     pub fn replay_damage(&mut self, log: &[(i32, i32, i32)]) {
-        for &(cx, cy, r) in log {
-            self.apply_damage_no_log(cx, cy, r);
+        // Build a set of already-recorded entries so we can skip duplicates in O(n) time.
+        // Deduplication prevents exponential log growth when terrain_sync / turn_advanced
+        // messages re-apply the same events (re-carving AIR is a no-op visually, but the
+        // duplicate log entries would bloat future sync messages and inflate memory usage).
+        let existing: std::collections::HashSet<(i32, i32, i32)> =
+            self.damage_log.iter().copied().collect();
+        for &entry in log {
+            if !existing.contains(&entry) {
+                self.apply_damage_no_log(entry.0, entry.1, entry.2);
+                self.damage_log.push(entry);
+            }
         }
-        // Store the replayed events so future sends include them
-        self.damage_log.extend_from_slice(log);
     }
 
     /// Regrow grass over any rectangular area (used after drill carvings).

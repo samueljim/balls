@@ -61,6 +61,8 @@ export class Game implements DurableObject {
   private lastPosUpdatePerPlayer: Map<string, number> = new Map();
   /** When we last received input/ball_state/end_turn from the active player (for terrain fallback) */
   private lastActivePlayerActivity: number = 0;
+  /** Player index of the player whose turn just ended (so late terrain_damages from them are accepted) */
+  private previousTurnPlayerIndex: number = -1;
 
   constructor(state: DurableObjectState, _env: unknown) {
     this.state = state;
@@ -313,6 +315,9 @@ export class Game implements DurableObject {
   private advanceTurn(): void {
     const numPlayers = this.gameState.playerOrder.length;
     if (numPlayers === 0) return;
+
+    // Record who just finished their turn so late terrain_damages from them can be accepted
+    this.previousTurnPlayerIndex = this.gameState.currentTurnIndex;
 
     // Check game over before advancing — if we're already down to 0–1 teams, broadcast and stop
     const { count: aliveCount, winner } = this.getAliveTeams();
@@ -686,16 +691,22 @@ export class Game implements DurableObject {
         return;
       }
 
-      // terrain_damages: accept from active player during their turn; if active player has been
-      // silent > 8s (e.g. disconnected), allow from any player to prevent permanent desync.
+      // terrain_damages: accept from active player during their turn; also accept from the
+      // player whose turn just ended (previousTurnPlayerIndex) so that terrain changes during
+      // retreat (e.g. mines firing) are still synced even if the server watchdog advanced
+      // the turn before the client sent its final terrain state.
+      // If active player has been silent > 8s (e.g. disconnected), allow from any player.
       if (parsed.type === "terrain_damages") {
         const dmgMsg = parsed as { type: string; log?: number[][] };
         const isActivePlayer = this.gameState.currentTurnIndex === idx;
+        const isPreviousTurnPlayer = this.previousTurnPlayerIndex === idx && this.previousTurnPlayerIndex >= 0;
         const phaseAllowsTerrain = ["aiming", "charging", "projectile", "settling", "retreat"].includes(this.gameState.phase);
         const activeSilentTooLong = Date.now() - this.lastActivePlayerActivity > 8000;
         const logValid = Array.isArray(dmgMsg.log) && dmgMsg.log.length >= this.terrainDamageLog.length
           && dmgMsg.log.every((e: unknown) => Array.isArray(e) && e.length >= 3 && (e as unknown[]).every((n) => typeof n === "number"));
-        const allowTerrain = (isActivePlayer && phaseAllowsTerrain) || (phaseAllowsTerrain && activeSilentTooLong);
+        // Allow from: current active player (during their turn), the just-ended player
+        // (catching up after a watchdog advance), or any player if active is long silent.
+        const allowTerrain = (isActivePlayer && phaseAllowsTerrain) || isPreviousTurnPlayer || (phaseAllowsTerrain && activeSilentTooLong);
         if (allowTerrain && logValid) {
           this.terrainDamageLog = dmgMsg.log as number[][];
           this.persistState();

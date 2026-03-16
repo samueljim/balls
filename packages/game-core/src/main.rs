@@ -143,6 +143,10 @@ struct Game {
     num_teams: usize,
     /// When we receive turn_advanced during ProjectileFlying/Settling, apply when settling ends
     pending_turn_sync: Option<usize>,
+    /// True when pending_turn_sync was set while it was our turn (e.g. server watchdog fired
+    /// during our retreat). When the deferred sync is applied, we first send terrain_damages
+    /// so the server has our final terrain state before the turn officially advances.
+    pending_sync_send_terrain: bool,
     /// Deferred restart seed
     restart_seed: Option<u32>,
     /// Set after re-connecting so the next `state` message always forces a turn sync
@@ -348,6 +352,7 @@ impl Game {
             current_turn_index: 0,
             num_teams,
             pending_turn_sync: None,
+            pending_sync_send_terrain: false,
             restart_seed: None,
             just_reconnected: false,
             had_network_connection: false,
@@ -417,6 +422,25 @@ impl Game {
         
         // Check if it's our turn
         self.current_turn_index == my_player_index
+    }
+
+    /// Returns true when a deferred turn sync (pending_turn_sync) should also trigger a
+    /// terrain_damages send. This is the case when the server advanced the turn while it
+    /// was our turn (e.g. watchdog firing during our Retreat) — we need to flush our latest
+    /// terrain state so all clients end up with the correct map.
+    ///
+    /// Must be called BEFORE `current_turn_index` is updated (i.e. before the pending sync
+    /// is applied) so that `is_my_turn()` still reflects the turn that is ending.
+    fn should_send_terrain_on_deferred_sync(&self) -> bool {
+        // If we're currently in Retreat, this is definitely our turn ending (non-active
+        // players enter TurnEnd, never Retreat, so Retreat ↔ active player).
+        if matches!(self.phase, Phase::Retreat) {
+            return true;
+        }
+        // For other phases (Settling, ProjectileFlying): check if it's our turn via
+        // the current turn index — this will be correct because current_turn_index has
+        // not been updated yet (the caller should invoke this before updating it).
+        self.is_my_turn()
     }
     
     /// Find the first alive ball for a given team/player
@@ -591,11 +615,15 @@ impl Game {
         if self.phase == Phase::Retreat || self.phase == Phase::ProjectileFlying {
             // During Retreat the active player moves the ball that just fired,
             // which is already stored in current_ball.
+            // Phase::Retreat is only entered when has_fired && is_my_turn() (in the Settling
+            // handler), so we don't need to re-check is_my_turn() here. Checking phase alone
+            // is reliable and avoids the bug where a server watchdog advances current_turn_index
+            // mid-retreat, making is_my_turn() return false and incorrectly blocking movement.
             // During ProjectileFlying the non-active player can also move; use
             // find_ball_for_player so they control one of their own balls.
             let ball_idx_opt = if self.phase == Phase::Retreat {
-                // Only let the local human player retreat their own ball; block bot turns
-                if self.is_my_turn() { Some(self.current_ball) } else { None }
+                // Retreat always belongs to the player who just fired (current_ball)
+                if self.current_ball < self.balls.len() { Some(self.current_ball) } else { None }
             } else if self.net.connected {
                 self.net.my_player_index.and_then(|pi| self.find_ball_for_player(pi))
             } else {
@@ -1889,6 +1917,7 @@ impl Game {
         self.bot_think_timer = 3.0;
         self.stuck_phase_timer = 0.0;
         self.non_active_stuck_timer = 0.0;
+        self.pending_sync_send_terrain = false;
         
         // Reset movement budget for the current ball
         if self.current_ball < self.balls.len() {
@@ -2027,7 +2056,13 @@ impl Game {
                 // The server will also broadcast turn_advanced/state, but we act immediately
                 // so the game visually unsticks even before those messages arrive.
                 match self.phase {
-                    Phase::Aiming | Phase::Charging | Phase::TurnEnd | Phase::Retreat => {
+                    Phase::Retreat => {
+                        // During Retreat, zero the timer so the retreat phase ends on the next
+                        // frame naturally. This lets terrain_damages be sent before the sync is
+                        // applied and preserves any remaining movement for the current frame.
+                        self.retreat_timer = 0.0;
+                    }
+                    Phase::Aiming | Phase::Charging | Phase::TurnEnd => {
                         // Will be overwritten by the coming turn_advanced, but unstick now
                         self.phase = Phase::TurnEnd;
                         self.turn_end_timer = 0.1;
@@ -2074,6 +2109,9 @@ impl Game {
                         let terrain_as_log = msg.replace("\"terrain\":[", "\"log\":[");
                         self.apply_terrain_sync(&terrain_as_log);
                     }
+                    // Capture whether this is still our turn BEFORE updating current_turn_index,
+                    // using the dedicated helper that checks Retreat phase as a reliable signal.
+                    let deferred_was_my_turn = self.should_send_terrain_on_deferred_sync();
                     // Always update our stored turn index
                     self.current_turn_index = player_index;
                     match self.phase {
@@ -2084,6 +2122,10 @@ impl Game {
                             // Defer during Retreat / ProjectileFlying / Settling so we
                             // don't abort an in-progress retreat or mid-flight projectile.
                             self.pending_turn_sync = Some(player_index);
+                            // Remember to send terrain_damages when the deferred sync is applied
+                            // if this advance happened while it was our turn (e.g. watchdog fired
+                            // during our retreat — we need to flush our latest terrain state first).
+                            self.pending_sync_send_terrain = deferred_was_my_turn;
                         }
                     }
                 }
@@ -2109,6 +2151,7 @@ impl Game {
                                 server_turn_index, self.current_turn_index);
                             unsafe { console_log(debug_msg.as_ptr()); }
                         }
+                        let deferred_was_my_turn = self.should_send_terrain_on_deferred_sync();
                         self.current_turn_index = server_turn_index;
                         match self.phase {
                             Phase::Aiming | Phase::Charging | Phase::TurnEnd => {
@@ -2116,6 +2159,7 @@ impl Game {
                             }
                             _ => {
                                 self.pending_turn_sync = Some(server_turn_index);
+                                self.pending_sync_send_terrain = deferred_was_my_turn;
                             }
                         }
                     }
@@ -2159,6 +2203,7 @@ impl Game {
                         }
                     }
                     if should_sync {
+                        let deferred_was_my_turn = self.should_send_terrain_on_deferred_sync();
                         self.current_turn_index = current_turn_index;
                         match self.phase {
                             Phase::Aiming | Phase::Charging | Phase::TurnEnd => {
@@ -2166,6 +2211,7 @@ impl Game {
                             }
                             _ => {
                                 self.pending_turn_sync = Some(current_turn_index);
+                                self.pending_sync_send_terrain = deferred_was_my_turn;
                             }
                         }
                     }
@@ -2930,6 +2976,12 @@ impl Game {
                         unsafe { console_log(msg.as_ptr()); }
                     }
                     if let Some(player_idx) = self.pending_turn_sync.take() {
+                        // Server already advanced the turn (watchdog/early advance).
+                        // Send terrain before syncing so the server has our latest state.
+                        if self.net.connected && self.pending_sync_send_terrain {
+                            self.send_terrain_damages();
+                        }
+                        self.pending_sync_send_terrain = false;
                         self.sync_to_player_turn(player_idx);
                     } else if self.has_fired && self.is_my_turn() {
                         // Send fresh ball state and full terrain ops after settling
@@ -3063,6 +3115,12 @@ impl Game {
                     && self.cluster_bomblets.is_empty();
                 if self.retreat_timer <= 0.0 && retreat_all_done {
                     if let Some(player_idx) = self.pending_turn_sync.take() {
+                        // Server already advanced while we were retreating (watchdog).
+                        // Send terrain so the server has our final map state before syncing.
+                        if self.net.connected && self.pending_sync_send_terrain {
+                            self.send_terrain_damages();
+                        }
+                        self.pending_sync_send_terrain = false;
                         self.sync_to_player_turn(player_idx);
                     } else {
                         self.end_turn();
@@ -3079,6 +3137,10 @@ impl Game {
                     self.proj = None;
                     self.cluster_bomblets.clear();
                     if let Some(player_idx) = self.pending_turn_sync.take() {
+                        if self.net.connected && self.pending_sync_send_terrain {
+                            self.send_terrain_damages();
+                        }
+                        self.pending_sync_send_terrain = false;
                         self.sync_to_player_turn(player_idx);
                     } else {
                         self.end_turn();
@@ -3092,6 +3154,13 @@ impl Game {
                 }
                 if self.turn_end_timer <= 0.0 {
                     if let Some(player_idx) = self.pending_turn_sync.take() {
+                        // Server advanced while we were in TurnEnd (or we entered TurnEnd from
+                        // force_advance with an in-progress retreat). Send terrain if we were
+                        // the active player so the server has our final map state.
+                        if self.net.connected && self.pending_sync_send_terrain {
+                            self.send_terrain_damages();
+                        }
+                        self.pending_sync_send_terrain = false;
                         self.sync_to_player_turn(player_idx);
                     } else if !self.net.connected {
                         self.advance_turn();

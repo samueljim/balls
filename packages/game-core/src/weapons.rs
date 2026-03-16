@@ -369,10 +369,10 @@ impl Weapon {
 impl WeaponCategory {
     pub fn name(&self) -> &str {
         match self {
-            WeaponCategory::Explosives => "* EXPLOSIVES",
-            WeaponCategory::Ballistics => "+ BALLISTICS",
-            WeaponCategory::Utilities => "~ UTILITIES",
-            WeaponCategory::Special => "# SPECIAL",
+            WeaponCategory::Explosives => "Explosives",
+            WeaponCategory::Ballistics => "Ballistics",
+            WeaponCategory::Utilities => "Utilities",
+            WeaponCategory::Special => "Special",
         }
     }
 }

@@ -356,6 +356,12 @@ pub fn draw_hud(
 /// Returns a [`WeaponMenuResult`] indicating whether a weapon was selected, the
 /// menu was closed, or nothing happened this frame.  The caller must call
 /// `egui_macroquad::draw()` after this function returns.
+///
+/// The menu uses `egui::Modal` as its container so the framework handles the
+/// backdrop dim and click-outside-to-close behaviour automatically.  On mobile
+/// (`sw < 600` or `sh < 700`) the modal fills almost the entire screen and
+/// shows weapons in a 4-column icon-tile grid.  On desktop it presents a
+/// narrower, centred dialog with a list layout (icon + name + description).
 pub fn draw_weapon_menu_egui(
     ctx: &egui::Context,
     selected_weapon: Weapon,
@@ -365,271 +371,217 @@ pub fn draw_weapon_menu_egui(
     let sh = screen_height();
     let is_mobile = sw < 600.0 || sh < 700.0;
 
-    // Menu dimensions — match the old layout so nothing looks jarring.
-    let menu_w = if is_mobile { sw * 0.97 } else { 520.0_f32.min(sw * 0.85) };
-    let controls_reserved = if is_mobile { 225.0_f32 } else { 0.0_f32 };
-    let menu_h = if is_mobile {
-        (sh - 50.0 - controls_reserved).max(200.0)
-    } else {
-        620.0_f32.min(sh * 0.85)
-    };
-    let menu_x = sw / 2.0 - menu_w / 2.0;
-    let menu_y = if is_mobile { 50.0 } else { sh / 2.0 - menu_h / 2.0 };
-
-    // ── Visuals ───────────────────────────────────────────────────────────────
+    // ── Theme ─────────────────────────────────────────────────────────────────
     let mut visuals = egui::Visuals::dark();
-    visuals.window_fill         = egui::Color32::from_rgb(20, 25, 36);
-    visuals.panel_fill          = egui::Color32::from_rgb(20, 25, 36);
-    visuals.extreme_bg_color    = egui::Color32::from_rgb(13, 16, 23);
-    // Default widget backgrounds
+    visuals.window_fill              = egui::Color32::from_rgb(20, 25, 36);
+    visuals.panel_fill               = egui::Color32::from_rgb(20, 25, 36);
+    visuals.extreme_bg_color         = egui::Color32::from_rgb(13, 16, 23);
     visuals.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(20, 25, 36);
     visuals.widgets.inactive.bg_fill       = egui::Color32::from_rgb(28, 36, 52);
     visuals.widgets.hovered.bg_fill        = egui::Color32::from_rgb(38, 60, 90);
     visuals.widgets.active.bg_fill         = egui::Color32::from_rgb(48, 105, 130);
-    // Category tab "selected" colour
-    visuals.selection.bg_fill   = egui::Color32::from_rgb(45, 110, 80);
-    visuals.selection.stroke    = egui::Stroke::new(1.0, egui::Color32::from_rgb(77, 220, 127));
-    visuals.window_stroke       = egui::Stroke::new(2.0, egui::Color32::from_rgb(64, 115, 166));
-    visuals.window_corner_radius = egui::CornerRadius::same(6);
+    visuals.selection.bg_fill        = egui::Color32::from_rgb(45, 110, 80);
+    visuals.selection.stroke         = egui::Stroke::new(1.0, egui::Color32::from_rgb(77, 220, 127));
+    visuals.window_stroke            = egui::Stroke::new(2.0, egui::Color32::from_rgb(64, 115, 166));
+    visuals.window_corner_radius     = egui::CornerRadius::same(8);
     ctx.set_visuals(visuals);
 
     // ── Text styles ───────────────────────────────────────────────────────────
-    let body_size   = if is_mobile { 14.0 } else { 15.0 };
-    let button_size = if is_mobile { 12.5 } else { 13.5 };
     let mut style = (*ctx.style()).clone();
     style.text_styles.insert(
         egui::TextStyle::Body,
-        egui::FontId::proportional(body_size),
+        egui::FontId::proportional(if is_mobile { 14.0 } else { 15.0 }),
     );
     style.text_styles.insert(
         egui::TextStyle::Button,
-        egui::FontId::proportional(button_size),
+        egui::FontId::proportional(if is_mobile { 12.5 } else { 13.5 }),
     );
     style.text_styles.insert(
         egui::TextStyle::Small,
         egui::FontId::proportional(11.0),
     );
-    style.spacing.button_padding = egui::vec2(10.0, 5.0);
-    style.spacing.item_spacing   = egui::vec2(4.0, 3.0);
+    style.spacing.button_padding = egui::vec2(8.0, 6.0);
+    style.spacing.item_spacing   = egui::vec2(6.0, 4.0);
     ctx.set_style(style);
 
+    // ── Layout constants ──────────────────────────────────────────────────────
+    // On mobile we reserve space for the virtual controls at the bottom.
+    let controls_reserved = if is_mobile { 225.0_f32 } else { 0.0_f32 };
+    let modal_w = if is_mobile {
+        sw * 0.96
+    } else {
+        500.0_f32.min(sw * 0.85)
+    };
+    let list_h = if is_mobile {
+        // Fill most of the screen above the on-screen controls.
+        (sh - 50.0 - controls_reserved - 130.0).max(150.0)
+    } else {
+        420.0_f32.min(sh * 0.55)
+    };
+
     let mut result = WeaponMenuResult::None;
+    let mut close  = false;
 
-    egui::Window::new("weapon_menu")
-        .title_bar(false)
-        .resizable(false)
-        .collapsible(false)
-        .fixed_pos([menu_x, menu_y])
-        .fixed_size([menu_w, menu_h])
-        .frame(
-            egui::Frame::none()
-                .fill(egui::Color32::from_rgb(20, 25, 36))
-                .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(64, 115, 166)))
-                .inner_margin(egui::Margin::same(0))
-                .corner_radius(egui::CornerRadius::same(6)),
-        )
-        .show(ctx, |ui| {
-            // ── Header ────────────────────────────────────────────────────────
-            let header_h = if is_mobile { 40.0 } else { 48.0 };
-            egui::Frame::none()
-                .fill(egui::Color32::from_rgb(15, 20, 30))
-                .inner_margin(egui::Margin::symmetric(12, 0))
-                .show(ui, |ui| {
-                    ui.set_min_width(menu_w);
-                    ui.set_min_height(header_h);
-                    ui.horizontal_centered(|ui| {
-                        ui.add(egui::Label::new(
-                            egui::RichText::new("\u{2694}  WEAPONS")
-                                .size(if is_mobile { 17.0 } else { 20.0 })
-                                .color(egui::Color32::from_rgb(230, 240, 255))
-                                .strong(),
-                        ));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let close_btn = egui::Button::new(
-                                egui::RichText::new("\u{2715}")
-                                    .size(14.0)
-                                    .color(egui::Color32::from_rgb(180, 190, 210)),
-                            )
-                            .fill(egui::Color32::TRANSPARENT)
-                            .stroke(egui::Stroke::NONE);
-                            if ui.add(close_btn).clicked() {
-                                result = WeaponMenuResult::Close;
-                            }
-                        });
-                    });
-                });
+    // ── egui::Modal — framework-provided centred dialog with backdrop ─────────
+    let modal_resp = egui::Modal::new(egui::Id::new("weapon_menu")).show(ctx, |ui| {
+        ui.set_width(modal_w);
 
-            ui.add(egui::Separator::default().spacing(0.0));
-
-            // ── Category tabs ─────────────────────────────────────────────────
-            let cats = [
-                WeaponCategory::Explosives,
-                WeaponCategory::Ballistics,
-                WeaponCategory::Special,
-                WeaponCategory::Utilities,
-            ];
-            egui::Frame::none()
-                .fill(egui::Color32::from_rgb(18, 23, 34))
-                .inner_margin(egui::Margin::symmetric(8, 6))
-                .show(ui, |ui| {
-                    ui.set_min_width(menu_w);
-                    ui.horizontal_wrapped(|ui| {
-                        for cat in &cats {
-                            let is_active = *active_category == *cat;
-                            let label = egui::RichText::new(cat.name())
-                                .size(if is_mobile { 12.0 } else { 13.0 })
-                                .color(if is_active {
-                                    egui::Color32::from_rgb(120, 230, 160)
-                                } else {
-                                    egui::Color32::from_rgb(155, 170, 195)
-                                });
-                            if ui.add(egui::SelectableLabel::new(is_active, label)).clicked() {
-                                *active_category = *cat;
-                            }
-                        }
-                    });
-                });
-
-            ui.add(egui::Separator::default().spacing(0.0));
-
-            // ── Weapon list ───────────────────────────────────────────────────
-            let item_h    = if is_mobile { 46.0_f32 } else { 52.0_f32 };
-            let name_size = if is_mobile { 14.5 } else { 15.5 };
-            let desc_size = if is_mobile { 10.5 } else { 11.5 };
-            let icon_size = if is_mobile { 14.0 } else { 15.0 };
-
-            let weapons: Vec<Weapon> = Weapon::all()
-                .iter()
-                .filter(|w| w.category() == *active_category)
-                .cloned()
-                .collect();
-
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .id_source("weapon_list")
-                .show(ui, |ui| {
-                    ui.set_min_width(menu_w);
-                    for w in weapons {
-                        let is_selected = w == selected_weapon;
-                        let avail_w = ui.available_width();
-                        let (rect, response) = ui.allocate_exact_size(
-                            egui::vec2(avail_w, item_h),
-                            egui::Sense::click(),
-                        );
-                        let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
-
-                        if ui.is_rect_visible(rect) {
-                            let bg = if is_selected {
-                                egui::Color32::from_rgb(38, 88, 62)
-                            } else if response.hovered() {
-                                egui::Color32::from_rgb(28, 48, 72)
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            };
-                            ui.painter().rect_filled(rect, 0.0, bg);
-
-                            // Green accent bar on left edge for selected weapon
-                            if is_selected {
-                                let accent_rect = egui::Rect::from_min_size(
-                                    rect.min,
-                                    egui::vec2(3.0, item_h),
-                                );
-                                ui.painter().rect_filled(
-                                    accent_rect,
-                                    0.0,
-                                    egui::Color32::from_rgb(77, 200, 120),
-                                );
-                                ui.painter().rect_stroke(
-                                    rect.shrink(1.0),
-                                    egui::CornerRadius::same(2),
-                                    egui::Stroke::new(
-                                        1.0,
-                                        egui::Color32::from_rgba_unmultiplied(77, 200, 120, 60),
-                                    ),
-                                    egui::StrokeKind::Middle,
-                                );
-                            }
-
-                            let icon_x  = rect.left() + 12.0;
-                            let text_x  = icon_x + (if is_mobile { 28.0 } else { 32.0 });
-                            let name_y  = rect.top() + item_h * 0.31;
-                            let desc_y  = rect.top() + item_h * 0.60;
-
-                            // Icon (monospace keeps alignment consistent across symbols)
-                            ui.painter().text(
-                                egui::pos2(icon_x, rect.center().y),
-                                egui::Align2::LEFT_CENTER,
-                                w.icon(),
-                                egui::FontId::monospace(icon_size),
-                                egui::Color32::from_rgb(195, 210, 230),
-                            );
-
-                            // Weapon name
-                            let name_color = if is_selected {
-                                egui::Color32::from_rgb(130, 245, 170)
-                            } else {
-                                egui::Color32::from_rgb(220, 228, 240)
-                            };
-                            ui.painter().text(
-                                egui::pos2(text_x, name_y),
-                                egui::Align2::LEFT_TOP,
-                                w.name(),
-                                egui::FontId::proportional(name_size),
-                                name_color,
-                            );
-
-                            // Description
-                            ui.painter().text(
-                                egui::pos2(text_x, desc_y),
-                                egui::Align2::LEFT_TOP,
-                                w.description(),
-                                egui::FontId::proportional(desc_size),
-                                egui::Color32::from_rgb(115, 130, 158),
-                            );
-
-                            // Subtle row divider
-                            ui.painter().hline(
-                                rect.left()..=rect.right(),
-                                rect.bottom(),
-                                egui::Stroke::new(
-                                    0.5,
-                                    egui::Color32::from_rgba_unmultiplied(60, 80, 110, 80),
-                                ),
-                            );
-                        }
-
-                        if response.clicked() {
-                            result = WeaponMenuResult::Select(w);
-                        }
-                    }
-                });
-
-            // ── Footer hint ───────────────────────────────────────────────────
-            ui.add(egui::Separator::default().spacing(0.0));
-            egui::Frame::none()
-                .fill(egui::Color32::from_rgb(15, 18, 26))
-                .inner_margin(egui::Margin::symmetric(0, 6))
-                .show(ui, |ui| {
-                    ui.set_min_width(menu_w);
-                    ui.vertical_centered(|ui| {
-                        let hint = if is_mobile {
-                            "Tap to select  \u{2022}  Swipe to scroll  \u{2022}  Tap outside to close"
-                        } else {
-                            "Click to select  \u{2022}  Scroll to browse  \u{2022}  ESC to close"
-                        };
-                        ui.add(egui::Label::new(
-                            egui::RichText::new(hint)
-                                .size(if is_mobile { 10.0 } else { 11.5 })
-                                .color(egui::Color32::from_rgb(95, 110, 138)),
-                        ));
-                    });
-                });
+        // ── Header ────────────────────────────────────────────────────────────
+        ui.horizontal(|ui| {
+            ui.add(egui::Label::new(
+                egui::RichText::new("\u{2694}  WEAPONS")
+                    .size(if is_mobile { 17.0 } else { 20.0 })
+                    .color(egui::Color32::from_rgb(230, 240, 255))
+                    .strong(),
+            ));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("\u{2715}")
+                                .size(14.0)
+                                .color(egui::Color32::from_rgb(180, 190, 210)),
+                        )
+                        .fill(egui::Color32::TRANSPARENT)
+                        .stroke(egui::Stroke::NONE),
+                    )
+                    .clicked()
+                {
+                    close = true;
+                }
+            });
         });
 
-    // Close when the user LEFT-clicks anywhere outside the menu window.
-    // We use primary_clicked (left button only) so that right-clicking outside
-    // does not accidentally trigger a close.
-    if ctx.input(|i| i.pointer.primary_clicked()) && !ctx.is_pointer_over_area() {
+        ui.separator();
+
+        // ── Category tabs ─────────────────────────────────────────────────────
+        const CATS: [WeaponCategory; 4] = [
+            WeaponCategory::Explosives,
+            WeaponCategory::Ballistics,
+            WeaponCategory::Special,
+            WeaponCategory::Utilities,
+        ];
+        ui.horizontal_wrapped(|ui| {
+            for cat in &CATS {
+                let is_active = *active_category == *cat;
+                if ui
+                    .add(egui::SelectableLabel::new(
+                        is_active,
+                        egui::RichText::new(cat.name())
+                            .size(if is_mobile { 12.5 } else { 13.5 })
+                            .color(if is_active {
+                                egui::Color32::from_rgb(120, 230, 160)
+                            } else {
+                                egui::Color32::from_rgb(155, 170, 195)
+                            }),
+                    ))
+                    .clicked()
+                {
+                    *active_category = *cat;
+                }
+            }
+        });
+
+        ui.separator();
+
+        // ── Weapon list / grid ────────────────────────────────────────────────
+        let weapons: Vec<Weapon> = Weapon::all()
+            .iter()
+            .filter(|w| w.category() == *active_category)
+            .cloned()
+            .collect();
+
+        egui::ScrollArea::vertical()
+            .max_height(list_h)
+            .id_salt("weapon_list")
+            .show(ui, |ui| {
+                if is_mobile {
+                    // 4-column icon-tile grid — takes up most of the screen.
+                    const COLS: usize = 4;
+                    let spacing = 6.0_f32;
+                    // Use the actual available width so the tile size is correct
+                    // regardless of the modal frame's inner margin.
+                    let avail_w = ui.available_width();
+                    let tile_w  = (avail_w - spacing * (COLS - 1) as f32) / COLS as f32;
+                    let tile_h  = tile_w * 1.1; // slightly taller than wide
+
+                    egui::Grid::new("weapon_grid")
+                        .num_columns(COLS)
+                        .spacing([spacing, spacing])
+                        .show(ui, |ui| {
+                            for (i, w) in weapons.iter().enumerate() {
+                                let is_selected = *w == selected_weapon;
+                                let tile_text = egui::RichText::new(
+                                    format!("{}\n{}", w.icon(), w.name()),
+                                )
+                                .size(11.0);
+                                if ui
+                                    .add(
+                                        egui::Button::new(tile_text)
+                                            .selected(is_selected)
+                                            .min_size(egui::vec2(tile_w, tile_h)),
+                                    )
+                                    .clicked()
+                                {
+                                    result = WeaponMenuResult::Select(*w);
+                                }
+                                if (i + 1) % COLS == 0 {
+                                    ui.end_row();
+                                }
+                            }
+                            // Terminate the last partial row.
+                            if weapons.len() % COLS != 0 {
+                                ui.end_row();
+                            }
+                        });
+                } else {
+                    // List layout for desktop — icon + name + description.
+                    for w in &weapons {
+                        let is_selected = *w == selected_weapon;
+                        let avail_w = ui.available_width();
+                        // Button: icon and name on a single line.
+                        let btn = egui::Button::new(
+                            egui::RichText::new(format!("{}  {}", w.icon(), w.name()))
+                                .size(15.0),
+                        )
+                        .selected(is_selected)
+                        .min_size(egui::vec2(avail_w, 44.0));
+                        if ui.add(btn).clicked() {
+                            result = WeaponMenuResult::Select(*w);
+                        }
+                        // Description — indented via a horizontal spacer.
+                        ui.horizontal(|ui| {
+                            ui.add_space(16.0);
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(w.description())
+                                    .size(11.5)
+                                    .color(egui::Color32::from_rgb(110, 125, 155)),
+                            ));
+                        });
+                        ui.add_space(2.0);
+                        ui.separator();
+                    }
+                }
+            });
+
+        ui.separator();
+
+        // ── Footer hint ───────────────────────────────────────────────────────
+        ui.vertical_centered(|ui| {
+            ui.add(egui::Label::new(
+                egui::RichText::new(if is_mobile {
+                    "Tap to select  \u{2022}  Swipe to scroll  \u{2022}  Tap outside to close"
+                } else {
+                    "Click to select  \u{2022}  Scroll to browse  \u{2022}  ESC to close"
+                })
+                .size(if is_mobile { 10.0 } else { 11.5 })
+                .color(egui::Color32::from_rgb(95, 110, 138)),
+            ));
+        });
+    });
+
+    // egui::Modal closes when the backdrop is clicked.
+    if modal_resp.should_close() || close {
         result = WeaponMenuResult::Close;
     }
 

@@ -3753,15 +3753,6 @@ impl Game {
         );
 
         // ── egui weapon menu ──────────────────────────────────────────────────
-        if self.weapon_menu_open {
-            // Draw dark overlay with macroquad before egui renders on top.
-            draw_rectangle(
-                0.0, 0.0,
-                screen_width(), screen_height(),
-                Color::new(0.0, 0.0, 0.0, 0.75),
-            );
-        }
-
         let selected = self.selected_weapon;
         let mut new_category = self.weapon_menu_category;
         let mut chosen_weapon: Option<Weapon> = None;

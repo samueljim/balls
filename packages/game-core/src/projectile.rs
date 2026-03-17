@@ -487,7 +487,15 @@ impl Projectile {
         let px = self.x as i32;
         let py = self.y as i32;
 
-        terrain.apply_damage(px, py, explosion_radius);
+        // Mortar creates a larger square-type impact on the ground instead of a circle.
+        // Scale factors: wider (1.6×) than tall (1.1×) to mimic a plunging-fire blast footprint.
+        if self.weapon == Weapon::Mortar {
+            let half_w = (explosion_radius as f32 * 1.6) as i32;
+            let half_h = (explosion_radius as f32 * 1.1) as i32;
+            terrain.apply_square_damage(px, py, half_w, half_h);
+        } else {
+            terrain.apply_damage(px, py, explosion_radius);
+        }
 
         let max_damage = self.weapon.base_damage();
 
@@ -574,7 +582,7 @@ pub fn simulate_trajectory(
     const GRAVITY: f32 = 480.0;
     const DT: f32 = 1.0 / 60.0;
     let air_resistance = if weapon == Weapon::Bazooka { 0.99 } else { 0.98 };
-    let max_steps = 180;
+    let max_steps = 360;
 
     for _ in 0..max_steps {
         vx += wind * 15.0 * DT;

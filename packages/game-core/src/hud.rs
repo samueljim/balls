@@ -111,23 +111,6 @@ pub fn draw_hud(
                 Color::new(0.85, 0.85, 0.85, 0.9));
         }
 
-        // ── NEW GAME button ──────────────────────────────────────────────────
-        let btn_w = (sw * 0.45).min(220.0);
-        let btn_h = if sw < 500.0 { 44.0_f32 } else { 52.0_f32 };
-        let btn_x = sw / 2.0 - btn_w / 2.0;
-        let btn_y = sh * 0.80;
-        // Button shadow
-        draw_rectangle(btn_x + 3.0, btn_y + 4.0, btn_w, btn_h, Color::new(0.0, 0.0, 0.0, 0.5));
-        // Button background
-        draw_rectangle(btn_x, btn_y, btn_w, btn_h, Color::new(0.15, 0.60, 0.25, 1.0));
-        // Button border
-        draw_rectangle_lines(btn_x, btn_y, btn_w, btn_h, 2.0, Color::new(0.4, 0.95, 0.5, 0.9));
-        // Button label
-        let label = "NEW GAME";
-        let label_font = if sw < 500.0 { 20u16 } else { 24u16 };
-        let lw = measure_text(label, None, label_font, 1.0).width;
-        draw_text(label, sw / 2.0 - lw / 2.0, btn_y + btn_h / 2.0 + label_font as f32 * 0.38, label_font as f32, WHITE);
-
         return;
     }
 

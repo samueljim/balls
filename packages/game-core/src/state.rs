@@ -27,8 +27,17 @@ impl Phase {
         matches!(self, Phase::Aiming | Phase::Charging)
     }
 
-    /// Movement only (walk, jump, backflip)
+    /// Movement only (walk, jump, backflip).
+    /// Includes Settling so players can dodge while explosions are still resolving,
+    /// before the formal Retreat phase begins.
     pub fn allows_movement(&self) -> bool {
-        matches!(self, Phase::Aiming | Phase::Charging | Phase::ProjectileFlying | Phase::Retreat)
+        matches!(
+            self,
+            Phase::Aiming
+                | Phase::Charging
+                | Phase::ProjectileFlying
+                | Phase::Settling
+                | Phase::Retreat
+        )
     }
 }

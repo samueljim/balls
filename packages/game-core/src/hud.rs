@@ -373,18 +373,23 @@ pub fn draw_weapon_menu_egui(
     let mut style = (*ctx.style()).clone();
     style.text_styles.insert(
         egui::TextStyle::Body,
-        egui::FontId::proportional(if is_mobile { 14.0 } else { 15.0 }),
+        egui::FontId::proportional(if is_mobile { 16.0 } else { 15.0 }),
     );
     style.text_styles.insert(
         egui::TextStyle::Button,
-        egui::FontId::proportional(if is_mobile { 12.5 } else { 13.5 }),
+        egui::FontId::proportional(if is_mobile { 15.0 } else { 13.5 }),
     );
     style.text_styles.insert(
         egui::TextStyle::Small,
-        egui::FontId::proportional(11.0),
+        egui::FontId::proportional(if is_mobile { 12.0 } else { 11.0 }),
     );
-    style.spacing.button_padding = egui::vec2(8.0, 6.0);
-    style.spacing.item_spacing   = egui::vec2(6.0, 4.0);
+    // Larger padding on mobile for better touch targets
+    style.spacing.button_padding = if is_mobile {
+        egui::vec2(12.0, 10.0)
+    } else {
+        egui::vec2(8.0, 6.0)
+    };
+    style.spacing.item_spacing = egui::vec2(6.0, if is_mobile { 6.0 } else { 4.0 });
     ctx.set_style(style);
 
     // ── Layout constants ──────────────────────────────────────────────────────
@@ -451,7 +456,7 @@ pub fn draw_weapon_menu_egui(
                     .add(egui::SelectableLabel::new(
                         is_active,
                         egui::RichText::new(cat.name())
-                            .size(if is_mobile { 12.5 } else { 13.5 })
+                            .size(if is_mobile { 15.0 } else { 13.5 })
                             .color(if is_active {
                                 egui::Color32::from_rgb(120, 230, 160)
                             } else {
@@ -478,72 +483,37 @@ pub fn draw_weapon_menu_egui(
             .max_height(list_h)
             .id_salt("weapon_list")
             .show(ui, |ui| {
-                if is_mobile {
-                    // 4-column icon-tile grid — takes up most of the screen.
-                    const COLS: usize = 4;
-                    let spacing = 6.0_f32;
-                    // Use the actual available width so the tile size is correct
-                    // regardless of the modal frame's inner margin.
-                    let avail_w = ui.available_width();
-                    let tile_w  = (avail_w - spacing * (COLS - 1) as f32) / COLS as f32;
-                    let tile_h  = tile_w * 1.1; // slightly taller than wide
+                // Both mobile and desktop use a vertical list layout.
+                // On mobile the buttons are taller (56 px min) for comfortable touch targets
+                // and the description is shown in a smaller font below the name.
+                let btn_min_h = if is_mobile { 56.0 } else { 44.0 };
+                let name_size = if is_mobile { 16.0 } else { 15.0 };
+                let desc_size = if is_mobile { 12.0 } else { 11.5 };
 
-                    egui::Grid::new("weapon_grid")
-                        .num_columns(COLS)
-                        .spacing([spacing, spacing])
-                        .show(ui, |ui| {
-                            for (i, w) in weapons.iter().enumerate() {
-                                let is_selected = *w == selected_weapon;
-                                let tile_text = egui::RichText::new(
-                                    format!("{}\n{}", w.icon(), w.name()),
-                                )
-                                .size(11.0);
-                                if ui
-                                    .add(
-                                        egui::Button::new(tile_text)
-                                            .selected(is_selected)
-                                            .min_size(egui::vec2(tile_w, tile_h)),
-                                    )
-                                    .clicked()
-                                {
-                                    result = WeaponMenuResult::Select(*w);
-                                }
-                                if (i + 1) % COLS == 0 {
-                                    ui.end_row();
-                                }
-                            }
-                            // Terminate the last partial row.
-                            if weapons.len() % COLS != 0 {
-                                ui.end_row();
-                            }
-                        });
-                } else {
-                    // List layout for desktop — icon + name + description.
-                    for w in &weapons {
-                        let is_selected = *w == selected_weapon;
-                        let avail_w = ui.available_width();
-                        // Button: icon and name on a single line.
-                        let btn = egui::Button::new(
-                            egui::RichText::new(format!("{}  {}", w.icon(), w.name()))
-                                .size(15.0),
-                        )
-                        .selected(is_selected)
-                        .min_size(egui::vec2(avail_w, 44.0));
-                        if ui.add(btn).clicked() {
-                            result = WeaponMenuResult::Select(*w);
-                        }
-                        // Description — indented via a horizontal spacer.
-                        ui.horizontal(|ui| {
-                            ui.add_space(16.0);
-                            ui.add(egui::Label::new(
-                                egui::RichText::new(w.description())
-                                    .size(11.5)
-                                    .color(egui::Color32::from_rgb(110, 125, 155)),
-                            ));
-                        });
-                        ui.add_space(2.0);
-                        ui.separator();
+                for w in &weapons {
+                    let is_selected = *w == selected_weapon;
+                    let avail_w = ui.available_width();
+                    // Button: icon and name on a single line.
+                    let btn = egui::Button::new(
+                        egui::RichText::new(format!("{}  {}", w.icon(), w.name()))
+                            .size(name_size),
+                    )
+                    .selected(is_selected)
+                    .min_size(egui::vec2(avail_w, btn_min_h));
+                    if ui.add(btn).clicked() {
+                        result = WeaponMenuResult::Select(*w);
                     }
+                    // Description — indented via a horizontal spacer.
+                    ui.horizontal(|ui| {
+                        ui.add_space(16.0);
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(w.description())
+                                .size(desc_size)
+                                .color(egui::Color32::from_rgb(110, 125, 155)),
+                        ));
+                    });
+                    ui.add_space(if is_mobile { 4.0 } else { 2.0 });
+                    ui.separator();
                 }
             });
 
@@ -557,7 +527,7 @@ pub fn draw_weapon_menu_egui(
                 } else {
                     "Click to select  \u{2022}  Scroll to browse  \u{2022}  ESC to close"
                 })
-                .size(if is_mobile { 10.0 } else { 11.5 })
+                .size(if is_mobile { 12.0 } else { 11.5 })
                 .color(egui::Color32::from_rgb(95, 110, 138)),
             ));
         });

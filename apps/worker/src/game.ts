@@ -325,7 +325,14 @@ export class Game implements DurableObject {
       const winnerName = winner >= 0
         ? this.gameState.playerOrder[winner]?.name ?? `Team ${winner + 1}`
         : "Nobody";
-      this.broadcast({ type: "game_over", winner: winnerName });
+      // Include winnerTeam index and ball snapshots so all clients can correctly
+      // display the winner (non-active clients haven't had a turn_advanced to sync state).
+      this.broadcast({
+        type: "game_over",
+        winner: winnerName,
+        winnerTeam: winner,
+        balls: this.ballSnapshots,
+      });
       this.gameState.phase = "game_over";
       this.persistState();
       // Schedule storage cleanup 60s from now (clients have time to see the result)
@@ -353,7 +360,14 @@ export class Game implements DurableObject {
       const winnerName = recheckWinner >= 0
         ? this.gameState.playerOrder[recheckWinner]?.name ?? `Team ${recheckWinner + 1}`
         : "Nobody";
-      this.broadcast({ type: "game_over", winner: winnerName });
+      // Include winnerTeam index and ball snapshots so all clients can correctly
+      // display the winner (non-active clients haven't had a turn_advanced to sync state).
+      this.broadcast({
+        type: "game_over",
+        winner: winnerName,
+        winnerTeam: recheckWinner,
+        balls: this.ballSnapshots,
+      });
       this.gameState.phase = "game_over";
       this.persistState();
       // Schedule storage cleanup 60s from now (clients have time to see the result)

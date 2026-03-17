@@ -584,30 +584,7 @@ impl Game {
         }
 
         if self.phase == Phase::GameOver {
-            // R key or click/tap on the NEW GAME button restarts the game.
-            let restart = is_key_pressed(KeyCode::R) || {
-                if is_mouse_button_pressed(MouseButton::Left) {
-                    let (mx, my) = mouse_position();
-                    let sw = screen_width();
-                    let sh = screen_height();
-                    let btn_w = (sw * 0.45).min(220.0);
-                    let btn_h = if sw < 500.0 { 44.0_f32 } else { 52.0_f32 };
-                    let btn_x = sw / 2.0 - btn_w / 2.0;
-                    let btn_y = sh * 0.80;
-                    mx >= btn_x && mx <= btn_x + btn_w && my >= btn_y && my <= btn_y + btn_h
-                } else {
-                    false
-                }
-            };
-            if restart {
-                let seed = lcg(self.rng_state);
-                if self.net.connected {
-                    let msg = format!("{{\"type\":\"restart\",\"seed\":{}}}", seed);
-                    self.net.send_message(&msg);
-                } else {
-                    self.restart_seed = Some(seed);
-                }
-            }
+            // Game is over — no input is accepted.
             return;
         }
 
@@ -813,7 +790,7 @@ impl Game {
                     let cos_a = angle.cos();
                     let sin_a = angle.sin();
                     let half_len = 35i32;
-                    let half_thick = 4i32;
+                    let half_thick = 35i32;
                     for i in -half_len..=half_len {
                         for j in -half_thick..=half_thick {
                             let wx = (ax + i as f32 * cos_a - j as f32 * sin_a).round() as i32;
@@ -882,7 +859,7 @@ impl Game {
                     let cos_a = angle.cos();
                     let sin_a = angle.sin();
                     let half_len = 35i32;
-                    let half_thick = 4i32;
+                    let half_thick = 35i32;
                     for i in -half_len..=half_len {
                         for j in -half_thick..=half_thick {
                             let wx = (ax + i as f32 * cos_a - j as f32 * sin_a).round() as i32;
@@ -1688,7 +1665,7 @@ impl Game {
                     let ax = *ax as f32; let ay = *ay as f32;
                     let angle = *amrad as f32 / 1000.0;
                     let cos_a = angle.cos(); let sin_a = angle.sin();
-                    let half_len = 35i32; let half_thick = 4i32;
+                    let half_len = 35i32; let half_thick = 35i32;
                     for i in -half_len..=half_len {
                         for j in -half_thick..=half_thick {
                             let wx = (ax + i as f32 * cos_a - j as f32 * sin_a).round() as i32;
@@ -2074,8 +2051,33 @@ impl Game {
                 continue;
             }
             if msg.contains("\"type\":\"game_over\"") || msg.contains("\"type\": \"game_over\"") {
-                // Server detected game over (e.g. after skipping dead teams)
+                // Server detected game over (e.g. after skipping dead teams).
+                // Apply the authoritative ball snapshot so all clients have up-to-date
+                // health/alive state before displaying the game-over overlay.
+                if msg.contains("\"balls\":[") {
+                    for t in &mut self.ball_lerp_targets {
+                        *t = None;
+                    }
+                    self.apply_ball_state(&msg);
+                }
                 self.phase = Phase::GameOver;
+                // Set winning_team from the server's authoritative winnerTeam index so all
+                // clients show the correct winner banner (not "Draw!" due to stale local state).
+                if let Some(winner_team_raw) = parse_json_number(&msg, "winnerTeam") {
+                    self.winning_team = if winner_team_raw >= 0.0 { Some(winner_team_raw as u32) } else { None };
+                } else {
+                    // Fallback: find the winner team by matching the winner name from the
+                    // server against player names or ball names.
+                    if let Some(winner) = parse_json_string(&msg, "winner") {
+                        let team = self.net.player_names.iter().position(|n| *n == winner)
+                            .or_else(|| self.balls.iter().find(|b| b.name == winner).map(|b| b.team as usize));
+                        self.winning_team = team.map(|t| t as u32);
+                        // Last resort: first alive ball's team
+                        if self.winning_team.is_none() {
+                            self.winning_team = self.balls.iter().find(|b| b.alive).map(|b| b.team);
+                        }
+                    }
+                }
                 if let Some(winner) = parse_json_string(&msg, "winner") {
                     let event = format!("{{\"type\":\"game_over\",\"winner\":\"{}\"}}",
                         sanitize_event_name(&winner));
@@ -2399,7 +2401,7 @@ impl Game {
                                 let cos_a = angle.cos();
                                 let sin_a = angle.sin();
                                 let half_len = 35i32;
-                                let half_thick = 4i32;
+                                let half_thick = 35i32;
                                 for i in -half_len..=half_len {
                                     for j in -half_thick..=half_thick {
                                         let wx = (ax + i as f32 * cos_a - j as f32 * sin_a).round() as i32;
@@ -2924,6 +2926,10 @@ impl Game {
                 if all_done {
                     self.phase = Phase::Settling;
                     self.settle_timer = 0.0;
+                    // Linger the camera on the last explosion/impact for a moment before
+                    // returning to the active player (most noticeable after an airstrike).
+                    const EXPLOSION_CAM_LINGER_SECS: f32 = 1.5;
+                    self.cam_free_timer = self.cam_free_timer.max(EXPLOSION_CAM_LINGER_SECS);
                     // All players send terrain damage log so the worker always
                     // has the latest cumulative state for reconnect sync.
                     if self.net.connected {

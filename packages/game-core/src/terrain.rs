@@ -69,6 +69,17 @@ impl Terrain {
         self.apply_damage_no_log(cx, cy, radius);
     }
 
+    /// Carve a square/rectangular hole centred at (cx, cy) with given half-width and half-height.
+    /// Used by the Mortar weapon to create a larger, square-type impact crater.
+    pub fn apply_square_damage(&mut self, cx: i32, cy: i32, half_w: i32, half_h: i32) {
+        for dy in -half_h..=half_h {
+            for dx in -half_w..=half_w {
+                self.set(cx + dx, cy + dy, AIR);
+            }
+        }
+        self.regrow_grass_near(cx, cy, half_w.max(half_h));
+    }
+
     /// Apply damage without recording to the log (used for replay on reconnect)
     fn apply_damage_no_log(&mut self, cx: i32, cy: i32, radius: i32) {
         let r2 = radius * radius;

@@ -14,7 +14,10 @@ const FALL_DAMAGE_THRESHOLD: f32 = 120.0;
 const FALL_DAMAGE_FACTOR: f32 = 0.25;
 const WALL_IMPACT_THRESHOLD: f32 = 250.0; // min speed to take wall-impact damage
 const WALL_IMPACT_FACTOR: f32 = 0.04;    // damage per unit of excess speed
-const MOVEMENT_BUDGET: f32 = 10000.0;  // Effectively unlimited — players can always move
+/// Pixels a player may walk per movement phase.  The aiming/charging phase and the post-fire
+/// retreat phase each receive an independent budget (reset by `reset_movement_budget()`).
+/// At WALK_SPEED 115 px/s this gives ≈8.7 seconds of continuous walking (≈71% of the map width).
+const MOVEMENT_BUDGET: f32 = 1000.0;
 const COYOTE_TIME: f32 = 0.15;        // Grace window after walking off edge
 const JUMP_BUFFER_TIME: f32 = 0.12;   // Jump pressed just before landing
 
@@ -292,12 +295,15 @@ pub fn walk(ball: &mut Ball, terrain: &Terrain, dir: f32) {
         return;
     }
 
-    // Check if movement budget is exhausted
+    // Always update facing so directional input feels responsive even when
+    // the movement budget is exhausted (ball turns in place rather than
+    // freezing completely, which is less confusing for the player).
+    ball.facing = dir;
+
+    // Position change requires remaining budget.
     if !ball.can_move() {
         return;
     }
-
-    ball.facing = dir;
 
     // ── Air control ───────────────────────────────────────────────────────
     // While airborne, nudge horizontal velocity instead of snapping position.

@@ -19,7 +19,7 @@ use terrain::Terrain;
 use weapons::{Weapon, WeaponCategory};
 
 const TURN_TIME: f32 = 45.0;
-const TURN_END_DELAY: f32 = 0.5;
+const TURN_END_DELAY: f32 = 3.0;
 const SETTLE_TIMEOUT: f32 = 3.0;
 const CHARGE_SPEED: f32 = 55.0;
 /// Default camera zoom level. Values > 1 mean “more zoomed in” relative to BASE_SHORT_AXIS.
@@ -588,20 +588,26 @@ impl Game {
             return;
         }
 
-        // During Retreat or ProjectileFlying phase: allow movement for local player's ball
-        if self.phase == Phase::Retreat || self.phase == Phase::ProjectileFlying {
-            // During Retreat the active player moves the ball that just fired,
+        // During Retreat, ProjectileFlying, or Settling: allow movement for local player's ball.
+        // Settling is included so players can reposition while explosions are still resolving,
+        // giving them a head-start before the formal 5-second Retreat window opens.
+        if self.phase == Phase::Retreat
+            || self.phase == Phase::ProjectileFlying
+            || self.phase == Phase::Settling
+        {
+            // During Retreat/Settling the active player moves the ball that just fired,
             // which is already stored in current_ball.
             // Phase::Retreat is only entered when has_fired && is_my_turn() (in the Settling
             // handler), so we don't need to re-check is_my_turn() here. Checking phase alone
             // is reliable and avoids the bug where a server watchdog advances current_turn_index
             // mid-retreat, making is_my_turn() return false and incorrectly blocking movement.
-            // During ProjectileFlying the non-active player can also move; use
-            // find_ball_for_player so they control one of their own balls.
+            // During ProjectileFlying and Settling each player controls their own ball so they
+            // can dodge; during Retreat only the active player moves (current_ball).
             let ball_idx_opt = if self.phase == Phase::Retreat {
                 // Retreat always belongs to the player who just fired (current_ball)
                 if self.current_ball < self.balls.len() { Some(self.current_ball) } else { None }
             } else if self.net.connected {
+                // ProjectileFlying / Settling in multiplayer: each player moves their own ball
                 self.net.my_player_index.and_then(|pi| self.find_ball_for_player(pi))
             } else {
                 Some(self.current_ball)
@@ -637,7 +643,7 @@ impl Game {
                     }
                 }
             }
-            return; // No weapon/aim/firing during retreat or projectile flying
+            return; // No weapon/aim/firing during retreat, settling, or projectile flying
         }
 
         // CRITICAL: Block all GAME input (not camera) if not our turn in multiplayer

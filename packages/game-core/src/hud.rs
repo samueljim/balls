@@ -27,6 +27,7 @@ pub fn draw_hud(
     is_my_turn: bool,
     turn_owner_name: &str,
     connected: bool,
+    player_names: &[String],
 ) {
     let sw = screen_width();
     let sh = screen_height();
@@ -45,11 +46,14 @@ pub fn draw_hud(
         // ── Winner banner ────────────────────────────────────────────────────
         let (winner_text, banner_col) = if let Some(team) = winning_team {
             let (r, g, b) = TEAM_COLORS[team as usize % TEAM_COLORS.len()];
-            // Try to find a name for the winning team.
-            let name = balls
-                .iter()
-                .find(|b| b.team == team)
-                .map(|b| b.name.as_str())
+            // Use the player's lobby name if available, otherwise fall back to ball name.
+            let name = player_names
+                .get(team as usize)
+                .filter(|n| !n.is_empty())
+                .map(|n| n.as_str())
+                .or_else(|| {
+                    balls.iter().find(|b| b.team == team).map(|b| b.name.as_str())
+                })
                 .unwrap_or("Unknown");
             (format!("{} Wins!", name), Color::new(r, g, b, 1.0))
         } else {

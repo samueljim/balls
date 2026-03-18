@@ -358,32 +358,6 @@ pub fn generate(seed: u32) -> Terrain {
         }
     }
 
-    // Carve a porous cave field using 2D noise so maps get lots of natural caverns.
-    // This runs before the chamber+worm pass to produce interconnected voids.
-    {
-        let mut s_cave = lcg(seed.wrapping_add(2500));
-        let cave_scale = 0.035; // coarser noise for big caverns
-        let cave_threshold = 0.42; // lower -> more air; slightly stricter to protect surface
-        for x in LAND_START_X as i32..=LAND_END_X as i32 {
-            if x < 0 || x >= w as i32 { continue; }
-            let ground = heights[x as usize] as i32;
-            // create caves starting a bit below surface and extending downward
-            let y0 = (ground + 10).max(10);
-            let y1 = (ground + 220).min(h as i32 - 10);
-            for y in y0..=y1 {
-                let nx = x as f32 * cave_scale;
-                let ny = y as f32 * cave_scale;
-                // combine a couple of noise samples for variety
-                let n1 = noise_2d(nx, ny, sf + 6000.0);
-                let n2 = noise_2d(nx * 1.7 + 17.0, ny * 0.9 + 53.0, sf + 7000.0) * 0.6;
-                let n = n1 * 0.7 + n2 * 0.3;
-                if n < cave_threshold {
-                    t.set(x, y, AIR);
-                }
-            }
-        }
-    }
-
     for x in 0..w {
         let ground = heights[x as usize].clamp(60.0, WATER_LEVEL - 20.0) as i32;
         // Only generate land in the center playable area
@@ -403,6 +377,31 @@ pub fn generate(seed: u32) -> Terrain {
                 STONE
             };
             t.set(x as i32, y, cell);
+        }
+    }
+
+    // Carve a porous cave field using 2D noise so maps get lots of natural caverns.
+    // This runs AFTER the terrain fill so the carved AIR is not overwritten.
+    {
+        let cave_scale = 0.035; // coarser noise for big caverns
+        let cave_threshold = 0.42; // lower -> more air; slightly stricter to protect surface
+        for x in LAND_START_X as i32..=LAND_END_X as i32 {
+            if x < 0 || x >= w as i32 { continue; }
+            let ground = heights[x as usize] as i32;
+            // create caves starting a bit below surface and extending downward
+            let y0 = (ground + 10).max(10);
+            let y1 = (ground + 220).min(h as i32 - 10);
+            for y in y0..=y1 {
+                let nx = x as f32 * cave_scale;
+                let ny = y as f32 * cave_scale;
+                // combine a couple of noise samples for variety
+                let n1 = noise_2d(nx, ny, sf + 6000.0);
+                let n2 = noise_2d(nx * 1.7 + 17.0, ny * 0.9 + 53.0, sf + 7000.0) * 0.6;
+                let n = n1 * 0.7 + n2 * 0.3;
+                if n < cave_threshold {
+                    t.set(x, y, AIR);
+                }
+            }
         }
     }
 

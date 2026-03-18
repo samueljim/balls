@@ -748,19 +748,20 @@ impl Game {
                 physics::walk(ball, &self.terrain, 1.0);
             }
             
-            // Jumping allowed while budget remains; cost is the horizontal distance
-            // traveled, charged on landing via jump_start_x (not a fixed fee).
-            if can_move {
-                if is_key_pressed(KeyCode::W) || is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::Space) {
-                    physics::jump(ball);
-                    if self.net.connected {
-                        let msg = format!(
-                            r#"{{"type":"input","input":"{{\"Jump\":{{}}}}","bi":{}}}"#,
-                            self.current_ball,
-                        );
-                        self.net.send_message(&msg);
-                    }
+            // Jumping always allowed regardless of movement budget — it's the escape hatch
+            // for players who get stuck. Cost is still tracked (charged on landing) but
+            // the budget gate is bypassed so players can always jump to get unstuck.
+            if is_key_pressed(KeyCode::W) || is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::Space) {
+                physics::jump(ball);
+                if self.net.connected {
+                    let msg = format!(
+                        r#"{{"type":"input","input":"{{\"Jump\":{{}}}}","bi":{}}}"#,
+                        self.current_ball,
+                    );
+                    self.net.send_message(&msg);
                 }
+            }
+            if can_move {
                 if is_key_pressed(KeyCode::S) || is_key_pressed(KeyCode::Down) {
                     physics::backflip(ball);
                     if self.net.connected {
@@ -796,7 +797,7 @@ impl Game {
                     let cos_a = angle.cos();
                     let sin_a = angle.sin();
                     let half_len = 35i32;
-                    let half_thick = 35i32;
+                    let half_thick = 4i32;
                     for i in -half_len..=half_len {
                         for j in -half_thick..=half_thick {
                             let wx = (ax + i as f32 * cos_a - j as f32 * sin_a).round() as i32;
@@ -865,7 +866,7 @@ impl Game {
                     let cos_a = angle.cos();
                     let sin_a = angle.sin();
                     let half_len = 35i32;
-                    let half_thick = 35i32;
+                    let half_thick = 4i32;
                     for i in -half_len..=half_len {
                         for j in -half_thick..=half_thick {
                             let wx = (ax + i as f32 * cos_a - j as f32 * sin_a).round() as i32;
@@ -1671,7 +1672,7 @@ impl Game {
                     let ax = *ax as f32; let ay = *ay as f32;
                     let angle = *amrad as f32 / 1000.0;
                     let cos_a = angle.cos(); let sin_a = angle.sin();
-                    let half_len = 35i32; let half_thick = 35i32;
+                    let half_len = 35i32; let half_thick = 4i32;
                     for i in -half_len..=half_len {
                         for j in -half_thick..=half_thick {
                             let wx = (ax + i as f32 * cos_a - j as f32 * sin_a).round() as i32;
@@ -2407,7 +2408,7 @@ impl Game {
                                 let cos_a = angle.cos();
                                 let sin_a = angle.sin();
                                 let half_len = 35i32;
-                                let half_thick = 35i32;
+                                let half_thick = 4i32;
                                 for i in -half_len..=half_len {
                                     for j in -half_thick..=half_thick {
                                         let wx = (ax + i as f32 * cos_a - j as f32 * sin_a).round() as i32;
@@ -3831,6 +3832,7 @@ impl Game {
             is_my_turn,
             &turn_owner,
             self.net.connected,
+            &self.net.player_names,
         );
 
         // ── egui weapon menu ──────────────────────────────────────────────────

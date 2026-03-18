@@ -327,16 +327,19 @@ impl Projectile {
                 let dx = target_x - self.x;
                 let dy = target_y - self.y;
                 let dist = (dx * dx + dy * dy).sqrt().max(1.0);
-                // Strong homing: steer toward target aggressively
-                let turn_force = 800.0 * dt;
+                // Very aggressive homing: steer strongly toward target each frame.
+                // Blend current velocity toward the ideal direction so the missile
+                // corrects course quickly without overshooting too wildly.
+                let turn_force = 2500.0 * dt;
                 self.vx += (dx / dist) * turn_force;
                 self.vy += (dy / dist) * turn_force;
                 
-                // Higher speed cap so it actually closes in
+                // Cap speed — keep it fast enough to close in but not so fast it
+                // zips past the target before the next tick.
                 let speed = (self.vx * self.vx + self.vy * self.vy).sqrt();
-                if speed > 420.0 {
-                    self.vx = (self.vx / speed) * 420.0;
-                    self.vy = (self.vy / speed) * 420.0;
+                if speed > 480.0 {
+                    self.vx = (self.vx / speed) * 480.0;
+                    self.vy = (self.vy / speed) * 480.0;
                 }
             }
 

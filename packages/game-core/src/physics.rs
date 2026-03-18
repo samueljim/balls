@@ -16,9 +16,8 @@ const WALL_IMPACT_THRESHOLD: f32 = 250.0; // min speed to take wall-impact damag
 const WALL_IMPACT_FACTOR: f32 = 0.04;    // damage per unit of excess speed
 /// Pixels a player may walk per movement phase.  The aiming/charging phase and the post-fire
 /// retreat phase each receive an independent budget (reset by `reset_movement_budget()`).
-/// At WALK_SPEED 115 px/s this gives ≈15 seconds of continuous walking (≈1.25× the map width),
-/// enough to reposition freely without ever feeling arbitrarily limited in normal play.
-const MOVEMENT_BUDGET: f32 = 1750.0;
+/// At WALK_SPEED 115 px/s this gives ≈8.7 seconds of continuous walking (≈71% of the map width).
+const MOVEMENT_BUDGET: f32 = 1000.0;
 const COYOTE_TIME: f32 = 0.15;        // Grace window after walking off edge
 const JUMP_BUFFER_TIME: f32 = 0.12;   // Jump pressed just before landing
 

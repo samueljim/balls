@@ -393,30 +393,31 @@ pub fn generate(seed: u32) -> Terrain {
         }
     }
 
-    // Worms-style underground cave tunnels — smooth worm-carved passages deep underground.
-    // Each cave is a "worm" that walks with slow angular changes, producing natural curves.
+    // Worms-style underground cave tunnels — janky, irregular passages deep underground.
+    // Each cave is a "worm" that walks with strong angular changes, producing natural but
+    // erratic shapes with chambers, pinches, and direction reversals.
     s = lcg(s.wrapping_add(2000));
-    let num_caves = 3 + (s >> 16) as u32 % 2; // 3-4 caves
+    let num_caves = 4 + (s >> 16) as u32 % 3; // 4-6 caves
     let max_cave_y = WATER_LEVEL as i32 - 40; // stay well above water
-    let min_depth_below_surface = 70i32; // caves start at least this far below surface
+    let min_depth_below_surface = 60i32; // caves start at least this far below surface
 
     for _ in 0..num_caves {
         s = lcg(s);
-        let start_x = LAND_START_X as i32 + 200 + (s >> 16) as i32 % (land_width - 400);
+        let start_x = LAND_START_X as i32 + 150 + (s >> 16) as i32 % (land_width - 300);
         let surface_at_start = heights[start_x.clamp(0, w as i32 - 1) as usize] as i32;
         s = lcg(s);
-        let start_depth = min_depth_below_surface + (s >> 16) as i32 % 80; // 70–150 px below surface
+        let start_depth = min_depth_below_surface + (s >> 16) as i32 % 100; // 60–160 px below surface
         let start_y = (surface_at_start + start_depth).min(max_cave_y);
 
         s = lcg(s);
-        let cave_radius = 14 + (s >> 16) as i32 % 5; // 14–18 px radius → 28–36 px diameter
+        let base_radius = 12 + (s >> 16) as i32 % 10; // 12–21 px radius → more varied sizes
+        let mut cave_radius = base_radius;
 
-        // Walking direction: mostly horizontal with small random vertical tilt
+        // Walking direction: can start at any angle now — much more varied
         s = lcg(s);
         let dir_sign = if (s >> 16) % 2 == 0 { 1.0f32 } else { -1.0f32 };
         s = lcg(s);
-        let initial_tilt = ((s >> 16) as f32 / 65535.0 - 0.5) * 0.4; // ±0.2 rad vertical tilt
-        // Rightward: angle near 0; leftward: angle near π — same vertical-tilt distribution
+        let initial_tilt = ((s >> 16) as f32 / 65535.0 - 0.5) * 1.2; // ±0.6 rad — much wilder start
         let mut walk_angle = if dir_sign > 0.0 {
             initial_tilt
         } else {
@@ -428,9 +429,37 @@ pub fn generate(seed: u32) -> Terrain {
         let mut wy = start_y as f32;
 
         s = lcg(s);
-        let num_steps = 200 + (s >> 16) as i32 % 120; // 200–320 steps × 3 px = 600–960 px length
+        let num_steps = 250 + (s >> 16) as i32 % 180; // 250–430 steps × varied px = longer caves
 
-        for _ in 0..num_steps {
+        // Chamber state: tracks whether we are currently inside an expanded chamber.
+        // Resets each time chamber_countdown fires, then radius decays back to normal.
+        let mut in_chamber = false;
+        let mut chamber_countdown = 30 + (s >> 16) as i32 % 60;
+
+        for step_i in 0..num_steps {
+            // Vary cave radius — shrink to pinch points, expand to chambers
+            chamber_countdown -= 1;
+            if chamber_countdown <= 0 {
+                s = lcg(s);
+                chamber_countdown = 25 + (s >> 16) as i32 % 70;
+                s = lcg(s);
+                // Expand to a chamber (radius 1.5–2.5× normal)
+                let chamber_extra = 6 + (s >> 16) as i32 % 14;
+                cave_radius = base_radius + chamber_extra;
+                in_chamber = true;
+            } else if in_chamber {
+                // Gradually shrink back toward normal radius after chamber peak
+                cave_radius = (cave_radius - 1).max(base_radius);
+                if cave_radius == base_radius {
+                    in_chamber = false;
+                }
+            }
+
+            // Occasional pinch: narrow passages between chambers
+            if !in_chamber && step_i % 40 == 20 {
+                cave_radius = (base_radius - 4).max(6);
+            }
+
             // Carve a filled circle at the current worm position
             let ix = wx as i32;
             let iy = wy as i32;
@@ -443,24 +472,26 @@ pub fn generate(seed: u32) -> Terrain {
                 }
             }
 
-            // Smooth angular-velocity update: small random acceleration + horizontal bias
+            // Janky angular-velocity update: large random accelerations with weak restoration.
+            // This creates dramatic bends and turns unlike the smooth original caves.
             s = lcg(s);
-            let rand_acc = ((s >> 16) as f32 / 65535.0 - 0.5) * 0.10; // ±0.05 rad/step
-            ang_vel = ang_vel * 0.88 + rand_acc * 0.12;
-            // Restoring force back toward horizontal (prevents worm from spiralling)
-            ang_vel -= walk_angle.sin() * 0.05;
-            ang_vel = ang_vel.clamp(-0.10, 0.10);
+            let rand_acc = ((s >> 16) as f32 / 65535.0 - 0.5) * 0.50; // ±0.25 rad/step (was ±0.05)
+            ang_vel = ang_vel * 0.75 + rand_acc * 0.25;
+            // Very weak restoring force — allows near-vertical sections and loops
+            ang_vel -= walk_angle.sin() * 0.015;
+            ang_vel = ang_vel.clamp(-0.45, 0.45); // much wider range (was ±0.10)
             walk_angle += ang_vel;
 
-            // Advance position
-            let step_size = 3.0f32;
+            // Variable step size: sometimes lunges, sometimes crawls
+            s = lcg(s);
+            let step_size = 2.0 + (s >> 16) as f32 / 65535.0 * 4.0; // 2–6 px
             wx += walk_angle.cos() * step_size;
             wy += walk_angle.sin() * step_size;
 
             // Bounce off horizontal map boundaries
             if wx < LAND_START_X + 30.0 || wx > LAND_END_X - 30.0 {
                 walk_angle = std::f32::consts::PI - walk_angle;
-                ang_vel = -ang_vel;
+                ang_vel = -ang_vel * 0.7;
                 wx = wx.clamp(LAND_START_X + 30.0, LAND_END_X - 30.0);
             }
 
@@ -473,7 +504,7 @@ pub fn generate(seed: u32) -> Terrain {
                 if walk_angle.sin() < 0.0 {
                     walk_angle = -walk_angle; // reflect vertical component, preserve horizontal
                 }
-                ang_vel = 0.0; // reset angular velocity on depth-ceiling bounce
+                ang_vel = ang_vel.abs() * 0.5; // lose some angular momentum on bounce
             }
 
             // Keep above water

@@ -954,8 +954,31 @@ impl Game {
                 };
                 let idx = self.current_ball;
                 if idx < self.balls.len() && self.balls[idx].alive {
-                    self.balls[idx].x = target_x;
-                    self.balls[idx].y = target_y;
+                    // Find a safe landing spot: if the target is inside solid terrain, search
+                    // upward for the first open cell and land just above the terrain surface.
+                    let r = physics::BALL_RADIUS;
+                    let safe_x = target_x.clamp(r + 1.0, self.terrain.width as f32 - r - 1.0);
+                    let mut safe_y = target_y;
+                    // If inside solid terrain, push upward to find open space
+                    let mut ty = target_y as i32;
+                    let min_ty = 10i32;
+                    while ty > min_ty && self.terrain.is_solid(safe_x as i32, ty) {
+                        ty -= 1;
+                    }
+                    // Now scan downward to find the surface to land on
+                    if !self.terrain.is_solid(safe_x as i32, ty) {
+                        let mut land_y = ty;
+                        while land_y < self.terrain.height as i32 - 1
+                            && !self.terrain.is_solid(safe_x as i32, land_y + 1)
+                        {
+                            land_y += 1;
+                        }
+                        // land_y is the last air row — place ball center just above ground
+                        safe_y = (land_y as f32 - r).min(target_y);
+                    }
+                    safe_y = safe_y.clamp(r + 1.0, crate::terrain::WATER_LEVEL - r - 5.0);
+                    self.balls[idx].x = safe_x;
+                    self.balls[idx].y = safe_y;
                     self.balls[idx].vx = 0.0;
                     self.balls[idx].vy = 0.0;
                     self.teleport_mode = false;
@@ -965,7 +988,7 @@ impl Game {
                     if self.net.connected {
                         let input_json = format!(
                             r#"{{"TeleportTo":{{"x":{},"y":{}}}}}"#,
-                            target_x, target_y
+                            safe_x, safe_y
                         );
                         let mut escaped = String::new();
                         for c in input_json.chars() {
@@ -2389,13 +2412,17 @@ impl Game {
                                 self.wall_log.push((ax as i32, ay as i32, (angle * 1000.0) as i32));
                             }
                         } else if input_str.contains("TeleportTo") {
-                            // Move the remote player's ball to target position
+                            // Move the remote player's ball to target position (coordinates
+                            // were already sanitised by the sender, just apply them directly).
                             let tx = parse_json_number(&input_str, "x").map(|v| v as f32);
                             let ty = parse_json_number(&input_str, "y").map(|v| v as f32);
                             if let (Some(tx), Some(ty)) = (tx, ty) {
                                 if ball_idx < self.balls.len() && self.balls[ball_idx].alive {
-                                    self.balls[ball_idx].x = tx.clamp(0.0, self.terrain.width as f32);
-                                    self.balls[ball_idx].y = ty.clamp(0.0, self.terrain.height as f32);
+                                    let r = physics::BALL_RADIUS;
+                                    let safe_x = tx.clamp(r + 1.0, self.terrain.width as f32 - r - 1.0);
+                                    let safe_y = ty.clamp(r + 1.0, terrain::WATER_LEVEL - r - 5.0);
+                                    self.balls[ball_idx].x = safe_x;
+                                    self.balls[ball_idx].y = safe_y;
                                     self.balls[ball_idx].vx = 0.0;
                                     self.balls[ball_idx].vy = 0.0;
                                 }
@@ -2585,6 +2612,8 @@ impl Game {
                             let by = self.balls[bot_ball_idx].y;
                             // Find nearest living enemy ball
                             let mut best_dist = f32::MAX;
+                            let mut target_x = 0.0f32;
+                            let mut target_y = 0.0f32;
                             let mut best_angle = -0.5f32; // default: slightly upward
                             let mut found_enemy = false;
                             for w in &self.balls {
@@ -2594,20 +2623,73 @@ impl Game {
                                 let dist = (dx * dx + dy * dy).sqrt();
                                 if dist < best_dist {
                                     best_dist = dist;
-                                    // Aim slightly above the target so the missile arcs in
-                                    best_angle = dy.atan2(dx) - 0.25;
+                                    target_x = w.x;
+                                    target_y = w.y;
+                                    // Aim slightly above the target so projectiles arc in
+                                    best_angle = dy.atan2(dx) - 0.20;
                                     found_enemy = true;
                                 }
                             }
                             if found_enemy {
+                                // Pick weapon based on distance and RNG — with a strong
+                                // preference for Homing Missile, but real variety too.
+                                self.rng_state = lcg(self.rng_state);
+                                let weapon_roll = (self.rng_state >> 16) as f32 / 65535.0;
+                                let chosen_weapon = if best_dist < 150.0 {
+                                    // Close range: shotgun, grenade, banana, bat area
+                                    if weapon_roll < 0.35 { Weapon::Shotgun }
+                                    else if weapon_roll < 0.55 { Weapon::Grenade }
+                                    else if weapon_roll < 0.70 { Weapon::BananaBomb }
+                                    else if weapon_roll < 0.82 { Weapon::ClusterBomb }
+                                    else { Weapon::HomingMissile }
+                                } else if best_dist < 350.0 {
+                                    // Medium range: homing favourite, plus mortars and grenades
+                                    if weapon_roll < 0.42 { Weapon::HomingMissile }
+                                    else if weapon_roll < 0.58 { Weapon::Bazooka }
+                                    else if weapon_roll < 0.70 { Weapon::Mortar }
+                                    else if weapon_roll < 0.80 { Weapon::Grenade }
+                                    else if weapon_roll < 0.88 { Weapon::ClusterBomb }
+                                    else { Weapon::BananaBomb }
+                                } else {
+                                    // Long range: homing missile strongly preferred
+                                    if weapon_roll < 0.55 { Weapon::HomingMissile }
+                                    else if weapon_roll < 0.72 { Weapon::Bazooka }
+                                    else if weapon_roll < 0.83 { Weapon::Mortar }
+                                    else if weapon_roll < 0.91 { Weapon::BananaBomb }
+                                    else { Weapon::ClusterBomb }
+                                };
+
+                                // Add a little aim wobble for imperfect bots
+                                self.rng_state = lcg(self.rng_state);
+                                let wobble = ((self.rng_state >> 16) as f32 / 65535.0 - 0.5) * 0.25;
+                                let fire_angle = best_angle + wobble;
+
+                                // For homing missile, aim more directly at target
+                                let final_angle = if chosen_weapon == Weapon::HomingMissile {
+                                    let aim_dy = target_y - by;
+                                    let aim_dx = target_x - bx;
+                                    aim_dy.atan2(aim_dx) - 0.25 + wobble * 0.5
+                                } else {
+                                    fire_angle
+                                };
+
+                                // Power varies by weapon and distance.
+                                // Mortar scales 55–90 power linearly with dist (max +35 at ~525 px).
+                                let power = match chosen_weapon {
+                                    Weapon::HomingMissile => 80.0,
+                                    Weapon::Mortar => 55.0 + (best_dist / 15.0).min(35.0),
+                                    Weapon::Shotgun => 70.0,
+                                    _ => (40.0 + best_dist / 10.0).min(90.0),
+                                };
+
                                 self.current_ball = bot_ball_idx;
-                                self.aim_angle = best_angle;
-                                self.selected_weapon = Weapon::HomingMissile;
+                                self.aim_angle = final_angle;
+                                self.selected_weapon = chosen_weapon;
                                 let shooter_team = self.balls[bot_ball_idx].team;
                                 let offset = BALL_RADIUS + 4.0;
-                                let sx = bx + best_angle.cos() * offset;
-                                let sy = by + best_angle.sin() * offset;
-                                let proj = Projectile::new(sx, sy, best_angle, 80.0, Weapon::HomingMissile, shooter_team);
+                                let sx = bx + final_angle.cos() * offset;
+                                let sy = by + final_angle.sin() * offset;
+                                let proj = Projectile::new(sx, sy, final_angle, power, chosen_weapon, shooter_team);
                                 self.proj = Some(proj);
                                 self.has_fired = true;
                                 self.phase = Phase::ProjectileFlying;

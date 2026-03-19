@@ -636,6 +636,7 @@ export class Game implements DurableObject {
 
     // Decide whether to walk toward the target first (if they're very far away)
     const dist = Math.abs(dx);
+    const totalDist = Math.hypot(target.x - sx, target.y - sy);
     const walkDir = dx > 0 ? 1 : -1;
     // Walk 1–4 steps when target is far; 0 when close or almost in range already
     const walkSteps = dist > 500 ? 4 : dist > 300 ? 2 : dist > 150 ? 1 : 0;
@@ -659,11 +660,42 @@ export class Game implements DurableObject {
       power = 55 + Math.floor(this.botRand() * 30);
     }
 
+    // Choose weapon based on distance — strongly prefer Homing Missile, but use
+    // a varied selection to keep gameplay interesting. No airstrikes or nukes.
+    // Mortar power scales 55–90 linearly with distance (max +35 at ~525 px range).
+    const mortarPower = (dist: number): number => Math.min(90, 55 + dist / 15);
+    const weaponRoll = this.botRand();
+    let weapon: string;
+    let finalPower = power;
+    if (totalDist < 150) {
+      // Close range
+      if (weaponRoll < 0.35)      { weapon = "Shotgun"; finalPower = 70; }
+      else if (weaponRoll < 0.55) { weapon = "Grenade"; }
+      else if (weaponRoll < 0.72) { weapon = "Banana Bomb"; }
+      else if (weaponRoll < 0.85) { weapon = "Cluster Bomb"; }
+      else                         { weapon = "Homing Missile"; finalPower = 80; }
+    } else if (totalDist < 350) {
+      // Medium range — homing missile favourite
+      if (weaponRoll < 0.42)      { weapon = "Homing Missile"; finalPower = 80; }
+      else if (weaponRoll < 0.58) { weapon = "Bazooka"; }
+      else if (weaponRoll < 0.70) { weapon = "Mortar"; finalPower = mortarPower(totalDist); }
+      else if (weaponRoll < 0.80) { weapon = "Grenade"; }
+      else if (weaponRoll < 0.88) { weapon = "Cluster Bomb"; }
+      else                         { weapon = "Banana Bomb"; }
+    } else {
+      // Long range — homing missile strongly preferred
+      if (weaponRoll < 0.55)      { weapon = "Homing Missile"; finalPower = 80; }
+      else if (weaponRoll < 0.72) { weapon = "Bazooka"; }
+      else if (weaponRoll < 0.83) { weapon = "Mortar"; finalPower = mortarPower(totalDist); }
+      else if (weaponRoll < 0.91) { weapon = "Banana Bomb"; }
+      else                         { weapon = "Cluster Bomb"; }
+    }
+
     return {
       ballIndex: chosen,
       walkDir,
       walkSteps,
-      fireInput: JSON.stringify({ Fire: { weapon: "Bazooka", angle_deg: angleDeg, power_percent: power } }),
+      fireInput: JSON.stringify({ Fire: { weapon, angle_deg: angleDeg, power_percent: finalPower } }),
     };
   }
 

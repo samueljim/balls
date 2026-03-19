@@ -159,30 +159,12 @@ pub fn draw_hud(
         let actual_font = if raw_lw > max_label_w { 14u16 } else { label_font };
         draw_text(&turn_label, 10.0, 23.0, actual_font as f32, turn_color);
 
-        // Row 2 — HP + mini move bar
+        // Row 2 — HP
         if current_ball < balls.len() {
             let ball = &balls[current_ball];
             let hp_text = format!("HP:{}", ball.health);
             let hp_font = 15u16;
             draw_text(&hp_text, 10.0, 52.0, hp_font as f32, WHITE);
-            let hp_w = measure_text(&hp_text, None, hp_font, 1.0).width;
-
-            let move_remaining = ball.movement_remaining();
-            let move_frac = (move_remaining / ball.movement_budget).clamp(0.0, 1.0);
-            let bar_x = 10.0 + hp_w + 6.0;
-            let bar_w = 40.0;
-            let bar_h_px = 7.0;
-            let bar_y = 46.0;
-            draw_rectangle(bar_x - 1.0, bar_y - 1.0, bar_w + 2.0, bar_h_px + 2.0,
-                Color::new(0.0, 0.0, 0.0, 0.6));
-            let bar_color = if move_frac > 0.5 {
-                Color::new(0.2, 0.7, 1.0, 0.9)
-            } else if move_frac > 0.15 {
-                Color::new(0.9, 0.7, 0.2, 0.9)
-            } else {
-                Color::new(0.9, 0.3, 0.2, 0.9)
-            };
-            draw_rectangle(bar_x, bar_y, bar_w * move_frac, bar_h_px, bar_color);
         }
 
         // Row 2 center — phase label
@@ -219,31 +201,6 @@ pub fn draw_hud(
             let hp = format!("HP:{}", ball.health);
             let hp_x = 12.0 + measure_text(&label, None, 26, 1.0).width + 14.0;
             draw_text(&hp, hp_x, 30.0, 20.0, WHITE);
-
-            // Draw movement bar
-            let move_remaining = ball.movement_remaining();
-            let move_percent = (move_remaining / ball.movement_budget * 100.0).min(100.0);
-            let move_x = hp_x + measure_text(&hp, None, 20, 1.0).width + 20.0;
-
-            let bar_w = 60.0;
-            let bar_h = 8.0;
-            let bar_y = 20.0;
-            draw_rectangle(move_x - 1.0, bar_y - 1.0, bar_w + 2.0, bar_h + 2.0,
-                Color::new(0.0, 0.0, 0.0, 0.6));
-
-            let move_frac = move_remaining / ball.movement_budget;
-            let bar_color = if move_frac > 0.5 {
-                Color::new(0.2, 0.7, 1.0, 0.9)
-            } else if move_frac > 0.15 {
-                Color::new(0.9, 0.7, 0.2, 0.9)
-            } else {
-                Color::new(0.9, 0.3, 0.2, 0.9)
-            };
-            draw_rectangle(move_x, bar_y, bar_w * move_frac, bar_h, bar_color);
-            draw_text("MOVE", move_x, 16.0, 11.0, Color::new(0.7, 0.7, 0.7, 0.8));
-            let move_text = format!("{:.0}%", move_percent);
-            draw_text(&move_text, move_x + bar_w + 4.0, 28.0, 14.0,
-                if move_frac < 0.1 { Color::new(1.0, 0.3, 0.3, 1.0) } else { WHITE });
         }
 
         // Phase label — use player name, not team number

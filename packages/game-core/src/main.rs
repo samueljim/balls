@@ -616,7 +616,6 @@ impl Game {
             if let Some(wi) = ball_idx_opt {
                 if wi < self.balls.len() && self.balls[wi].alive {
                     let ball = &mut self.balls[wi];
-                    let can_move = ball.can_move();
 
                     if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) {
                         physics::walk(ball, &self.terrain, -1.0);
@@ -625,20 +624,18 @@ impl Game {
                         physics::walk(ball, &self.terrain, 1.0);
                     }
 
-                    if can_move {
-                        if is_key_pressed(KeyCode::W) || is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::Space) {
-                            physics::jump(ball);
-                            if self.net.connected {
-                                let msg = r#"{"type":"input","input":"{\"Jump\":{}}"}"#;
-                                self.net.send_message(msg);
-                            }
+                    if is_key_pressed(KeyCode::W) || is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::Space) {
+                        physics::jump(ball);
+                        if self.net.connected {
+                            let msg = r#"{"type":"input","input":"{\"Jump\":{}}"}"#;
+                            self.net.send_message(msg);
                         }
-                        if is_key_pressed(KeyCode::S) || is_key_pressed(KeyCode::Down) {
-                            physics::backflip(ball);
-                            if self.net.connected {
-                                let msg = r#"{"type":"input","input":"{\"Backflip\":{}}"}"#;
-                                self.net.send_message(msg);
-                            }
+                    }
+                    if is_key_pressed(KeyCode::S) || is_key_pressed(KeyCode::Down) {
+                        physics::backflip(ball);
+                        if self.net.connected {
+                            let msg = r#"{"type":"input","input":"{\"Backflip\":{}}"}"#;
+                            self.net.send_message(msg);
                         }
                     }
                 }
@@ -739,18 +736,14 @@ impl Game {
         // Only allow movement if it's the player's turn and phase allows it
         if self.is_my_turn() && self.phase.allows_movement() && self.current_ball < self.balls.len() && self.balls[self.current_ball].alive && !self.weapon_menu_open {
             let ball = &mut self.balls[self.current_ball];
-            let can_move = ball.can_move();
-            
+
             if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) {
                 physics::walk(ball, &self.terrain, -1.0);
             }
             if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) {
                 physics::walk(ball, &self.terrain, 1.0);
             }
-            
-            // Jumping always allowed regardless of movement budget — it's the escape hatch
-            // for players who get stuck. Cost is still tracked (charged on landing) but
-            // the budget gate is bypassed so players can always jump to get unstuck.
+
             if is_key_pressed(KeyCode::W) || is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::Space) {
                 physics::jump(ball);
                 if self.net.connected {
@@ -761,16 +754,14 @@ impl Game {
                     self.net.send_message(&msg);
                 }
             }
-            if can_move {
-                if is_key_pressed(KeyCode::S) || is_key_pressed(KeyCode::Down) {
-                    physics::backflip(ball);
-                    if self.net.connected {
-                        let msg = format!(
-                            r#"{{"type":"input","input":"{{\"Backflip\":{{}}}}","bi":{}}}"#,
-                            self.current_ball,
-                        );
-                        self.net.send_message(&msg);
-                    }
+            if is_key_pressed(KeyCode::S) || is_key_pressed(KeyCode::Down) {
+                physics::backflip(ball);
+                if self.net.connected {
+                    let msg = format!(
+                        r#"{{"type":"input","input":"{{\"Backflip\":{{}}}}","bi":{}}}"#,
+                        self.current_ball,
+                    );
+                    self.net.send_message(&msg);
                 }
             }
         }
@@ -936,9 +927,6 @@ impl Game {
                 // Restore zoom now that targeting is done.
                 self.cam_target_zoom = DEFAULT_ZOOM;
                 self.cam_return_timer = 2.0;
-                if self.current_ball < self.balls.len() {
-                    self.balls[self.current_ball].reset_movement_budget();
-                }
                 if self.net.connected {
                     let weapon_name = match airstrike_weapon {
                         Weapon::NapalmStrike => "NapalmStrike",
@@ -1110,12 +1098,6 @@ impl Game {
         self.cam_return_timer = 0.0;   // skip the glide-back phase too
         self.do_fire(idx, angle, power, weapon);
 
-        // Give the firing player a fresh movement budget so they can dodge
-        // while the projectile is in the air.
-        if self.phase == Phase::ProjectileFlying && idx < self.balls.len() {
-            self.balls[idx].reset_movement_budget();
-        }
-
         // Don't set has_fired for Baseball Bat, Teleport, and BuildWall - they need a second click
         if weapon != Weapon::BaseballBat && weapon != Weapon::Teleport && weapon != Weapon::BuildWall
             && weapon != Weapon::Airstrike && weapon != Weapon::NapalmStrike {
@@ -1279,9 +1261,6 @@ impl Game {
                 });
                 self.phase = Phase::Retreat;
                 self.retreat_timer = 5.0;
-                if self.current_ball < self.balls.len() {
-                    self.balls[self.current_ball].reset_movement_budget();
-                }
             },
             
             // Baseball Bat - enter melee mode
@@ -1442,9 +1421,6 @@ impl Game {
                 });
                 self.phase = Phase::Retreat;
                 self.retreat_timer = 5.0;
-                if self.current_ball < self.balls.len() {
-                    self.balls[self.current_ball].reset_movement_budget();
-                }
             },
 
             // Mortar - fire as projectile but enter Retreat immediately so player
@@ -1455,9 +1431,6 @@ impl Game {
                 self.proj = Some(proj);
                 self.phase = Phase::Retreat;
                 self.retreat_timer = 5.0;
-                if self.current_ball < self.balls.len() {
-                    self.balls[self.current_ball].reset_movement_budget();
-                }
             },
 
             // All other weapons use regular projectile
@@ -1903,9 +1876,8 @@ impl Game {
         self.non_active_stuck_timer = 0.0;
         self.pending_sync_send_terrain = false;
         
-        // Reset movement budget for the current ball
+        // Set aim angle based on the current ball's facing direction
         if self.current_ball < self.balls.len() {
-            self.balls[self.current_ball].reset_movement_budget();
             self.aim_angle = if self.balls[self.current_ball].facing > 0.0 {
                 -0.3
             } else {
@@ -2349,11 +2321,6 @@ impl Game {
                             }
                             self.do_fire(ball_idx, angle_rad, power, weapon);
                             self.has_fired = true;
-                            // Reset budget on the firing ball so remote players also get
-                            // a fresh dodge window once their shot is in the air.
-                            if self.phase == Phase::ProjectileFlying && ball_idx < self.balls.len() {
-                                self.balls[ball_idx].reset_movement_budget();
-                            }
                             } // end !is_two_click
                         } else if let Some(dir) = parse_walk_input(&input_str) {
                             if ball_idx < self.balls.len() {
@@ -2362,12 +2329,10 @@ impl Game {
                         } else if input_str.contains("\"Jump\"") || input_str.contains("Jump") {
                             if ball_idx < self.balls.len() {
                                 physics::jump(&mut self.balls[ball_idx]);
-                                self.balls[ball_idx].movement_used += 20.0;
                             }
                         } else if input_str.contains("\"Backflip\"") || input_str.contains("Backflip") {
                             if ball_idx < self.balls.len() {
                                 physics::backflip(&mut self.balls[ball_idx]);
-                                self.balls[ball_idx].movement_used += 30.0;
                             }
                         } else if input_str.contains("AirstrikeTarget") {
                             // Spawn airstrike/napalm droplets for the remote player's click
@@ -2395,9 +2360,6 @@ impl Game {
                                 }
                                 self.has_fired = true;
                                 self.phase = Phase::ProjectileFlying;
-                                if ball_idx < self.balls.len() {
-                                    self.balls[ball_idx].reset_movement_budget();
-                                }
                             }
                         } else if input_str.contains("BuildWallPlace") {
                             // Stamp the wall onto terrain for the remote player's placement
@@ -3006,10 +2968,6 @@ impl Game {
                         // Active player: enter retreat phase - 5 seconds to move
                         self.phase = Phase::Retreat;
                         self.retreat_timer = 5.0;
-                        // Reset movement budget for retreat
-                        if self.current_ball < self.balls.len() {
-                            self.balls[self.current_ball].reset_movement_budget();
-                        }
                     } else if !self.net.connected {
                         self.end_turn();
                     } else if self.is_my_turn() {

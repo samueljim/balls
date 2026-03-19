@@ -384,9 +384,8 @@ pub fn generate(seed: u32) -> Terrain {
             for dx in 0..plat_width {
                 let x = px + dx;
                 if x >= 0 && x < w as i32 {
-                    t.set(x, py, GRASS);
-                    for d in 1..4 {
-                        t.set(x, py + d, DIRT);
+                    for d in 0..6 {
+                        t.set(x, py + d, WOOD);
                     }
                 }
             }

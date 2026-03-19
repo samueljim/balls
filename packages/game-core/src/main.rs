@@ -241,7 +241,7 @@ impl Game {
                 }
                 
                 if is_safe {
-                    spawn_y = Some(surface_y as f32 - BALL_RADIUS - 2.0);
+                    spawn_y = Some(surface_y as f32 - BALL_RADIUS - 5.0);
                 }
             }
             
@@ -251,7 +251,7 @@ impl Game {
                     for dir in [-1, 1] {
                         let test_x = (x as i32 + offset * dir).max(terrain::LAND_START_X as i32).min(terrain::LAND_END_X as i32);
                         if let Some(surface_y) = t.find_surface_y(test_x) {
-                            let ball_y = surface_y - (BALL_RADIUS as i32) - 2;
+                            let ball_y = surface_y - (BALL_RADIUS as i32) - 5;
                             let mut is_safe = true;
                             
                             // Check area around spawn position for lava
@@ -268,7 +268,7 @@ impl Game {
                             }
                             
                             if is_safe {
-                                spawn_y = Some(surface_y as f32 - BALL_RADIUS - 2.0);
+                                spawn_y = Some(surface_y as f32 - BALL_RADIUS - 5.0);
                                 search_x = test_x;
                                 break;
                             }
@@ -1882,6 +1882,13 @@ impl Game {
         self.phase = Phase::Aiming;
         self.turn_timer = TURN_TIME;
         self.has_fired = false;
+        
+        // Nudge the active ball slightly above the ground at turn start so it is never
+        // stuck in terrain. It will simply fall back down on the first physics tick.
+        if self.current_ball < self.balls.len() {
+            self.balls[self.current_ball].y -= 5.0;
+            self.balls[self.current_ball].vy = 0.0;
+        }
         self.firing_by_key = false;
         self.aim_locked = false;
         self.retreat_timer = 0.0;

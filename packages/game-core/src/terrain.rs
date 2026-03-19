@@ -211,19 +211,6 @@ fn lcg(s: u32) -> u32 {
     s.wrapping_mul(1103515245).wrapping_add(12345)
 }
 
-/// Simple integer-hash based 2D noise in [0,1). Lightweight and deterministic.
-fn noise_2d(x: f32, y: f32, seed: f32) -> f32 {
-    let ix = x as i32;
-    let iy = y as i32;
-    let is = seed as i32;
-    let mut h = (ix as u32).wrapping_mul(374761393)
-        .wrapping_add((iy as u32).wrapping_mul(668265263))
-        .wrapping_add((is as u32).wrapping_mul(982451653));
-    h = (h ^ (h >> 13)).wrapping_mul(1274126177);
-    h = h ^ (h >> 16);
-    (h & 0x00FFFFFF) as f32 / 16777216.0
-}
-
 pub fn generate(seed: u32) -> Terrain {
     let w = WIDTH;
     let h = HEIGHT;
@@ -380,31 +367,6 @@ pub fn generate(seed: u32) -> Terrain {
         }
     }
 
-    // Carve a porous cave field using 2D noise so maps get lots of natural caverns.
-    // This runs AFTER the terrain fill so the carved AIR is not overwritten.
-    {
-        let cave_scale = 0.035; // coarser noise for big caverns
-        let cave_threshold = 0.42; // lower -> more air; slightly stricter to protect surface
-        for x in LAND_START_X as i32..=LAND_END_X as i32 {
-            if x < 0 || x >= w as i32 { continue; }
-            let ground = heights[x as usize] as i32;
-            // create caves starting a bit below surface and extending downward
-            let y0 = (ground + 10).max(10);
-            let y1 = (ground + 220).min(h as i32 - 10);
-            for y in y0..=y1 {
-                let nx = x as f32 * cave_scale;
-                let ny = y as f32 * cave_scale;
-                // combine a couple of noise samples for variety
-                let n1 = noise_2d(nx, ny, sf + 6000.0);
-                let n2 = noise_2d(nx * 1.7 + 17.0, ny * 0.9 + 53.0, sf + 7000.0) * 0.6;
-                let n = n1 * 0.7 + n2 * 0.3;
-                if n < cave_threshold {
-                    t.set(x, y, AIR);
-                }
-            }
-        }
-    }
-
     let mut s = lcg(seed.wrapping_add(1000));
     let num_platforms = 3 + (s >> 16) as u32 % 4;
     let land_width = (LAND_END_X - LAND_START_X) as i32;
@@ -431,136 +393,91 @@ pub fn generate(seed: u32) -> Terrain {
         }
     }
 
-    // Generate improved caves with more variety
+    // Worms-style underground cave tunnels — smooth worm-carved passages deep underground.
+    // Each cave is a "worm" that walks with slow angular changes, producing natural curves.
     s = lcg(s.wrapping_add(2000));
-    let num_caves = 12 + (s >> 16) as u32 % 6; // Many caves (12-17)
-    let mut cave_positions = Vec::new();
-    
-    for i in 0..num_caves {
+    let num_caves = 3 + (s >> 16) as u32 % 2; // 3-4 caves
+    let max_cave_y = WATER_LEVEL as i32 - 40; // stay well above water
+    let min_depth_below_surface = 70i32; // caves start at least this far below surface
+
+    for _ in 0..num_caves {
         s = lcg(s);
-        let cx = LAND_START_X as i32 + 100 + (s >> 16) as i32 % (land_width - 200);
+        let start_x = LAND_START_X as i32 + 200 + (s >> 16) as i32 % (land_width - 400);
+        let surface_at_start = heights[start_x.clamp(0, w as i32 - 1) as usize] as i32;
         s = lcg(s);
-        let cy = 100 + (s >> 16) as i32 % ((heights[cx as usize] as i32) - 120);
+        let start_depth = min_depth_below_surface + (s >> 16) as i32 % 80; // 70–150 px below surface
+        let start_y = (surface_at_start + start_depth).min(max_cave_y);
+
         s = lcg(s);
-        let cave_w = 110 + (s >> 16) as i32 % 160; // Generous width (110-270)
+        let cave_radius = 14 + (s >> 16) as i32 % 5; // 14–18 px radius → 28–36 px diameter
+
+        // Walking direction: mostly horizontal with small random vertical tilt
         s = lcg(s);
-        let cave_h = 70 + (s >> 16) as i32 % 110; // Generous height (70-180)
-        
-        cave_positions.push((cx, cy));
-        
-        // Carve out main cave chamber with more organic shape
-        for dy in 0..cave_h {
-            for dx in 0..cave_w {
-                let xd = (dx - cave_w / 2) as f32;
-                let yd = (dy - cave_h / 2) as f32;
-                // Use different radii for more irregular shapes
-                let x_radius = cave_w as f32 * 0.5;
-                let y_radius = cave_h as f32 * 0.5;
-                let dist = ((xd * xd) / (x_radius * x_radius) + 
-                           (yd * yd) / (y_radius * y_radius)).sqrt();
-                
-                // Add some noise to cave edges for organic feel
-                s = lcg(s);
-                let noise = ((s >> 16) as f32 / 65535.0) * 0.25;
-                if dist < 1.0 + noise {
-                    t.set(cx + dx - cave_w / 2, cy + dy - cave_h / 2, AIR);
+        let dir_sign = if (s >> 16) % 2 == 0 { 1.0f32 } else { -1.0f32 };
+        s = lcg(s);
+        let initial_tilt = ((s >> 16) as f32 / 65535.0 - 0.5) * 0.4; // ±0.2 rad vertical tilt
+        // Rightward: angle near 0; leftward: angle near π — same vertical-tilt distribution
+        let mut walk_angle = if dir_sign > 0.0 {
+            initial_tilt
+        } else {
+            std::f32::consts::PI - initial_tilt
+        };
+        let mut ang_vel = 0.0f32;
+
+        let mut wx = start_x as f32;
+        let mut wy = start_y as f32;
+
+        s = lcg(s);
+        let num_steps = 200 + (s >> 16) as i32 % 120; // 200–320 steps × 3 px = 600–960 px length
+
+        for _ in 0..num_steps {
+            // Carve a filled circle at the current worm position
+            let ix = wx as i32;
+            let iy = wy as i32;
+            let r2 = cave_radius * cave_radius;
+            for dy in -cave_radius..=cave_radius {
+                for dx in -cave_radius..=cave_radius {
+                    if dx * dx + dy * dy <= r2 {
+                        t.set(ix + dx, iy + dy, AIR);
+                    }
                 }
             }
-        }
-        
-        // Add small alcoves to some caves for more complexity
-        s = lcg(s);
-        if (s >> 16) % 2 == 0 {
+
+            // Smooth angular-velocity update: small random acceleration + horizontal bias
             s = lcg(s);
-            let alcove_dx = if (s >> 16) % 2 == 0 { -cave_w / 3 } else { cave_w / 3 };
-            let alcove_w = 15 + (s >> 16) as i32 % 20;
-            let alcove_h = 12 + (s >> 16) as i32 % 15;
-            
-            for dy in 0..alcove_h {
-                for dx in 0..alcove_w {
-                    let xd = (dx - alcove_w / 2) as f32;
-                    let yd = (dy - alcove_h / 2) as f32;
-                    let dist = ((xd * xd + yd * yd) as f32).sqrt();
-                    if dist < (alcove_w.min(alcove_h) as f32) * 0.5 {
-                        t.set(cx + alcove_dx + dx - alcove_w / 2, cy + dy - alcove_h / 2, AIR);
-                    }
-                }
+            let rand_acc = ((s >> 16) as f32 / 65535.0 - 0.5) * 0.10; // ±0.05 rad/step
+            ang_vel = ang_vel * 0.88 + rand_acc * 0.12;
+            // Restoring force back toward horizontal (prevents worm from spiralling)
+            ang_vel -= walk_angle.sin() * 0.05;
+            ang_vel = ang_vel.clamp(-0.10, 0.10);
+            walk_angle += ang_vel;
+
+            // Advance position
+            let step_size = 3.0f32;
+            wx += walk_angle.cos() * step_size;
+            wy += walk_angle.sin() * step_size;
+
+            // Bounce off horizontal map boundaries
+            if wx < LAND_START_X + 30.0 || wx > LAND_END_X - 30.0 {
+                walk_angle = std::f32::consts::PI - walk_angle;
+                ang_vel = -ang_vel;
+                wx = wx.clamp(LAND_START_X + 30.0, LAND_END_X - 30.0);
             }
-        }
-        
-        // Connect most caves with tunnels
-        if i > 0 && (s >> 16) % 4 != 0 && cave_positions.len() >= 2 {
-            let prev_idx = cave_positions.len() - 2;
-            let (prev_cx, prev_cy) = cave_positions[prev_idx];
-            
-            // Create winding, worm-like tunnel between caves using a noisy walk.
-            // This produces curvier tunnels that can cross over themselves and branch.
-            {
-                let mut px = prev_cx as f32;
-                let mut py = prev_cy as f32;
-                let txf = cx as f32;
-                let tyf = cy as f32;
-                let total_dist = ((txf - px).hypot(tyf - py)).max(1.0);
-                // More steps for longer tunnels
-                let steps = (total_dist / 3.0).max(30.0) as i32;
 
-                for _ in 0..steps {
-                    // steer toward target but with jitter
-                    let desired = (tyf - py).atan2(txf - px);
-                    s = lcg(s);
-                    let jitter = ((s >> 16) as f32 / 65535.0 - 0.5) * 1.6; // +/- ~0.8 rad
-                    let angle = desired + jitter;
-
-                    s = lcg(s);
-                    let step_len = 2.5 + ((s >> 16) as f32 / 65535.0) * 4.0; // 2.5-6.5 px
-                    px += angle.cos() * step_len;
-                    py += angle.sin() * step_len;
-
-                    // varying radius for organic tunnels
-                    s = lcg(s);
-                    let base_r = 7.0 + ((s >> 16) as f32 / 65535.0) * 8.0; // 7-15
-                    let wobble = ((px * 0.12).sin() + (py * 0.15).cos()) * 1.5;
-                    let radius_f = (base_r + wobble).max(3.0);
-                    let radius = radius_f as i32;
-
-                    let ix = px as i32;
-                    let iy = py as i32;
-                    for dy in -radius - 1..=radius + 1 {
-                        for dx in -radius - 1..=radius + 1 {
-                            if dx * dx + dy * dy <= radius * radius {
-                                t.set(ix + dx, iy + dy, AIR);
-                            }
-                        }
-                    }
-
-                    // occasional side-branches for variety
-                    s = lcg(s);
-                    if (s >> 16) % 30 == 0 {
-                        // small branching tunnel
-                        s = lcg(s);
-                        let mut bx = px;
-                        let mut by = py;
-                        let branch_angle = angle + ((s >> 16) as f32 / 65535.0 - 0.5) * 3.14 * 0.5;
-                        s = lcg(s);
-                        let blen = 8 + (s >> 16) as i32 % 20;
-                        for _b in 0..blen {
-                            s = lcg(s);
-                            bx += branch_angle.cos() * (1.8 + ((s >> 16) as f32 / 65535.0) * 2.2);
-                            by += branch_angle.sin() * (1.8 + ((s >> 16) as f32 / 65535.0) * 2.2);
-                            let br = 2 + ((s >> 16) as i32 % 4);
-                            let bix = bx as i32;
-                            let biy = by as i32;
-                            for dy in -br..=br {
-                                for dx in -br..=br {
-                                    if dx * dx + dy * dy <= br * br {
-                                        t.set(bix + dx, biy + dy, AIR);
-                                    }
-                                }
-                            }
-                        }
-                    }
+            // Enforce minimum depth — push worm back underground if it climbs too high
+            let xi = (wx as usize).clamp(0, w as usize - 1);
+            let surf_y = heights[xi] as f32;
+            let min_y = surf_y + min_depth_below_surface as f32;
+            if wy < min_y {
+                wy = min_y;
+                if walk_angle.sin() < 0.0 {
+                    walk_angle = -walk_angle; // reflect vertical component, preserve horizontal
                 }
+                ang_vel = 0.0; // reset angular velocity on depth-ceiling bounce
             }
+
+            // Keep above water
+            wy = wy.min(max_cave_y as f32);
         }
     }
 

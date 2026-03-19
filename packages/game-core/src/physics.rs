@@ -5,7 +5,7 @@ const GRAVITY: f32 = 480.0;
 const WALK_SPEED: f32 = 115.0;         // Slightly snappier
 const JUMP_VEL: f32 = -320.0;          // More air — bigger, floatier jump
 const JUMP_HORIZONTAL_BOOST: f32 = 75.0; // Extra run on jump
-const MAX_CLIMB: i32 = 16;             // Can hop up over small terrain bumps
+const MAX_CLIMB: i32 = 20;             // Can hop up over small terrain bumps
 const GROUND_FRICTION: f32 = 0.80;
 const AIR_FRICTION: f32 = 0.985;       // Slightly less air drag
 const AIR_CONTROL_ACCEL: f32 = 420.0; // Horizontal acceleration applied per-frame while airborne
@@ -357,15 +357,12 @@ pub fn walk(ball: &mut Ball, terrain: &Terrain, dir: f32) {
 
     if blocked_head || blocked_body || blocked_mid || blocked_foot {
         // Try to step up over small terrain bumps.
-        // Require clearance at both ball centre AND ball top so tick()'s
-        // head-wall check won't immediately push the ball back after the step.
-        let ball_top_offset = r as i32;
+        // Only require clearance at ball centre and head — these match tick()'s wall
+        // collision checks, so if they pass here, tick() won't push the ball back.
         for climb in 1..=MAX_CLIMB {
-            let test_y     = ball.y as i32 - climb;
-            let test_top   = test_y - ball_top_offset;
-            let test_head  = test_y - (r * 0.5) as i32;   // head_y at climbed position
+            let test_y    = ball.y as i32 - climb;
+            let test_head = test_y - (r * 0.5) as i32;   // head_y at climbed position
             if !terrain.is_solid(forward_x, test_y)
-                && !terrain.is_solid(forward_x, test_top)
                 && !terrain.is_solid(forward_x, test_head)
             {
                 ball.x = new_x;

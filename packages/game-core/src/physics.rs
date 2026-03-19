@@ -14,10 +14,6 @@ const FALL_DAMAGE_THRESHOLD: f32 = 120.0;
 const FALL_DAMAGE_FACTOR: f32 = 0.25;
 const WALL_IMPACT_THRESHOLD: f32 = 250.0; // min speed to take wall-impact damage
 const WALL_IMPACT_FACTOR: f32 = 0.04;    // damage per unit of excess speed
-/// Pixels a player may walk per movement phase.  The aiming/charging phase and the post-fire
-/// retreat phase each receive an independent budget (reset by `reset_movement_budget()`).
-/// At WALK_SPEED 115 px/s this gives ≈8.7 seconds of continuous walking (≈71% of the map width).
-const MOVEMENT_BUDGET: f32 = 1000.0;
 const COYOTE_TIME: f32 = 0.15;        // Grace window after walking off edge
 const JUMP_BUFFER_TIME: f32 = 0.12;   // Jump pressed just before landing
 
@@ -43,15 +39,10 @@ pub struct Ball {
     pub fall_start_y: f32,
     pub last_damage: i32,
     pub damage_timer: f32,
-    pub movement_budget: f32,
-    pub movement_used: f32,
     /// Grace period after walking off an edge — still allows jumping
     pub coyote_timer: f32,
     /// Queued jump — executes on next landing if within window
     pub jump_buffer: f32,
-    /// X position when a player-initiated jump started; used to charge actual
-    /// horizontal travel distance to the movement budget on landing.
-    pub jump_start_x: Option<f32>,
 }
 
 impl Ball {
@@ -71,26 +62,9 @@ impl Ball {
             fall_start_y: y,
             last_damage: 0,
             damage_timer: 0.0,
-            movement_budget: MOVEMENT_BUDGET,
-            movement_used: 0.0,
             coyote_timer: 0.0,
             jump_buffer: 0.0,
-            jump_start_x: None,
         }
-    }
-
-    pub fn reset_movement_budget(&mut self) {
-        self.movement_used = 0.0;
-        self.movement_budget = MOVEMENT_BUDGET;
-        self.jump_start_x = None;
-    }
-
-    pub fn can_move(&self) -> bool {
-        self.movement_used < self.movement_budget
-    }
-
-    pub fn movement_remaining(&self) -> f32 {
-        (self.movement_budget - self.movement_used).max(0.0)
     }
 
     pub fn tick(&mut self, terrain: &Terrain, dt: f32) {
@@ -146,12 +120,6 @@ impl Ball {
                                 self.take_damage(dmg);
                             }
                         }
-                        // Charge the actual horizontal distance traveled during a
-                        // player-initiated jump to the movement budget.
-                        if let Some(jx) = self.jump_start_x.take() {
-                            let dist = (self.x - jx).abs();
-                            self.movement_used = (self.movement_used + dist).min(self.movement_budget);
-                        }
                     }
                     self.vy = 0.0;
                     break;
@@ -183,8 +151,6 @@ impl Ball {
                 self.fall_start_y = self.y;
                 self.jump_buffer = 0.0;
                 self.coyote_timer = 0.0;
-                // Record jump origin for movement-budget tracking on landing
-                self.jump_start_x = Some(self.x);
             }
         }
 
@@ -227,9 +193,6 @@ impl Ball {
                 if self.vy < 0.0 {
                     self.vy = 0.0;
                 }
-                // Any queued jump that was blocked by a ceiling should not
-                // charge distance from the aborted jump.
-                self.jump_start_x = None;
                 break;
             }
         }
@@ -295,21 +258,12 @@ pub fn walk(ball: &mut Ball, terrain: &Terrain, dir: f32) {
         return;
     }
 
-    // Always update facing so directional input feels responsive even when
-    // the movement budget is exhausted (ball turns in place rather than
-    // freezing completely, which is less confusing for the player).
+    // Always update facing so directional input feels responsive — the ball
+    // turns in place rather than appearing frozen when blocked by terrain.
     ball.facing = dir;
-
-    // Position change requires remaining budget.
-    if !ball.can_move() {
-        return;
-    }
 
     // ── Air control ───────────────────────────────────────────────────────
     // While airborne, nudge horizontal velocity instead of snapping position.
-    // This lets the player steer jumps to reach higher spots.
-    // Budget is NOT drained here — horizontal travel is charged on landing via
-    // jump_start_x so that only actual distance counts against the budget.
     if !ball.on_ground {
         let push = dir * AIR_CONTROL_ACCEL * (1.0 / 60.0);
         // Only push if we haven't hit the air-speed cap in that direction
@@ -321,21 +275,8 @@ pub fn walk(ball: &mut Ball, terrain: &Terrain, dir: f32) {
 
     // ── Ground walk ───────────────────────────────────────────────────────
     let step = dir * WALK_SPEED * (1.0 / 60.0);
-    let movement_distance = step.abs();
 
-    // Clamp step to remaining budget (may be less than a full step).
-    let actual_step = if ball.movement_used + movement_distance > ball.movement_budget {
-        let remaining = ball.movement_budget - ball.movement_used;
-        if remaining < 0.5 {
-            return;
-        }
-        dir.signum() * remaining
-    } else {
-        step
-    };
-
-    let old_x = ball.x;
-    let new_x = ball.x + actual_step;
+    let new_x = ball.x + step;
     let r = BALL_RADIUS;
     let nx = new_x as i32;
     let foot_y = (ball.y + r) as i32;
@@ -357,38 +298,30 @@ pub fn walk(ball: &mut Ball, terrain: &Terrain, dir: f32) {
 
     if blocked_head || blocked_body || blocked_mid || blocked_foot {
         // Try to step up over small terrain bumps.
-        // Only require clearance at ball centre and head — these match tick()'s wall
-        // collision checks, so if they pass here, tick() won't push the ball back.
         for climb in 1..=MAX_CLIMB {
             let test_y    = ball.y as i32 - climb;
-            let test_head = test_y - (r * 0.5) as i32;   // head_y at climbed position
+            let test_head = test_y - (r * 0.5) as i32;
             if !terrain.is_solid(forward_x, test_y)
                 && !terrain.is_solid(forward_x, test_head)
             {
                 ball.x = new_x;
                 ball.y = test_y as f32;
-                ball.movement_used += (ball.x - old_x).abs();
                 return;
             }
         }
-        // Truly blocked — don't move and don't charge budget.
+        // Truly blocked by terrain — don't move the ball.
         return;
     }
 
     for drop in 0..=10 {
         if terrain.is_solid(nx, foot_y + drop) {
             ball.x = new_x;
-            // Place foot ON the solid cell (consistent with tick()'s snap logic)
             ball.y = (foot_y + drop) as f32 - r;
-            // Track the actual distance moved
-            ball.movement_used += (ball.x - old_x).abs();
             return;
         }
     }
 
     ball.x = new_x;
-    // Track the actual distance moved
-    ball.movement_used += (ball.x - old_x).abs();
 }
 
 pub fn jump(ball: &mut Ball) {
@@ -396,10 +329,6 @@ pub fn jump(ball: &mut Ball) {
         return;
     }
     if ball.on_ground || ball.coyote_timer > 0.0 {
-        // Normal jump or coyote-time jump
-        // Record origin so the horizontal distance is charged to movement
-        // budget when the ball lands (see tick() landing handler).
-        ball.jump_start_x = Some(ball.x);
         ball.vy = JUMP_VEL;
         ball.vx += ball.facing * JUMP_HORIZONTAL_BOOST;
         ball.on_ground = false;
@@ -417,9 +346,7 @@ pub fn backflip(ball: &mut Ball) {
         return;
     }
     if ball.on_ground || ball.coyote_timer > 0.0 {
-        // Record origin so horizontal distance is charged on landing
-        ball.jump_start_x = Some(ball.x);
-        ball.vy = JUMP_VEL - 70.0;          // Extra height for backflip
+        ball.vy = JUMP_VEL - 70.0;
         ball.vx += -ball.facing * 130.0;
         ball.on_ground = false;
         ball.coyote_timer = 0.0;

@@ -1,6 +1,6 @@
 import type { GameState } from "./types";
 
-const TURN_TIME_MS = 45_000;
+const TURN_TIME_MS = 120_000;
 
 interface BallSnapshot {
   x: number; y: number; vx: number; vy: number; hp: number; alive: boolean;

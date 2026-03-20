@@ -18,7 +18,7 @@ use state::Phase;
 use terrain::Terrain;
 use weapons::{Weapon, WeaponCategory};
 
-const TURN_TIME: f32 = 45.0;
+const TURN_TIME: f32 = 120.0;
 const TURN_END_DELAY: f32 = 3.0;
 const SETTLE_TIMEOUT: f32 = 3.0;
 const CHARGE_SPEED: f32 = 55.0;
@@ -453,6 +453,61 @@ impl Game {
             .map(|(idx, _)| idx)
     }
 
+    /// Execute a teleport for the current ball to the given raw world coordinates.
+    /// Applies upward depenetration when the target is inside solid terrain, then scans
+    /// downward to find the nearest surface so the ball lands naturally.
+    /// Sets has_fired, transitions to Settling, and syncs the move to other clients.
+    fn execute_teleport_to(&mut self, target_x: f32, target_y: f32) {
+        let idx = self.current_ball;
+        if idx >= self.balls.len() || !self.balls[idx].alive {
+            return;
+        }
+        let r = physics::BALL_RADIUS;
+        let safe_x = target_x.clamp(r + 1.0, self.terrain.width as f32 - r - 1.0);
+        let mut safe_y = target_y;
+        // If the target is inside solid terrain, push upward to find open space.
+        let mut ty = target_y as i32;
+        let min_ty = 10i32;
+        while ty > min_ty && self.terrain.is_solid(safe_x as i32, ty) {
+            ty -= 1;
+        }
+        if !self.terrain.is_solid(safe_x as i32, ty) {
+            // From the first clear row, scan downward for the nearest surface below.
+            let mut land_y = ty;
+            while land_y < self.terrain.height as i32 - 1
+                && !self.terrain.is_solid(safe_x as i32, land_y + 1)
+            {
+                land_y += 1;
+            }
+            // Place ball just above the surface but no lower than the original click.
+            safe_y = (land_y as f32 - r).min(target_y);
+        }
+        safe_y = safe_y.clamp(r + 1.0, crate::terrain::WATER_LEVEL - r - 5.0);
+        self.balls[idx].x = safe_x;
+        self.balls[idx].y = safe_y;
+        self.balls[idx].vx = 0.0;
+        self.balls[idx].vy = 0.0;
+        self.teleport_mode = false;
+        self.has_fired = true;
+        self.phase = Phase::Settling;
+        self.settle_timer = 0.0;
+        if self.net.connected {
+            let input_json = format!(
+                r#"{{"TeleportTo":{{"x":{},"y":{}}}}}"#,
+                safe_x, safe_y
+            );
+            let mut escaped = String::new();
+            for c in input_json.chars() {
+                match c {
+                    '"' => escaped.push_str("\\\""),
+                    '\\' => escaped.push_str("\\\\"),
+                    _ => escaped.push(c),
+                }
+            }
+            self.net.send_message(&format!(r#"{{"type":"input","input":"{}","bi":{}}}"#, escaped, self.current_ball));
+        }
+    }
+
     fn handle_input(&mut self) {
         if let Some(seed) = self.restart_seed.take() {
             // Restart with same team count
@@ -506,12 +561,12 @@ impl Game {
                     let (wx, _wy) = self.cam.screen_to_world(mx, my);
                     self.airstrike_locked_x = Some(wx.clamp(0.0, self.terrain.width as f32));
                 } else if self.teleport_mode {
-                    // Lock the teleport destination at the tapped world position.
-                    // Tapping again overwrites the destination so the player can reposition.
+                    // Execute teleport immediately at the tapped world position — no separate
+                    // FIRE press needed. "It should move you to where you pick."
                     let (wx, wy) = self.cam.screen_to_world(mx, my);
-                    let tx = wx.clamp(0.0, self.terrain.width as f32);
-                    let ty = wy.clamp(0.0, self.terrain.height as f32);
-                    self.teleport_locked_pos = Some((tx, ty));
+                    let target_x = wx.clamp(0.0, self.terrain.width as f32);
+                    let target_y = wy.clamp(0.0, self.terrain.height as f32);
+                    self.execute_teleport_to(target_x, target_y);
                 } else {
                     self.aim_locked = !self.aim_locked;
                 }
@@ -643,24 +698,12 @@ impl Game {
             return; // No weapon/aim/firing during retreat, settling, or projectile flying
         }
 
-        // CRITICAL: Block all GAME input (not camera) if not our turn in multiplayer
-        if !self.is_my_turn() {
-            return;
-        }
+        // ── Weapon menu: allow opening/browsing regardless of whose turn it is ──────
+        // This lets players plan their next move while waiting for others to play.
 
-        
-
-        if !self.phase.allows_input() {
-            if self.charging {
-                self.charging = false;
-            }
-            return;
-        }
-
-        // Toggle weapon menu with Tab or Q (only on your turn).
-        // If currently charging, cancel the charge first so the player can switch weapon.
-        if self.is_my_turn() && (is_key_pressed(KeyCode::Tab) || is_key_pressed(KeyCode::Q)) {
-            if self.charging {
+        // Tab or Q: toggle weapon menu.
+        if is_key_pressed(KeyCode::Tab) || is_key_pressed(KeyCode::Q) {
+            if self.is_my_turn() && self.charging {
                 self.charging = false;
                 self.charge_power = 0.0;
                 self.phase = Phase::Aiming;
@@ -671,27 +714,31 @@ impl Game {
             while get_char_pressed().is_some() {}
         }
 
-        // ESC or right-click while charging cancels the charge (return to aiming).
-        // Also cancel any click-targeting modes.
-        if self.is_my_turn() && (is_key_pressed(KeyCode::Escape) || is_mouse_button_pressed(MouseButton::Right)) {
-            if self.charging {
-                self.charging = false;
-                self.charge_power = 0.0;
-                self.phase = Phase::Aiming;
-                self.firing_by_key = false;
-            }
-            self.baseball_bat_mode = false;
-            self.airstrike_locked_x = None;
-            self.teleport_locked_pos = None;
-        }
-        
-        // Toggle weapon menu with mouse click on button (only on your turn)
-        if self.is_my_turn() && !self.weapon_menu_open && is_mouse_button_pressed(MouseButton::Left) {
+        // HUD weapon button click: open menu (regardless of whose turn it is).
+        if !self.weapon_menu_open && is_mouse_button_pressed(MouseButton::Left) {
             let button = hud::get_weapon_button_bounds();
             let (mx, my) = mouse_position();
-            if mx >= button.0 && mx <= button.0 + button.2 
-                && my >= button.1 && my <= button.1 + button.3 {
+            if mx >= button.0 && mx <= button.0 + button.2
+                && my >= button.1 && my <= button.1 + button.3
+            {
                 self.weapon_menu_open = true;
+            }
+        }
+
+        // ESC or right-click: close the weapon menu first; on your turn also cancel charge/modes.
+        if is_key_pressed(KeyCode::Escape) || is_mouse_button_pressed(MouseButton::Right) {
+            if self.weapon_menu_open {
+                self.weapon_menu_open = false;
+            } else if self.is_my_turn() {
+                if self.charging {
+                    self.charging = false;
+                    self.charge_power = 0.0;
+                    self.phase = Phase::Aiming;
+                    self.firing_by_key = false;
+                }
+                self.baseball_bat_mode = false;
+                self.airstrike_locked_x = None;
+                self.teleport_locked_pos = None;
             }
         }
 
@@ -700,9 +747,21 @@ impl Game {
         while get_char_pressed().is_some() {}
 
         // Weapon menu input is now handled entirely by egui inside game.draw().
-        // When the menu is open, skip all the normal pointer / aim processing
-        // so egui's events are not double-consumed.
+        // When the menu is open, skip all other game input so egui's events are not
+        // double-consumed.
         if self.weapon_menu_open {
+            return;
+        }
+
+        // CRITICAL: Block all remaining GAME input (not camera) if not our turn in multiplayer
+        if !self.is_my_turn() {
+            return;
+        }
+
+        if !self.phase.allows_input() {
+            if self.charging {
+                self.charging = false;
+            }
             return;
         }
 
@@ -947,60 +1006,16 @@ impl Game {
                     self.net.send_message(&format!(r#"{{"type":"input","input":"{}","bi":{}}}"#, escaped, self.current_ball));
                 }
             } else if self.teleport_mode {
-                // Use the locked destination (set by tapping). If player hasn't tapped yet, do nothing.
-                let (target_x, target_y) = match self.teleport_locked_pos.take() {
-                    Some(pos) => pos,
-                    None => return, // no destination locked yet — wait for player to tap first
-                };
-                let idx = self.current_ball;
-                if idx < self.balls.len() && self.balls[idx].alive {
-                    // Find a safe landing spot: if the target is inside solid terrain, search
-                    // upward for the first open cell and land just above the terrain surface.
-                    let r = physics::BALL_RADIUS;
-                    let safe_x = target_x.clamp(r + 1.0, self.terrain.width as f32 - r - 1.0);
-                    let mut safe_y = target_y;
-                    // If inside solid terrain, push upward to find open space
-                    let mut ty = target_y as i32;
-                    let min_ty = 10i32;
-                    while ty > min_ty && self.terrain.is_solid(safe_x as i32, ty) {
-                        ty -= 1;
-                    }
-                    // Now scan downward to find the surface to land on
-                    if !self.terrain.is_solid(safe_x as i32, ty) {
-                        let mut land_y = ty;
-                        while land_y < self.terrain.height as i32 - 1
-                            && !self.terrain.is_solid(safe_x as i32, land_y + 1)
-                        {
-                            land_y += 1;
-                        }
-                        // land_y is the last air row — place ball center just above ground
-                        safe_y = (land_y as f32 - r).min(target_y);
-                    }
-                    safe_y = safe_y.clamp(r + 1.0, crate::terrain::WATER_LEVEL - r - 5.0);
-                    self.balls[idx].x = safe_x;
-                    self.balls[idx].y = safe_y;
-                    self.balls[idx].vx = 0.0;
-                    self.balls[idx].vy = 0.0;
-                    self.teleport_mode = false;
-                    self.has_fired = true;
-                    self.phase = Phase::Settling;
-                    self.settle_timer = 0.0;
-                    if self.net.connected {
-                        let input_json = format!(
-                            r#"{{"TeleportTo":{{"x":{},"y":{}}}}}"#,
-                            safe_x, safe_y
-                        );
-                        let mut escaped = String::new();
-                        for c in input_json.chars() {
-                            match c {
-                                '"' => escaped.push_str("\\\""),
-                                '\\' => escaped.push_str("\\\\"),
-                                _ => escaped.push(c),
-                            }
-                        }
-                        self.net.send_message(&format!(r#"{{"type":"input","input":"{}","bi":{}}}"#, escaped, self.current_ball));
-                    }
-                }
+                // Fallback for the F-key / mobile FIRE button: use the locked destination if
+                // the player pre-tapped a spot, otherwise use the current cursor position.
+                let (mx_cur, my_cur) = mouse_position();
+                let (cx, cy) = self.cam.screen_to_world(mx_cur, my_cur);
+                let (target_x, target_y) = self.teleport_locked_pos.take()
+                    .unwrap_or_else(|| (
+                        cx.clamp(0.0, self.terrain.width as f32),
+                        cy.clamp(0.0, self.terrain.height as f32),
+                    ));
+                self.execute_teleport_to(target_x, target_y);
             } else if self.baseball_bat_mode {
                 // Baseball bat fires instantly on F press (no charge needed).
                 let idx = self.current_ball;
@@ -1883,11 +1898,10 @@ impl Game {
         self.turn_timer = TURN_TIME;
         self.has_fired = false;
         
-        // Nudge the active ball slightly above the ground at turn start so it is never
-        // stuck in terrain. It will simply fall back down on the first physics tick.
+        // Eject the active ball from any solid terrain it may be stuck in at turn start.
+        // This uses a proper upward search (up to 80 px) so players are never trapped.
         if self.current_ball < self.balls.len() {
-            self.balls[self.current_ball].y -= 5.0;
-            self.balls[self.current_ball].vy = 0.0;
+            physics::eject_from_terrain(&mut self.balls[self.current_ball], &self.terrain);
         }
         self.firing_by_key = false;
         self.aim_locked = false;
@@ -3908,19 +3922,23 @@ impl Game {
         if let Some(w) = chosen_weapon {
             self.selected_weapon = w;
             self.weapon_menu_open = false;
-            // Reset special modes, then activate the new weapon's mode.
-            self.airstrike_mode = None;
-            self.airstrike_locked_x = None;
-            self.teleport_mode = false;
-            self.teleport_locked_pos = None;
-            self.build_wall_mode = false;
-            self.build_wall_anchor = None;
-            match w {
-                Weapon::Teleport    => { self.teleport_mode = true; }
-                Weapon::BuildWall   => { self.build_wall_mode = true; }
-                Weapon::Airstrike   => { self.airstrike_mode = Some(Weapon::Airstrike); }
-                Weapon::NapalmStrike => { self.airstrike_mode = Some(Weapon::NapalmStrike); }
-                _ => {}
+            // Only activate/reset special weapon modes when it is actually your turn.
+            // When browsing the menu between turns, just update the selected weapon
+            // so it's ready for when your turn arrives.
+            if self.is_my_turn() && self.phase.allows_input() {
+                self.airstrike_mode = None;
+                self.airstrike_locked_x = None;
+                self.teleport_mode = false;
+                self.teleport_locked_pos = None;
+                self.build_wall_mode = false;
+                self.build_wall_anchor = None;
+                match w {
+                    Weapon::Teleport    => { self.teleport_mode = true; }
+                    Weapon::BuildWall   => { self.build_wall_mode = true; }
+                    Weapon::Airstrike   => { self.airstrike_mode = Some(Weapon::Airstrike); }
+                    Weapon::NapalmStrike => { self.airstrike_mode = Some(Weapon::NapalmStrike); }
+                    _ => {}
+                }
             }
         }
         if close_menu {

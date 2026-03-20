@@ -291,6 +291,43 @@ impl Ball {
     }
 }
 
+/// Force-eject the ball from any solid terrain it is intersecting.
+/// Searches upward up to `max_rise` pixels from the current center.
+/// Checks both the ball center and foot so the ball is fully clear before stopping.
+/// Called at turn start to ensure players are never stuck in the ground.
+pub fn eject_from_terrain(ball: &mut Ball, terrain: &Terrain) {
+    if !ball.alive {
+        return;
+    }
+    let r = BALL_RADIUS;
+    let bx = ball.x as i32;
+    let center_y = ball.y as i32;
+    let foot_y = (ball.y + r) as i32;
+
+    // Nothing to do if both center and foot are already clear of solid terrain.
+    if !terrain.is_solid(bx, center_y) && !terrain.is_solid(bx, foot_y) {
+        return;
+    }
+
+    // Search upward for the first position where both center and foot are clear.
+    let max_rise: i32 = 80;
+    let limit = (center_y - max_rise).max(0);
+    let mut test_cy = center_y - 1;
+    while test_cy > limit {
+        let test_fy = (test_cy as f32 + r) as i32;
+        if !terrain.is_solid(bx, test_cy) && !terrain.is_solid(bx, test_fy) {
+            ball.y = test_cy as f32;
+            ball.vy = 0.0;
+            return;
+        }
+        test_cy -= 1;
+    }
+
+    // Could not find a clear position within max_rise — just nudge up by the radius.
+    ball.y -= r;
+    ball.vy = 0.0;
+}
+
 pub fn walk(ball: &mut Ball, terrain: &Terrain, dir: f32) {
     if !ball.alive {
         return;

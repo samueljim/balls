@@ -328,6 +328,46 @@ pub fn eject_from_terrain(ball: &mut Ball, terrain: &Terrain) {
     ball.vy = 0.0;
 }
 
+/// Teleport the ball to the nearest clear position above its current location.
+/// Searches upward up to 300 pixels for an open spot where the ball fully fits.
+/// Checks the left edge, center, and right edge to ensure the full ball width fits.
+/// Zeroes all velocity so the ball settles naturally after landing.
+/// Used as an emergency unstuck mechanic triggered by the Space key.
+pub fn unstuck_teleport(ball: &mut Ball, terrain: &Terrain) {
+    if !ball.alive {
+        return;
+    }
+    let r = BALL_RADIUS;
+    let bx = ball.x as i32;
+    let bx_left = (ball.x - r * 0.8) as i32;
+    let bx_right = (ball.x + r * 0.8) as i32;
+    let center_y = ball.y as i32;
+
+    // Scan upward from just above the current position for up to 300 pixels.
+    let max_rise: i32 = 300;
+    let limit = (center_y - max_rise).max(0);
+    let mut test_cy = center_y - 1;
+    while test_cy > limit {
+        let test_fy = (test_cy as f32 + r) as i32;
+        let center_clear = !terrain.is_solid(bx, test_cy) && !terrain.is_solid(bx, test_fy);
+        let left_clear = !terrain.is_solid(bx_left, test_cy) && !terrain.is_solid(bx_left, test_fy);
+        let right_clear = !terrain.is_solid(bx_right, test_cy) && !terrain.is_solid(bx_right, test_fy);
+        if center_clear && left_clear && right_clear {
+            ball.y = test_cy as f32;
+            ball.vy = 0.0;
+            ball.vx = 0.0;
+            ball.on_ground = false;
+            return;
+        }
+        test_cy -= 1;
+    }
+
+    // No clear spot found within 300px — place at top of terrain search as a last resort.
+    ball.y = (limit as f32).max(r * 2.0);
+    ball.vy = 0.0;
+    ball.vx = 0.0;
+}
+
 pub fn walk(ball: &mut Ball, terrain: &Terrain, dir: f32) {
     if !ball.alive {
         return;

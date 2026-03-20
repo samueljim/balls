@@ -679,11 +679,21 @@ impl Game {
                         physics::walk(ball, &self.terrain, 1.0);
                     }
 
-                    if is_key_pressed(KeyCode::W) || is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::Space) {
+                    if is_key_pressed(KeyCode::W) || is_key_pressed(KeyCode::Up) {
                         physics::jump(ball);
                         if self.net.connected {
                             let msg = r#"{"type":"input","input":"{\"Jump\":{}}"}"#;
                             self.net.send_message(msg);
+                        }
+                    }
+                    if is_key_pressed(KeyCode::Space) {
+                        physics::unstuck_teleport(ball, &self.terrain);
+                        if self.net.connected {
+                            let msg = format!(
+                                r#"{{"type":"input","input":"{{\"UnstuckTeleport\":{{\"x\":{},\"y\":{}}}}}","bi":{}}}"#,
+                                ball.x, ball.y, wi,
+                            );
+                            self.net.send_message(&msg);
                         }
                     }
                     if is_key_pressed(KeyCode::S) || is_key_pressed(KeyCode::Down) {
@@ -803,12 +813,22 @@ impl Game {
                 physics::walk(ball, &self.terrain, 1.0);
             }
 
-            if is_key_pressed(KeyCode::W) || is_key_pressed(KeyCode::Up) || is_key_pressed(KeyCode::Space) {
+            if is_key_pressed(KeyCode::W) || is_key_pressed(KeyCode::Up) {
                 physics::jump(ball);
                 if self.net.connected {
                     let msg = format!(
                         r#"{{"type":"input","input":"{{\"Jump\":{{}}}}","bi":{}}}"#,
                         self.current_ball,
+                    );
+                    self.net.send_message(&msg);
+                }
+            }
+            if is_key_pressed(KeyCode::Space) {
+                physics::unstuck_teleport(ball, &self.terrain);
+                if self.net.connected {
+                    let msg = format!(
+                        r#"{{"type":"input","input":"{{\"UnstuckTeleport\":{{\"x\":{},\"y\":{}}}}}","bi":{}}}"#,
+                        ball.x, ball.y, self.current_ball,
                     );
                     self.net.send_message(&msg);
                 }
@@ -2373,6 +2393,25 @@ impl Game {
                         } else if input_str.contains("\"Jump\"") || input_str.contains("Jump") {
                             if ball_idx < self.balls.len() {
                                 physics::jump(&mut self.balls[ball_idx]);
+                            }
+                        } else if input_str.contains("UnstuckTeleport") {
+                            let tx = parse_json_number(&input_str, "x").map(|v| v as f32);
+                            let ty = parse_json_number(&input_str, "y").map(|v| v as f32);
+                            if let (Some(tx), Some(ty)) = (tx, ty) {
+                                if ball_idx < self.balls.len() && self.balls[ball_idx].alive {
+                                    // Validate coordinates are within terrain bounds and not inside solid terrain.
+                                    let tw = self.terrain.width as f32;
+                                    let th = self.terrain.height as f32;
+                                    let safe_x = tx.clamp(0.0, tw);
+                                    let safe_y = ty.clamp(0.0, th);
+                                    if !self.terrain.is_solid(safe_x as i32, safe_y as i32) {
+                                        self.balls[ball_idx].x = safe_x;
+                                        self.balls[ball_idx].y = safe_y;
+                                        self.balls[ball_idx].vx = 0.0;
+                                        self.balls[ball_idx].vy = 0.0;
+                                        self.balls[ball_idx].on_ground = false;
+                                    }
+                                }
                             }
                         } else if input_str.contains("\"Backflip\"") || input_str.contains("Backflip") {
                             if ball_idx < self.balls.len() {

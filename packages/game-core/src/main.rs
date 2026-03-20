@@ -1620,7 +1620,8 @@ impl Game {
     /// Format: [[type,a,b,c],...] where type 0=explosion, 1=drill, 2=wall.
     fn send_terrain_damages(&self) {
         let explosions = &self.terrain.damage_log;
-        let total = explosions.len() + self.wall_log.len() + self.drill_log.len();
+        let squares = &self.terrain.square_damage_log;
+        let total = explosions.len() + squares.len() + self.wall_log.len() + self.drill_log.len();
         if total == 0 {
             return;
         }
@@ -1629,6 +1630,11 @@ impl Game {
         for &(cx, cy, r) in explosions.iter() {
             if !first { arr.push(','); }
             arr.push_str(&format!("[0,{},{},{}]", cx, cy, r));
+            first = false;
+        }
+        for &(cx, cy, half_w, half_h) in squares.iter() {
+            if !first { arr.push(','); }
+            arr.push_str(&format!("[3,{},{},{},{}]", cx, cy, half_w, half_h));
             first = false;
         }
         for &(bx, by, amrad) in self.drill_log.iter() {
@@ -1647,8 +1653,9 @@ impl Game {
     }
 
     /// Apply terrain ops log received from server on reconnect.
-    /// Handles [0,cx,cy,r] explosions, [1,bx,by,amrad] drills, [2,ax,ay,amrad] walls.
-    /// Also handles legacy 3-element [cx,cy,r] entries (old format = explosion).
+    /// Handles [0,cx,cy,r] explosions, [1,bx,by,amrad] drills, [2,ax,ay,amrad] walls,
+    /// [3,cx,cy,half_w,half_h] square damage (Mortar). Also handles legacy 3-element
+    /// [cx,cy,r] entries (old format = explosion).
     fn apply_terrain_sync(&mut self, msg: &str) {
         let key = "\"log\":[";
         let start = match msg.find(key) {
@@ -1671,6 +1678,7 @@ impl Game {
         if content.is_empty() { return; }
 
         let mut explosions: Vec<(i32, i32, i32)> = Vec::new();
+        let mut squares: Vec<(i32, i32, i32, i32)> = Vec::new();
         let mut pos = 0;
         while pos < content.len() {
             let sub_start = match content[pos..].find('[') {
@@ -1721,6 +1729,10 @@ impl Game {
                         self.wall_log.push((aix, aiy, *amrad));
                     }
                 }
+                // type 3 = square damage (Mortar)
+                [3, cx, cy, half_w, half_h] => {
+                    squares.push((*cx, *cy, *half_w, *half_h));
+                }
                 _ => {}
             }
             pos = sub_end + 1;
@@ -1733,6 +1745,10 @@ impl Game {
                 unsafe { console_log(debug_msg.as_ptr()); }
             }
             self.terrain.replay_damage(&explosions);
+            self.terrain_dirty = true;
+        }
+        if !squares.is_empty() {
+            self.terrain.replay_square_damage(&squares);
             self.terrain_dirty = true;
         }
     }

@@ -18,8 +18,10 @@ pub struct Terrain {
     pub width: u32,
     pub height: u32,
     pub cells: Vec<u8>,
-    /// Log of all (cx, cy, radius) damage events for replay on reconnect
+    /// Log of all (cx, cy, radius) circular damage events for replay on reconnect
     pub damage_log: Vec<(i32, i32, i32)>,
+    /// Log of all (cx, cy, half_w, half_h) square damage events for replay on reconnect
+    pub square_damage_log: Vec<(i32, i32, i32, i32)>,
 }
 
 impl Terrain {
@@ -29,6 +31,7 @@ impl Terrain {
             height: h,
             cells: vec![AIR; (w * h) as usize],
             damage_log: Vec::new(),
+            square_damage_log: Vec::new(),
         }
     }
 
@@ -72,12 +75,29 @@ impl Terrain {
     /// Carve a square/rectangular hole centred at (cx, cy) with given half-width and half-height.
     /// Used by the Mortar weapon to create a larger, square-type impact crater.
     pub fn apply_square_damage(&mut self, cx: i32, cy: i32, half_w: i32, half_h: i32) {
+        self.square_damage_log.push((cx, cy, half_w, half_h));
+        self.apply_square_damage_no_log(cx, cy, half_w, half_h);
+    }
+
+    fn apply_square_damage_no_log(&mut self, cx: i32, cy: i32, half_w: i32, half_h: i32) {
         for dy in -half_h..=half_h {
             for dx in -half_w..=half_w {
                 self.set(cx + dx, cy + dy, AIR);
             }
         }
         self.regrow_grass_near(cx, cy, half_w.max(half_h));
+    }
+
+    /// Replay a square damage log on this terrain (e.g. after reconnect)
+    pub fn replay_square_damage(&mut self, log: &[(i32, i32, i32, i32)]) {
+        let existing: std::collections::HashSet<(i32, i32, i32, i32)> =
+            self.square_damage_log.iter().copied().collect();
+        for &entry in log {
+            if !existing.contains(&entry) {
+                self.apply_square_damage_no_log(entry.0, entry.1, entry.2, entry.3);
+                self.square_damage_log.push(entry);
+            }
+        }
     }
 
     /// Apply damage without recording to the log (used for replay on reconnect)
